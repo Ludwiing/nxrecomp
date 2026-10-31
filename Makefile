@@ -1,12 +1,12 @@
 # guest (ARM64, formato Switch) -> NRO -> C -> ejecutable nativo de Linux x86_64
 CLANG ?= clang
 B := build
-PROGS := hola neon
+PROGS := hola neon vm
 
 OPT ?= -O2
 # -ffp-contract=off en las dos versiones: ningún compilador fusiona a*b+c por su cuenta.
 GUEST_CFLAGS := --target=aarch64-none-elf $(OPT) -ffreestanding -fno-builtin -nostdlib \
-	-fno-jump-tables -fno-pic -fno-stack-protector -ffp-contract=off -fno-math-errno \
+	-fno-pic -fno-stack-protector -ffp-contract=off -fno-math-errno \
 	-fno-asynchronous-unwind-tables -fno-unwind-tables -Wall
 CFLAGS_hola := -mgeneral-regs-only
 CFLAGS_neon := -O3

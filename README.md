@@ -12,7 +12,7 @@ guest/*.c (ARM64) ──clang──▶ .elf ──mknro──▶ .nro ──nxre
 
 1. `guest/` tiene programas de prueba en formato homebrew de Switch: cabecera NRO, MOD0 y llamadas `svc` al kernel de Horizon.
 2. `tools/mknro.py` los empaqueta como `.nro`.
-3. `recomp/nxrecomp.py` lee el NRO, descubre las funciones y traduce cada instrucción a C. El decodificador está en `recomp/a64.py` (enteros y memoria), `recomp/simd.py` (FP escalar y cargas SIMD) y `recomp/neon.py` (NEON y cripto).
+3. `recomp/nxrecomp.py` lee el NRO, descubre las funciones (y los destinos de las tablas de salto, en `recomp/jumptable.py`) y traduce cada instrucción a C. El decodificador está en `recomp/a64.py` (enteros y memoria), `recomp/simd.py` (FP escalar y cargas SIMD) y `recomp/neon.py` (NEON y cripto).
 4. `runtime/` carga la imagen en la misma dirección que en la Switch, arma la pila y el TLS, y responde las llamadas al kernel. También tiene la semántica exacta de ARM para punto flotante (`nxfp.h`), NEON (`nxsimd.h`) y cripto (`nxcrypto.h`).
 
 ```
@@ -21,6 +21,7 @@ make test
 
 compila cada programa para la Switch, lo recompila y compara su salida con la del mismo código compilado directo para x86_64:
 - `hola`: enteros. Pasa en `-O0` a `-Oz` (`make test OPT=-Os`).
+- `vm`: una máquina virtual de bytecode (un `switch` de 32 casos dentro del bucle del intérprete), un analizador léxico y switches densos y dispersos. Ejercita las tablas de salto en `-O0` a `-Oz`.
 - `neon`: punto flotante y bucles vectorizados con `-O3`. Usa FMUL/FADD, TBL, ST3, SQXTN2, SHRN2, UMLAL2, UZP2, REV64, CNT, ADDV, BSL, FCVTZS y más. Los resultados coinciden bit a bit.
 
 ## El conjunto de instrucciones: completo para la CPU de la Switch
@@ -48,7 +49,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 
 ## Límites conocidos
 
-- **Tablas de salto** de los `switch`: un `BR` a una etiqueta dentro de la función todavía no se resuelve. Por eso las pruebas usan `-fno-jump-tables`.
+- **Tablas de salto en binarios con reubicaciones**: las tablas se leen del archivo tal cual. En un NSO real (PIE) las tablas de punteros absolutos se llenan con reubicaciones al cargar, así que habrá que aplicarlas antes de analizar.
 - **Hilos**: el monitor exclusivo es de un solo hilo.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.
 - **Velocidad**: el código traducido es entre 2 y 4,5 veces más lento que el nativo. Los registros viven en memoria y todavía no hay optimizaciones.
@@ -57,7 +58,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 ## Hoja de ruta hacia un juego real
 
 1. ~~NEON y punto flotante~~: hecho, verificado contra Unicorn.
-2. **Tablas de salto y descubrimiento de código** robusto para binarios grandes.
+2. ~~Tablas de salto~~: hecho. `recomp/jumptable.py` reconstruye el cálculo del destino de cada `BR` hacia atrás (incluso con la dirección de la tabla sacada del bucle o el índice pasado por la pila en `-O0`), encuentra la cota del `CMP` y lee la tabla. Los destinos se vuelven etiquetas `goto` de la misma función.
 3. **Optimización**: registros en variables locales y eliminación de banderas que nadie lee.
 4. **Formato NSO y NSP**: descompresión LZ4 y los módulos `rtld`, `main` y `sdk`. La extracción con `prod.keys` sacadas de tu propia consola puede reutilizar las herramientas de nxnative.
 5. **Hilos y sincronización de Horizon**: mapear los hilos del juego a hilos de Linux, con atómicos de verdad.

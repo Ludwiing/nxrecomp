@@ -33,6 +33,8 @@ class Insn:
     target: int | None = None
     cond: str | None = None   # expresión C de la condición (bcond)
     reg: str | None = None    # expresión C del registro destino (br, blr)
+    reg_num: int | None = None
+    targets: list = field(default_factory=list)  # destinos resueltos de un BR (tablas de salto)
     ref: int | None = None    # dirección que la instrucción materializa (ADR/ADRP)
     adrp_reg: int | None = None
 
@@ -313,7 +315,7 @@ def branch_sys(i, x):
         if op2 != 0x1F or op3 != 0 or op4 != 0:
             raise Unsupported("salto con autenticación de punteros")
         if opc == 0:
-            i.kind, i.reg = "br", R(rn)
+            i.kind, i.reg, i.reg_num = "br", R(rn), rn
         elif opc == 1:
             i.kind, i.reg = "blr", R(rn)
         elif opc == 2:

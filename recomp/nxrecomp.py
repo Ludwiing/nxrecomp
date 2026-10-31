@@ -13,9 +13,11 @@ El C resultante se compila con runtime/nxrt.c y queda un ejecutable nativo de Li
 """
 
 import argparse
+import bisect
 import struct
 import sys
 
+import jumptable
 from a64 import bits, decode
 
 NRO_MAGIC = b"NRO0"
@@ -78,11 +80,12 @@ def adr_candidates(mod):
     return out
 
 
-def walk(mod, entry, entries, on_call=None):
+def walk(mod, entry, entries, starts, on_call=None):
     """Recorre el código alcanzable desde `entry` sin salir de la función.
 
-    Un B a la entrada de otra función es una llamada de cola y no se sigue.
-    Devuelve {pc: Insn}.
+    `entries` son las entradas seguras (destinos de BL): un B a una de ellas es una
+    llamada de cola y no se sigue. `starts` (ordenada) sirve para ubicar el inicio de
+    la función que contiene un BR al buscar su tabla de salto. Devuelve {pc: Insn}.
     """
     body = {}
     stack = [entry]
@@ -106,12 +109,25 @@ def walk(mod, entry, entries, on_call=None):
             stack.append(pc + 4)
         elif k in ("op", "blr"):
             stack.append(pc + 4)
+        elif k == "br":
+            k0 = bisect.bisect_right(starts, pc) - 1
+            start = min(entry, starts[k0]) if k0 >= 0 else entry
+            i.targets = jumptable.resolve(mod, pc, i.reg_num, start)
+            stack.extend(t for t in i.targets if t not in entries or t == entry)
     return body
 
 
 def discover(mod, entry):
-    entries = {entry} | pointer_candidates(mod) | adr_candidates(mod)
-    work = list(entries)
+    """Devuelve (entradas seguras, todas las funciones).
+
+    Seguras: la entrada del módulo y los destinos de BL. Posibles: direcciones de código
+    que aparecen en datos o con ADR (punteros a función, vtables). Las posibles también
+    se compilan, para las llamadas indirectas, pero un salto directo a ellas sigue siendo
+    local: puede ser solo una etiqueta, como la base de una tabla de salto.
+    """
+    strong = {entry}
+    weak = pointer_candidates(mod) | adr_candidates(mod)
+    work = [entry] + sorted(weak)
     done = set()
     while work:
         f = work.pop()
@@ -120,20 +136,23 @@ def discover(mod, entry):
         done.add(f)
 
         def found(t):
-            if t not in entries:
-                entries.add(t)
+            if t not in strong:
+                strong.add(t)
                 work.append(t)
 
-        walk(mod, f, set(), found)
-    return entries
+        walk(mod, f, set(), sorted(strong), found)
+    return strong, strong | weak
 
 
 def fname(a):
     return f"f_{a:x}"
 
 
-def emit_function(mod, f, entries, out):
-    body = walk(mod, f, entries)
+def emit_function(mod, f, strong, out, stats):
+    body = walk(mod, f, strong, sorted(strong))
+    for i in body.values():
+        if i.kind == "br":
+            stats["br_tabla" if i.targets else "br_indirecto"].add(i.pc)
     out.append(f"static void {fname(f)}(Ctx *c) {{")
     order = sorted(body)
     if order[0] != f:
@@ -145,7 +164,7 @@ def emit_function(mod, f, entries, out):
         k = i.kind
 
         def jump(t):
-            if t in entries and t != f:
+            if t in strong and t != f:
                 return f"{{ {fname(t)}(c); return; }}"
             if t in body:
                 return f"goto L_{t:x};"
@@ -171,7 +190,14 @@ def emit_function(mod, f, entries, out):
         elif k == "blr":
             out.append(f"    {{ uint64_t t = {i.reg}; c->x[30] = 0x{pc + 4:x}ull; nx_dispatch(c, t); }}")
         elif k == "br":
-            out.append(f"    nx_dispatch(c, {i.reg}); return;")
+            if i.targets:  # tabla de salto resuelta: cada destino es una etiqueta de esta función
+                out.append(f"    switch ({i.reg}) {{")
+                for t in i.targets:
+                    out.append(f"    case 0x{t:x}ull: {jump(t)}")
+                out.append(f"    default: nx_dispatch(c, {i.reg}); return;")
+                out.append("    }")
+            else:
+                out.append(f"    nx_dispatch(c, {i.reg}); return;")
             continue
         elif k == "ret":
             out.append("    return;")
@@ -192,7 +218,7 @@ def main():
 
     mod = Module(open(args.nro, "rb").read(), args.base)
     entry = mod.text_lo
-    entries = discover(mod, entry)
+    strong, entries = discover(mod, entry)
 
     out = ['#include "nxrt.h"', ""]
     out.append(f"/* {args.nro}: {len(entries)} funciones, .text {mod.text[1]:#x} bytes */")
@@ -207,8 +233,9 @@ def main():
     for f in sorted(entries):
         out.append(f"static void {fname(f)}(Ctx *c);")
     out.append("")
+    stats = {"br_tabla": set(), "br_indirecto": set()}
     for f in sorted(entries):
-        emit_function(mod, f, entries, out)
+        emit_function(mod, f, strong, out, stats)
 
     out.append("void nx_dispatch(Ctx *c, uint64_t a) {")
     out.append("    switch (a) {")
@@ -222,7 +249,9 @@ def main():
 
     with open(args.output, "w") as fh:
         fh.write("\n".join(out) + "\n")
-    print(f"{args.output}: {len(entries)} funciones recompiladas desde {args.nro}")
+    print(f"{args.output}: {len(entries)} funciones recompiladas desde {args.nro}; "
+          f"{len(stats['br_tabla'])} tablas de salto resueltas, "
+          f"{len(stats['br_indirecto'])} BR sin tabla (llamadas de cola por puntero)")
 
 
 if __name__ == "__main__":
