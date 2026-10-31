@@ -1,7 +1,7 @@
 # guest (ARM64, formato Switch) -> NRO -> C -> ejecutable nativo de Linux x86_64
 CLANG ?= clang
 B := build
-PROGS := hola neon vm
+PROGS := hola neon vm multi
 
 OPT ?= -O2
 # -ffp-contract=off en las dos versiones: ningún compilador fusiona a*b+c por su cuenta.
@@ -30,15 +30,46 @@ $(B)/%.elf: $(B)/start.o $(B)/%.o guest/link.ld
 $(B)/%.nro: $(B)/%.elf tools/mknro.py
 	python3 tools/mknro.py $< $@
 
-$(B)/%_rec.c: $(B)/%.nro $(RECOMP)
-	python3 recomp/nxrecomp.py $< -o $@
+$(B)/%_rec/programa.c: $(B)/%.nro $(RECOMP)
+	python3 recomp/nxrecomp.py $< -o $(B)/$*_rec
 
-$(B)/%: $(B)/%_rec.c $(RUNTIME) $(RUNTIME_H)
-	$(CLANG) $(HOST_CFLAGS) $< $(RUNTIME) -lm -o $@
+$(B)/%: $(B)/%_rec/programa.c $(RUNTIME) $(RUNTIME_H)
+	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -o $@
 
 # El mismo programa compilado directo para x86_64: su salida es la referencia.
 $(B)/%_ref: guest/%.c guest/mini.h | $(B)
 	$(CLANG) -O2 -ffp-contract=off -DNATIVE_REF $< -o $@
+
+# Par de módulos NSO enlazados entre sí (main importa del sdk), como el ExeFS de un juego.
+MOD_CFLAGS := --target=aarch64-none-elf -O2 -fPIC -ffreestanding -fno-builtin -nostdlib -fno-stack-protector \
+	-ffp-contract=off -fno-math-errno -fno-asynchronous-unwind-tables -fno-unwind-tables -Wall
+M := $(B)/multi_mod
+
+$(M)/%.o: guest/multi/%.c guest/mini.h | $(M)
+	$(CLANG) $(MOD_CFLAGS) -c $< -o $@
+
+$(M)/modstart.o: guest/multi/modstart.S | $(M)
+	$(CLANG) $(MOD_CFLAGS) -c $< -o $@
+
+$(M)/%.so: $(M)/%.o $(M)/modstart.o guest/multi/module.ld
+	ld.lld -shared -T guest/multi/module.ld --hash-style=sysv -z norelro -soname $* $(M)/modstart.o $< -o $@
+
+$(M)/exefs/main.npdm: tools/mknso.py | $(M)
+	mkdir -p $(M)/exefs
+	python3 tools/mknso.py --npdm multi $@
+
+$(M)/exefs/%: $(M)/%.so tools/mknso.py recomp/nso.py
+	mkdir -p $(M)/exefs
+	python3 tools/mknso.py $< $@
+
+$(B)/multi_rec/programa.c: $(M)/exefs/main $(M)/exefs/sdk $(M)/exefs/main.npdm $(RECOMP)
+	python3 recomp/nxrecomp.py $(M)/exefs -o $(B)/multi_rec
+
+$(B)/multi_ref: guest/multi/main.c guest/multi/sdk.c guest/multi/ref.c guest/mini.h | $(B)
+	$(CLANG) -O2 -ffp-contract=off -DNATIVE_REF guest/multi/main.c guest/multi/sdk.c guest/multi/ref.c -o $@
+
+$(M):
+	mkdir -p $@
 
 test: all
 	@ok=1; for p in $(PROGS); do \
@@ -53,5 +84,5 @@ $(B):
 clean:
 	rm -rf $(B)
 
-.PRECIOUS: $(B)/%.o $(B)/%.elf $(B)/%.nro $(B)/%_rec.c
+.PRECIOUS: $(M)/%.o $(M)/%.so $(B)/%.o $(B)/%.elf $(B)/%.nro $(B)/%_rec/programa.c
 .PHONY: all test clean

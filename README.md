@@ -22,7 +22,21 @@ make test
 compila cada programa para la Switch, lo recompila y compara su salida con la del mismo código compilado directo para x86_64:
 - `hola`: enteros. Pasa en `-O0` a `-Oz` (`make test OPT=-Os`).
 - `vm`: una máquina virtual de bytecode (un `switch` de 32 casos dentro del bucle del intérprete), un analizador léxico y switches densos y dispersos. Ejercita las tablas de salto en `-O0` a `-Oz`.
+- `multi`: dos módulos NSO comprimidos con LZ4, `main` y `sdk`, enlazados entre sí como el ExeFS de un juego. Tiene llamadas por PLT/GOT, tablas de punteros, una vtable, constructores, un símbolo débil ausente y una importación sin definir.
 - `neon`: punto flotante y bucles vectorizados con `-O3`. Usa FMUL/FADD, TBL, ST3, SQXTN2, SHRN2, UMLAL2, UZP2, REV64, CNT, ADDV, BSL, FCVTZS y más. Los resultados coinciden bit a bit.
+
+## Juegos: NSP → ExeFS → C → ejecutable
+
+```
+python3 tools/extraer.py --keys ~/.switch/prod.keys juego.nsp [--update actualizacion.nsp] -o ~/Juegos/juego
+python3 recomp/nxrecomp.py ~/Juegos/juego/ExeFS -o ~/Juegos/juego/c
+python3 tools/compilar.py ~/Juegos/juego/c -o ~/Juegos/juego/juego
+```
+
+- **Extracción** (`tools/extraer.py`): usa `nx_extract` de nxnative (LibHac, licencia MIT, en `tools/nx_extract`). Abre NSP, NSZ, XCI y XCZ, junta la actualización con el juego base y saca el ExeFS y el RomFS. Necesita el SDK de .NET (`sudo pacman -S dotnet-sdk`) y las `prod.keys` de tu propia consola.
+- **Módulos** (`recomp/nso.py`): lee NSO con LZ4 y verifica el SHA-256 de cada segmento, igual que el cargador de Horizon. También lee NRO y el `main.npdm` (pila, prioridad, espacio de direcciones).
+- **Enlace** (`recomp/program.py`): hace el trabajo de `rtld`, pero antes de traducir. Ubica `rtld`, `main`, `subsdk*` y `sdk` uno detrás de otro, aplica las reubicaciones (RELA, JMPREL y RELR empaquetadas) y resuelve los símbolos entre módulos con las reglas de Horizon. Así el traductor ve las direcciones finales de las vtables y de la GOT. Lo que ningún módulo define queda como un stub que dice su nombre si alguien lo llama.
+- **Salida**: el C se reparte en varios archivos y la imagen de cada módulo se incluye con `.incbin`, sin copiarla al C. `tools/compilar.py` los compila en paralelo.
 
 ## El conjunto de instrucciones: completo para la CPU de la Switch
 
@@ -49,7 +63,9 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 
 ## Límites conocidos
 
-- **Tablas de salto en binarios con reubicaciones**: las tablas se leen del archivo tal cual. En un NSO real (PIE) las tablas de punteros absolutos se llenan con reubicaciones al cargar, así que habrá que aplicarlas antes de analizar.
+- **Arranque de un juego real**: después de los constructores se salta directo a `nnMain`. Un juego con el SDK de Nintendo necesita antes la secuencia de `nn::init::Start` (`nnosInitialize`, `nninitStartup`...), y esa secuencia necesita hilos, SVC y servicios de Horizon. Es el siguiente paso.
+- **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
+- **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
 - **Hilos**: el monitor exclusivo es de un solo hilo.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.
 - **Velocidad**: el código traducido es entre 2 y 4,5 veces más lento que el nativo. Los registros viven en memoria y todavía no hay optimizaciones.
@@ -60,7 +76,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 1. ~~NEON y punto flotante~~: hecho, verificado contra Unicorn.
 2. ~~Tablas de salto~~: hecho. `recomp/jumptable.py` reconstruye el cálculo del destino de cada `BR` hacia atrás (incluso con la dirección de la tabla sacada del bucle o el índice pasado por la pila en `-O0`), encuentra la cota del `CMP` y lee la tabla. Los destinos se vuelven etiquetas `goto` de la misma función.
 3. **Optimización**: registros en variables locales y eliminación de banderas que nadie lee.
-4. **Formato NSO y NSP**: descompresión LZ4 y los módulos `rtld`, `main` y `sdk`. La extracción con `prod.keys` sacadas de tu propia consola puede reutilizar las herramientas de nxnative.
+4. ~~Formato NSO y NSP~~: hecho (extracción, NSO con LZ4, enlace entre módulos, NPDM).
 5. **Hilos y sincronización de Horizon**: mapear los hilos del juego a hilos de Linux, con atómicos de verdad.
 6. **Servicios del SDK** (`sm`, `fs`, `hid`, `vi`, `nvdrv`, audio). nxnative tiene muchos en C portable bajo `dm/host`.
 7. **Gráficos**: NVN sobre Vulkan para la RTX/Radeon, en lugar de Metal.

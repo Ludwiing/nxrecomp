@@ -94,3 +94,17 @@ void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to) {
             (unsigned long long)to, (unsigned long long)from);
     exit(1);
 }
+
+void nx_import_call(Ctx *c, int index) {
+    (void)c;
+    fflush(stdout);
+    fprintf(stderr, "[RED] se llamó a %s, que ningún módulo define y el runtime todavía no implementa\n",
+            nx_imports[index]);
+    exit(1);
+}
+
+uint64_t nx_symbol(const char *name) {
+    for (int k = 0; k < nx_nsymbols; k++)
+        if (!strcmp(nx_symbols[k].name, name)) return nx_symbols[k].addr;
+    return 0;
+}

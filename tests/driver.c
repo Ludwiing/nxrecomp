@@ -25,6 +25,10 @@ extern const int nx_ntests;
 extern const uint32_t nx_words[];
 
 void nx_dispatch(Ctx *c, uint64_t a) { nx_bad_jump(c, 0, a); }
+const char *const nx_imports[] = {0};
+const int nx_nimports = 0;
+const NxSymbol nx_symbols[] = {{0, 0}};
+const int nx_nsymbols = 0;
 
 static uint32_t crc_table[256];
 static volatile int current = -1;

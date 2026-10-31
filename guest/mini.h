@@ -48,7 +48,7 @@ void *memcpy(void *d, const void *s, size_t n) {
 static char buf[512];
 static size_t blen;
 
-static void flush(void) {
+__attribute__((unused)) static void flush(void) {
     if (blen) out_raw(buf, blen);
     blen = 0;
 }
@@ -75,9 +75,7 @@ static void put_s(s64 v) {
 }
 
 // %d s32, %u u32, %x u32 hex, %D s64, %U u64, %X u64 hex, %s cadena, %c carácter
-static void pr(const char *f, ...) {
-    va_list ap;
-    va_start(ap, f);
+__attribute__((unused)) static void vpr(const char *f, va_list ap) {
     for (; *f; f++) {
         if (*f != '%') {
             put(*f);
@@ -96,5 +94,11 @@ static void pr(const char *f, ...) {
         default: put('%'); put(*f); break;
         }
     }
+}
+
+__attribute__((unused)) static void pr(const char *f, ...) {
+    va_list ap;
+    va_start(ap, f);
+    vpr(f, ap);
     va_end(ap);
 }

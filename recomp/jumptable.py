@@ -38,7 +38,7 @@ def find_bound(mod, pc):
     cond = None
     q = pc - 4
     for _ in range(MAX_BACK):
-        if q < mod.text_lo:
+        if not mod.in_text(q):
             break
         w = mod.word(q)
         if bits(w, 31, 24) == 0b01010100 and not bits(w, 4, 4):  # B.cond
@@ -71,7 +71,7 @@ class Slicer:
             return ("var",)
         q = pc - 4
         for _ in range(MAX_BACK):
-            if q < self.mod.text_lo:
+            if not self.mod.in_text(q):
                 break
             if self.bound and r == self.bound[0] and q < self.bound[1] + 4:
                 return ("var",)  # el valor que acota el CMP
@@ -90,7 +90,7 @@ class Slicer:
         """Busca hacia atrás el guardado en [base + off] que alimenta una carga (código -O0)."""
         p = q - 4
         for _ in range(2 * MAX_BACK):
-            if p < self.mod.text_lo:
+            if not self.mod.in_text(p):
                 return None
             w = self.mod.word(p)
             if _flow_stop(w):
@@ -212,10 +212,7 @@ def evaluate(mod, e, k):
         return (sext(v, width) & M64) if signed else v
     if t == "load":
         a = evaluate(mod, e[1], k)
-        off = a - mod.base
-        if off < 0 or off + e[2] > len(mod.image):
-            raise ValueError("fuera de la imagen")
-        v = int.from_bytes(mod.image[off:off + e[2]], "little")
+        v = int.from_bytes(mod.read(a, e[2]), "little")
         return (sext(v, 8 * e[2]) & M64) if e[3] else v
     raise ValueError(t)
 

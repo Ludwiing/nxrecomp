@@ -47,23 +47,31 @@ NX_WRV(16, h)
 NX_WRV(32, s)
 NX_WRV(64, d)
 
-typedef struct NxImage {
-    uint64_t base;
-    uint64_t size;
+// Lo que genera el recompilador (programa.c)
+typedef struct NxModule {
+    const char *name;
+    uint64_t base, size, bss;     // la imagen (text + ro + data) va en base; el bss la sigue
     const unsigned char *data;
-    uint64_t bss_size;
-    uint64_t bss_start;
-} NxImage;
+} NxModule;
+typedef struct NxSymbol {
+    const char *name;
+    uint64_t addr;
+} NxSymbol;
+extern const NxModule nx_modules[];
+extern const int nx_nmodules;
+extern const NxSymbol nx_symbols[];
+extern const int nx_nsymbols;
+extern const char *const nx_imports[];
+extern const int nx_nimports;
+extern const uint64_t nx_inits[];
+extern const int nx_ninits;
+extern const uint64_t nx_main_addr, nx_entry_addr, nx_main_stack;
+void nx_dispatch(Ctx *c, uint64_t addr);
 
 enum {
     NX_TPIDR_EL0, NX_TPIDRRO_EL0, NX_CNTFRQ_EL0, NX_CNTPCT_EL0, NX_CNTVCT_EL0,
     NX_DCZID_EL0, NX_NZCV, NX_FPCR, NX_FPSR, NX_CTR_EL0,
 };
-
-// Lo que genera el recompilador
-extern const NxImage nx_image;
-void nx_entry(Ctx *c);
-void nx_dispatch(Ctx *c, uint64_t addr);
 
 // Lo que implementa nxrt.c
 void nx_map_fixed(uint64_t addr, uint64_t size, const char *what);
@@ -73,6 +81,8 @@ void nx_msr(Ctx *c, int reg, uint64_t v);
 void nx_dc_zva(Ctx *c, uint64_t addr);
 __attribute__((noreturn)) void nx_trap(Ctx *c, uint64_t pc, uint32_t word, const char *why);
 __attribute__((noreturn)) void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to);
+__attribute__((noreturn)) void nx_import_call(Ctx *c, int index);
+uint64_t nx_symbol(const char *name);
 
 // ---------- memoria (ARM permite accesos desalineados, x86 también) ----------
 #define NX_LD(bits)                                                                 \
