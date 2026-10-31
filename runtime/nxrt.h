@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include "nxfp.h"
+#include "nxsimd.h"
+#include "nxcrypto.h"
 
 // Un registro V de NEON. En x86 y en ARM el carril 0 es el byte menos significativo,
 // así que las vistas por tamaño de elemento coinciden con la numeración de ARM.

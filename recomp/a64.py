@@ -394,8 +394,9 @@ def loadstore(i, x):
             raise Unsupported("SIMD exclusivo")
         size, o2, l, o1, rs, o0 = bits(x, 31, 30), bits(x, 23, 23), bits(x, 22, 22), bits(x, 21, 21), bits(x, 20, 16), bits(x, 15, 15)
         rt2 = bits(x, 14, 10)
-        if o1 == 0 and rt2 != 31 or (o2 == 1 or l) and rs != 31 or o2 == 1 and o0 == 0:
-            raise Unsupported("exclusiva con campos reservados")
+        # Rt2 y Rs "deberían ser 1" en algunas formas; el procesador los ignora, igual que aquí.
+        if o2 == 1 and o0 == 0:
+            raise Unsupported("LDLAR/STLLR (ARMv8.1)")
         if not l and o2 == 0 and rs in (rt, rt2) or not l and o2 == 0 and rs == rn and rn != 31:
             raise Unsupported("exclusiva UNPREDICTABLE")
         if o2 == 1 and o1 == 0:  # LDAR / STLR
@@ -580,8 +581,15 @@ def dp_reg(i, x):
                 0b001010: f"({T(w)})(({ST(w)}){a} >> ({b} & {w - 1}))",
                 0b001011: f"ror{w}({a}, {b} & {w - 1})",
             }
+            if opcode >> 3 == 0b010 and not bits(x, 29, 29):  # CRC32 / CRC32C
+                sz, crc_c = bits(x, 11, 10), bits(x, 12, 12)
+                if (sz == 3) != bool(sf):
+                    raise Unsupported("CRC32 inválido")
+                poly = "0x82F63B78u" if crc_c else "0xEDB88320u"
+                i.lines = [setr(rd, f"crc32_arm((uint32_t){R(rn)}, {R(rm)}, {1 << sz}, {poly})", 32)]
+                return
             if opcode not in ops or bits(x, 29, 29):
-                raise Unsupported("CRC32 o procesamiento de 2 fuentes no soportado")
+                raise Unsupported("procesamiento de 2 fuentes no soportado")
             i.lines = [setr(rd, ops[opcode], w)]
         else:  # 1 fuente
             if bits(x, 20, 16) or bits(x, 29, 29):
@@ -605,7 +613,7 @@ def dp_reg(i, x):
 
     if bits(x, 28, 24) == 0b11011:  # 3 fuentes
         op31, o0, ra = bits(x, 23, 21), bits(x, 15, 15), bits(x, 14, 10)
-        if bits(x, 30, 29) or op31 in (2, 6) and ra != 31:
+        if bits(x, 30, 29):
             raise Unsupported("multiplicación inválida")
         sign = "-" if o0 else "+"
         if op31 == 0:

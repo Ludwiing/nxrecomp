@@ -30,8 +30,11 @@ def vfp_expand_imm(imm8, w):
 
 def fp_scalar(i, x):
     """Grupo 'punto flotante escalar' (bits 28:24 = 11110 / 11111, bit 30 = 0)."""
-    if bits(x, 31, 31) or bits(x, 29, 29):
-        raise Unsupported("FP con M o S reservados")
+    if bits(x, 29, 29):
+        raise Unsupported("FP con S reservado")
+    conversion = bits(x, 28, 24) == 0b11110 and (bits(x, 21, 21) == 0 or bits(x, 15, 10) == 0)
+    if bits(x, 31, 31) and not conversion:  # en las conversiones el bit 31 es sf
+        raise Unsupported("FP con M reservado")
     ftype = bits(x, 23, 22)
     rd, rn, rm = bits(x, 4, 0), bits(x, 9, 5), bits(x, 20, 16)
 
@@ -110,9 +113,7 @@ def fp_scalar(i, x):
         if ftype not in (0, 1) or bits(x, 15, 14) or bits(x, 2, 0):
             raise Unsupported("FCMP inválido")
         w = FT[ftype]
-        zero = bits(x, 3, 3)
-        if zero and rm:
-            raise Unsupported("FCMP con cero inválido")
+        zero = bits(x, 3, 3)  # con cero, el campo Rm se ignora
         b = "0" if zero else S(rm, w)
         i.lines = [f"{{ unsigned f = fcmp{w}({S(rn, w)}, {b}); c->n = f >> 3; c->z = f >> 2 & 1; c->c = f >> 1 & 1; c->v = f & 1; }}"]
         return
@@ -178,7 +179,8 @@ def conv_int(i, x, ftype, rd, rn):
 
 
 def advsimd(i, x):
-    raise Unsupported("NEON todavía no soportado")
+    import neon
+    neon.decode(i, x)
 
 
 # ---------- cargas y guardados de registros V ----------
