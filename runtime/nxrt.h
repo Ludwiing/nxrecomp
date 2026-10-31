@@ -6,7 +6,26 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "nxfp.h"
+
+// Un registro V de NEON. En x86 y en ARM el carril 0 es el byte menos significativo,
+// así que las vistas por tamaño de elemento coinciden con la numeración de ARM.
+typedef union V128 {
+    uint8_t b[16];
+    uint16_t h[8];
+    uint32_t s[4];
+    uint64_t d[2];
+    int8_t sb[16];
+    int16_t sh[8];
+    int32_t ss[4];
+    int64_t sd[2];
+    float f[4];
+    double df[2];
+    unsigned __int128 q;
+} V128;
+
 typedef struct Ctx {
+    V128 vr[32];  // V0-V31 (los nombres n, z, c, v son las banderas)
     uint64_t x[31];
     uint64_t sp;
     uint8_t n, z, c, v;
@@ -14,6 +33,17 @@ typedef struct Ctx {
     uint64_t fpcr, fpsr;
     uint64_t excl_addr; // monitor exclusivo de LDXR/STXR (por ahora de un solo hilo)
 } Ctx;
+
+// Escribir un escalar en un registro V pone en cero el resto del registro.
+#define NX_WRV(bits, lane)                                                          \
+    static inline void wrv##bits(Ctx *c, int d, uint64_t v) {                      \
+        c->vr[d].q = 0;                                                             \
+        c->vr[d].lane[0] = (uint##bits##_t)v;                                       \
+    }
+NX_WRV(8, b)
+NX_WRV(16, h)
+NX_WRV(32, s)
+NX_WRV(64, d)
 
 typedef struct NxImage {
     uint64_t base;
@@ -34,6 +64,7 @@ void nx_entry(Ctx *c);
 void nx_dispatch(Ctx *c, uint64_t addr);
 
 // Lo que implementa nxrt.c
+void nx_map_fixed(uint64_t addr, uint64_t size, const char *what);
 void nx_svc(Ctx *c, uint32_t imm);
 uint64_t nx_mrs(Ctx *c, int reg);
 void nx_msr(Ctx *c, int reg, uint64_t v);
@@ -56,6 +87,12 @@ NX_LD(8)
 NX_LD(16)
 NX_LD(32)
 NX_LD(64)
+static inline V128 ldq(uint64_t a) {
+    V128 v;
+    memcpy(&v, (const void *)(uintptr_t)a, 16);
+    return v;
+}
+static inline void stq(uint64_t a, V128 v) { memcpy((void *)(uintptr_t)a, &v, 16); }
 
 // ---------- aritmética con banderas (AddWithCarry del manual de Arm) ----------
 static inline uint64_t awc64(Ctx *c, uint64_t x, uint64_t y, unsigned cin, int setf) {

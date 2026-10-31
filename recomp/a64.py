@@ -159,7 +159,11 @@ def decode(pc, word):
         elif op0 & 0b0111 == 0b0101:
             dp_reg(i, word)
         elif op0 & 0b0111 == 0b0111:
-            unimpl(i, "SIMD/FP todavía no soportado")
+            import simd
+            if bits(word, 28, 24) in (0b11110, 0b11111) and not bits(word, 30, 30):
+                simd.fp_scalar(i, word)
+            else:
+                simd.advsimd(i, word)
         else:
             unimpl(i, "codificación no asignada")
     except Unsupported as e:
@@ -230,7 +234,7 @@ def dp_imm(i, x):
     elif kind == 0b110:  # SBFM / BFM / UBFM
         opc, n = bits(x, 30, 29), bits(x, 22, 22)
         immr, imms = bits(x, 21, 16), bits(x, 15, 10)
-        if opc == 3 or n != sf:
+        if opc == 3 or n != sf or (not sf and (immr > 31 or imms > 31)):
             raise Unsupported("bitfield inválido")
         m = decode_bit_masks(n, imms, immr, False, w)
         if m is None:
@@ -252,6 +256,8 @@ def dp_imm(i, x):
         if bits(x, 30, 29) or bits(x, 22, 22) != sf or bits(x, 21, 21):
             raise Unsupported("extract inválido")
         rm, lsb = bits(x, 20, 16), bits(x, 15, 10)
+        if not sf and lsb > 31:
+            raise Unsupported("extract inválido")
         if lsb == 0:
             i.lines = [setr(rd, RW(rm, w), w)]
         else:
@@ -333,8 +339,10 @@ def system(i, x):
     elif op0 == 1 and l == 0:  # SYS: mantenimiento de cachés
         if op1 == 3 and crn == 7 and crm == 4 and op2 == 1:
             i.lines = [f"nx_dc_zva(c, {R(rt)});"]
+        elif op1 == 3 and crn == 7 and (crm, op2) in ((5, 1), (10, 1), (11, 1), (14, 1)):
+            i.lines = ["/* IC IVAU / DC CVAC / DC CVAU / DC CIVAC */"]
         else:
-            i.lines = ["/* mantenimiento de caché */"]
+            raise Unsupported("instrucción SYS no permitida en EL0")
     elif op0 >= 2:
         name = SYSREG.get((op0, op1, crn, crm, op2))
         if name is None:
@@ -372,12 +380,25 @@ def loadstore(i, x):
     rt, rn = bits(x, 4, 0), bits(x, 9, 5)
     base = R(rn, sp=True)
 
+    if bits(x, 29, 24) in (0b001100, 0b001101) and not bits(x, 31, 31):  # LD1-LD4 / ST1-ST4
+        import simd
+        simd.ldst_struct(i, x)
+        return
+    if v and (bits(x, 29, 27) in (0b101, 0b111) or bits(x, 29, 27) == 0b011 and not bits(x, 24, 24)):  # B/H/S/D/Q
+        import simd
+        simd.ldst_v(i, x)
+        return
+
     if bits(x, 29, 24) == 0b001000:  # exclusivas y adquirir/liberar
         if v:
             raise Unsupported("SIMD exclusivo")
         size, o2, l, o1, rs, o0 = bits(x, 31, 30), bits(x, 23, 23), bits(x, 22, 22), bits(x, 21, 21), bits(x, 20, 16), bits(x, 15, 15)
         rt2 = bits(x, 14, 10)
-        if o2 == 1 and o1 == 0:  # LDAR / STLR / LDLAR / STLLR
+        if o1 == 0 and rt2 != 31 or (o2 == 1 or l) and rs != 31 or o2 == 1 and o0 == 0:
+            raise Unsupported("exclusiva con campos reservados")
+        if not l and o2 == 0 and rs in (rt, rt2) or not l and o2 == 0 and rs == rn and rn != 31:
+            raise Unsupported("exclusiva UNPREDICTABLE")
+        if o2 == 1 and o1 == 0:  # LDAR / STLR
             i.lines = [f"{{ uint64_t a = {base}; __atomic_thread_fence(__ATOMIC_SEQ_CST); {mem_op(size, l, rt)} }}"]
         elif o2 == 0 and o1 == 0:  # LDXR / LDAXR / STXR / STLXR
             if l:
@@ -419,8 +440,10 @@ def loadstore(i, x):
             raise Unsupported("LDP/STP de SIMD")
         opc, typ, l = bits(x, 31, 30), bits(x, 24, 23), bits(x, 22, 22)
         rt2 = bits(x, 14, 10)
-        if opc == 3 or (opc == 1 and not l):
+        if opc == 3 or (opc == 1 and (not l or typ == 0)):
             raise Unsupported("par inválido")
+        if l and rt == rt2 or typ in (1, 3) and rn != 31 and rn in (rt, rt2):
+            raise Unsupported("par UNPREDICTABLE")
         s = 3 if opc == 2 else 2
         off = sext(bits(x, 21, 15), 7) << s
         n = 1 << s
@@ -454,6 +477,10 @@ def loadstore(i, x):
         if bits(x, 21, 21) == 0:
             imm = sext(bits(x, 20, 12), 9)
             form = bits(x, 11, 10)  # 0 sin escalar, 1 post, 2 sin privilegios, 3 pre
+            if size == 3 and opc == 2 and form != 0 or size == 2 and opc == 3:
+                raise Unsupported("load/store inválido")
+            if form in (1, 3) and rn == rt and rn != 31:
+                raise Unsupported("writeback UNPREDICTABLE")
             if form == 1:
                 i.lines = [f"{{ uint64_t a = {base}; {mem_op(size, opc, rt)} {base} = a + {imm}; }}"]
             elif form == 3:
@@ -496,11 +523,11 @@ def dp_reg(i, x):
         op, s = bits(x, 30, 30), bits(x, 29, 29)
         if bits(x, 21, 21) == 0:  # desplazado
             st, amt = bits(x, 23, 22), bits(x, 15, 10)
-            if st == 3:
-                raise Unsupported("desplazamiento ROR inválido")
+            if st == 3 or (not sf and amt > 31):
+                raise Unsupported("desplazamiento inválido")
             a, b, dsp = RW(rn, w), shifted(RW(rm, w), st, amt, w), False
         else:  # extendido
-            if bits(x, 23, 22):
+            if bits(x, 23, 22) or bits(x, 12, 10) > 4:
                 raise Unsupported("extendido inválido")
             a = RW(rn, w, sp=True)
             b = extended(rm, bits(x, 15, 13), bits(x, 12, 10), w)
@@ -514,6 +541,8 @@ def dp_reg(i, x):
 
     top = bits(x, 28, 21)
     if top == 0b11010000:  # ADC / SBC
+        if bits(x, 15, 10):
+            raise Unsupported("ADC/SBC inválido")
         op, s = bits(x, 30, 30), bits(x, 29, 29)
         b = f"({T(w)})~{RW(rm, w)}" if op else RW(rm, w)
         i.lines = [setr(rd, flags_add(w, RW(rn, w), b, "c->c", s), w)]
@@ -521,7 +550,7 @@ def dp_reg(i, x):
 
     if top == 0b11010010:  # CCMN / CCMP
         op, cond, nzcv = bits(x, 30, 30), bits(x, 15, 12), bits(x, 3, 0)
-        if not bits(x, 29, 29):
+        if not bits(x, 29, 29) or bits(x, 10, 10) or bits(x, 4, 4):
             raise Unsupported("comparación condicional inválida")
         b = lit(rm, w) if bits(x, 11, 11) else RW(rm, w)
         if op:
@@ -576,6 +605,8 @@ def dp_reg(i, x):
 
     if bits(x, 28, 24) == 0b11011:  # 3 fuentes
         op31, o0, ra = bits(x, 23, 21), bits(x, 15, 15), bits(x, 14, 10)
+        if bits(x, 30, 29) or op31 in (2, 6) and ra != 31:
+            raise Unsupported("multiplicación inválida")
         sign = "-" if o0 else "+"
         if op31 == 0:
             e = f"{RW(ra, w)} {sign} ({T(w)})({RW(rn, w)} * {RW(rm, w)})"

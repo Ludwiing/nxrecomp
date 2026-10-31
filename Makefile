@@ -6,7 +6,7 @@ OPT ?= -O2
 GUEST_CFLAGS := --target=aarch64-none-elf $(OPT) -ffreestanding -fno-builtin -nostdlib \
 	-mgeneral-regs-only -fno-jump-tables -fno-pic -fno-stack-protector \
 	-fno-asynchronous-unwind-tables -fno-unwind-tables -Wall
-HOST_CFLAGS := -O2 -Iruntime -Wall -Wno-unused-label -Wno-unused-function -Wno-unused-value -Wno-parentheses-equality
+HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime -Wall -Wno-unused-label -Wno-unused-function -Wno-unused-value -Wno-parentheses-equality
 
 all: $(B)/hola $(B)/hola_ref
 
@@ -21,8 +21,8 @@ $(B)/hola.nro: $(B)/hola.elf tools/mknro.py
 $(B)/hola_rec.c: $(B)/hola.nro recomp/nxrecomp.py recomp/a64.py
 	python3 recomp/nxrecomp.py $< -o $@
 
-$(B)/hola: $(B)/hola_rec.c runtime/nxrt.c runtime/nxrt.h
-	$(CLANG) $(HOST_CFLAGS) $(B)/hola_rec.c runtime/nxrt.c -o $@
+$(B)/hola: $(B)/hola_rec.c runtime/nxrt.c runtime/nxmain.c runtime/nxrt.h
+	$(CLANG) $(HOST_CFLAGS) $(B)/hola_rec.c runtime/nxrt.c runtime/nxmain.c -lm -o $@
 
 # El mismo programa compilado directo para x86_64: su salida es la referencia.
 $(B)/hola_ref: guest/hola.c | $(B)
