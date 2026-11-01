@@ -13,6 +13,10 @@ typedef struct {
 int nx_gl_draw(const NxDraw *d);
 int nx_gl_dispatch(const uint32_t *compute_regs, const uint32_t *qmd); // lanzamiento de cómputo  // 0 si no hay OpenGL (NX_SIN_GPU o sin EGL)
 int nx_gl_clear(const uint32_t *regs, uint32_t v); // ClearBuffers en la GPU; 0 si la tiene que hacer la CPU
+// Contadores de los reportes (tipo = bits 23-27 del método ReportSemaphore): el valor acumulado
+// desde el último reinicio; 0 si no se cuenta. nx_gl_contador_reiniciar recibe el valor de CounterReset.
+uint64_t nx_gl_contador(uint32_t tipo);
+void nx_gl_contador_reiniciar(uint32_t v);
 void nx_gl_flush(void);           // escribe en la memoria del juego lo que la GPU dibujó
 void nx_gl_release(void);         // flush y suelta el contexto (al terminar un envío)
 // La CPU va a escribir esa memoria (ClearBuffers por CPU, cargas en línea): lo pendiente se escribe

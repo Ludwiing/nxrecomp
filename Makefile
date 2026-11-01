@@ -10,10 +10,13 @@ LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema)
 # Ejemplos oficiales de libnx con pantalla: se compara la huella del cuadro 10 (sin ventana).
 LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
 # deko3d por la GPU: el color de limpieza y el triángulo con sus colores interpolados.
-LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic deko_console deko_imagen)
+LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic deko_console deko_imagen deko_gpu)
 PIXELES_deko_basic := 0 0 32,75,122 1270 10 32,75,122 640 360 127,64,64 640 20 248,3,4 100 700 7,231,17 1180 700 7,16,232
 # deko_console: texto con una textura de fuente (arreglo 2D subido con el motor de copia), 3600 instancias.
 # deko_imagen: un shader de cómputo pinta (x, y, x xor y) en una imagen que después se muestra.
+# deko_gpu: draws indirectos, alpha test, logic op XOR y tres cuadros verdes si los contadores de
+# muestras, las marcas de tiempo (614,4 MHz) y los semáforos (acquire, reducción) dieron lo esperado.
+PIXELES_deko_gpu := 150 520 255,255,255 400 520 255,0,0 650 520 0,255,0 850 520 0,0,0 950 520 0,0,255 1150 520 0,255,255 100 270 0,255,0 250 270 0,255,0 400 270 0,255,0 600 270 0,0,0
 PIXELES_deko_imagen := 100 50 100,50,86 159 159 159,159,0 37 140 37,140,169 300 300 0,0,0
 PIXELES_deko_console := 0 0 0,0,0 231 21 191,191,191 56 98 0,127,0 133 357 255,0,0 357 357 64,0,0 168 385 255,255,0 133 406 0,0,255
 # deko_examples (los 9 ejemplos oficiales de deko3d, elegidos desde su menú con NX_PULSAR). Varios

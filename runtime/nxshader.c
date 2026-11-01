@@ -319,6 +319,14 @@ static void frag_outputs(T *t) {
                   t->key->rt_int[rt] == 1 ? "int" : t->key->rt_int[rt] == 2 ? "uint" : "uintBitsToFloat", R(t, base + c));
         if (omap >> (rt * 4) & 15) base += 4;
     }
+    // Alpha test sobre el alfa del render target 0 (en el hardware es estado fijo).
+    if (t->key->alpha_func && t->key->alpha_func != 8 && (omap & 0xF) && !t->key->rt_int[0]) {
+        static const char *op[8] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
+        int f = t->key->alpha_func - 1;
+        if (f == 0) L(t, "discard;");
+        else L(t, "if (!(frag0.w %s uintBitsToFloat(%uu))) discard;", op[f], t->key->alpha_ref);
+        t->uses_discard = 1;
+    }
     if (t->sph[19] & 2) {
         t->frag_depth = 1;
         L(t, "gl_FragDepth = uintBitsToFloat(%s);", R(t, __builtin_popcount(omap) + 1));

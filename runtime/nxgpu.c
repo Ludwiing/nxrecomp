@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sched.h>
 #include <string.h>
 #include <time.h>
 
@@ -319,23 +320,77 @@ static void clear_buffers(uint32_t v) {
         }
 }
 
+// Marcas de tiempo de la GPU: ticks de 614,4 MHz (384 por cada 625 ns), no los de 19,2 MHz de la CPU.
+// Algunos juegos restan dos marcas y convierten la diferencia ellos mismos (NieR, BotW).
+static uint64_t gpu_ticks(void) {
+    uint64_t ns = nx_now_ns();
+    return ns / 625 * 384 + ns % 625 * 384 / 625;
+}
+
+// Escribe un reporte: corto (4 bytes) o largo (valor de 64 bits y marca de tiempo).
+static void reporte(uint8_t *p, uint64_t valor, int corto) {
+    if (corto) {
+        uint32_t v32 = (uint32_t)valor;
+        memcpy(p, &v32, 4);
+    } else {
+        uint64_t ts = gpu_ticks();
+        memcpy(p, &valor, 8);
+        memcpy(p + 8, &ts, 8);
+    }
+}
+
+// Espera (acquire) a que la palabra en `p` cumpla la condición. Lo que la cumple puede ser la CPU u
+// otro canal; si no llega en 2 s se avisa y se sigue, para no colgar el juego entero.
+static void esperar_semaforo(volatile uint32_t *p, uint32_t valor, int modo) {
+    uint64_t limite = nx_now_ns() + 2000000000ull;
+    for (;;) {
+        uint32_t x = *p;
+        if (modo == 0 ? x == valor : modo == 1 ? x >= valor : (x & valor) != 0) return;
+        if (nx_now_ns() > limite) {
+            fprintf(stderr, "[RED] GPU: semáforo sin cumplirse (vale %u, espera %u, modo %d)\n", x, valor, modo);
+            return;
+        }
+        sched_yield();
+    }
+}
+
+// Reducciones atómicas de los semáforos (Min, Max, Xor, And, Or, Add, Inc, Dec).
+static void reducir(uint32_t *p, uint32_t valor, uint32_t op, int con_signo) {
+    uint32_t viejo = __atomic_load_n(p, __ATOMIC_SEQ_CST), nuevo;
+    do {
+        switch (op) {
+        case 0: nuevo = con_signo ? ((int32_t)viejo < (int32_t)valor ? viejo : valor) : viejo < valor ? viejo : valor; break;
+        case 1: nuevo = con_signo ? ((int32_t)viejo > (int32_t)valor ? viejo : valor) : viejo > valor ? viejo : valor; break;
+        case 2: nuevo = viejo ^ valor; break;
+        case 3: nuevo = viejo & valor; break;
+        case 4: nuevo = viejo | valor; break;
+        case 5: nuevo = viejo + valor; break;
+        case 6: nuevo = viejo >= valor ? 0 : viejo + 1; break;
+        case 7: nuevo = viejo == 0 || viejo > valor ? valor : viejo - 1; break;
+        default: return;
+        }
+    } while (!__atomic_compare_exchange_n(p, &viejo, nuevo, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+}
+
+// SetReportSemaphore (0x6C3): bits 0-1 operación (0 Release, 1 Acquire, 2 contador), 23-27 tipo de
+// contador, 28 reporte corto.
 static void report_semaphore(uint32_t v) {
     uint32_t *R = e3d.regs;
     uint8_t *p = nx_gpu_ptr(iova(R, 0x6C0));
     if (!p) return;
-    uint32_t op = v & 3;
-    if (op == 0 || op == 2) { // Release / ReportOnly
-        if (v >> 28 & 1) { // forma corta: solo el valor
-            memcpy(p, &R[0x6C2], 4);
-        } else {
-            uint64_t payload = R[0x6C2], ts = nx_now_ns();
-            memcpy(p, &payload, 8);
-            memcpy(p + 8, &ts, 8);
-        }
+    int corto = v >> 28 & 1;
+    switch (v & 3) {
+    case 0: reporte(p, R[0x6C2], corto); break;
+    case 1: esperar_semaforo((volatile uint32_t *)p, R[0x6C2], 0); break;
+    case 2: {
+        uint32_t tipo = v >> 23 & 31;
+        reporte(p, tipo == 0 ? R[0x6C2] : nx_gl_contador(tipo), corto);
+        break;
+    }
     }
 }
 
-static int traza_gpu = -1; // NX_TRAZA_GPU: cada método del motor 3D
+static int traza_gpu; // NX_TRAZA_GPU: cada método del motor 3D y del puller
 
 // Los drivers dibujan N instancias como N pares VertexBeginGl(InstanceNext)/VertexEndGl sin nada en
 // medio; se juntan en un draw instanciado, que sale cuando llega cualquier otro método.
@@ -399,6 +454,7 @@ static void method_3d(uint32_t m, uint32_t v) {
                                             // que no nos importan y avisa en MmeFirmwareArgs[0]
     case 0x674: clear_buffers(v); break;                                // ClearBuffers
     case 0x6C3: draw_flush(), nx_gl_flush(), report_semaphore(v); break; // SetReportSemaphore
+    case 0x54C: draw_flush(), nx_gl_contador_reiniciar(v); break;         // CounterReset
     case 0x06C: // LaunchDma (carga en línea): destino y largo
         e3d.i2m_dst = iova(e3d.regs, 0x62);
         e3d.i2m_len = e3d.regs[0x60] * (e3d.regs[0x61] ? e3d.regs[0x61] : 1);
@@ -430,19 +486,18 @@ static void method_3d(uint32_t m, uint32_t v) {
 
 // Métodos del "puller" (subcanal cualquiera, método < 0x40): semáforos y syncpoints.
 static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
+    if (traza_gpu) fprintf(stderr, "[gpu] fifo %02x = %08x\n", m, v);
     regs[m] = v;
-    if (m == 0x07) { // Semaphore
+    if (m == 0x07) { // SemaphoreD: bits 0-4 operación, 24 tamaño (4 bytes), 27-30 reducción, 31 sin signo
         uint32_t op = v & 31;
-        if (op == 2) draw_flush(), nx_gl_flush();
         uint8_t *p = nx_gpu_ptr(iova(regs, 0x04));
-        if (op == 2 && p) { // Release
-            if (v >> 24 & 1) memcpy(p, &regs[0x06], 4);
-            else {
-                uint64_t payload = regs[0x06], ts = nx_now_ns();
-                memcpy(p, &payload, 8);
-                memcpy(p + 8, &ts, 8);
-            }
-        }
+        if (!p) return;
+        if (op == 2 || op == 16) draw_flush(), nx_gl_flush(); // lo anterior queda escrito antes
+        if (op == 1) esperar_semaforo((volatile uint32_t *)p, regs[0x06], 0);      // Acquire
+        else if (op == 4) esperar_semaforo((volatile uint32_t *)p, regs[0x06], 1); // AcqGeq
+        else if (op == 8) esperar_semaforo((volatile uint32_t *)p, regs[0x06], 2); // AcqAnd
+        else if (op == 2) reporte(p, regs[0x06], v >> 24 & 1);                     // Release
+        else if (op == 16) reducir((uint32_t *)p, regs[0x06], v >> 27 & 15, !(v >> 31 & 1)); // Reduction
     } else if (m == 0x1D && (v & 1)) { // Syncpoint: incrementar (esperar no hace falta: todo es en orden)
         draw_flush();
         nx_gl_flush();
@@ -621,40 +676,50 @@ static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
     // cómputo, 2D y copia: todavía no
 }
 
-// Ejecuta un pushbuffer de `words` palabras en la dirección de GPU `gpu`.
+// Estado del lector de pushbuffers. Sobrevive entre entradas del GPFIFO y entre envíos, como en el
+// hardware: NVN arma los draws indirectos con la llamada a la macro en una entrada y sus argumentos
+// (escritos por la GPU) en la siguiente. La macro corre cuando llega su último argumento.
+static struct {
+    uint32_t method, sub, count, mode; // count: datos que faltan del comando en curso
+} pbs;
+
 static void run_pushbuffer(uint64_t gpu, uint32_t words) {
-    const uint32_t *pb = nx_gpu_ptr(gpu);
-    if (!pb) {
-        fprintf(stderr, "[RED] GPU: pushbuffer en 0x%llx sin memoria\n", (unsigned long long)gpu);
+    uint64_t avail;
+    const uint32_t *pb = nx_gpu_ptr_n(gpu, &avail);
+    if (!pb || avail < (uint64_t)words * 4) {
+        fprintf(stderr, "[RED] GPU: pushbuffer en 0x%llx (%u palabras) sin memoria\n", (unsigned long long)gpu, words);
         return;
     }
     uint32_t i = 0;
     while (i < words) {
+        if (pbs.count) { // datos de un comando que empezó antes (quizá en otra entrada)
+            call_method(pbs.sub, pbs.method, pb[i++]);
+            if (pbs.mode == 1) pbs.method++;
+            else if (pbs.mode == 5) pbs.mode = 3, pbs.method++;
+            if (!--pbs.count) macro_flush();
+            continue;
+        }
         uint32_t h = pb[i++];
         uint32_t m = h & 0x1FFF, sub = h >> 13 & 7, arg = h >> 16 & 0x1FFF, mode = h >> 29;
         switch (mode) {
-        case 1: // creciente
-            for (uint32_t k = 0; k < arg && i < words; k++) call_method(sub, m + k, pb[i++]);
-            break;
-        case 3: // no creciente
-            for (uint32_t k = 0; k < arg && i < words; k++) call_method(sub, m, pb[i++]);
+        case 1: case 3: case 5: // creciente, no creciente, crece una vez
+            pbs.method = m, pbs.sub = sub, pbs.count = arg, pbs.mode = mode;
             break;
         case 4: // en línea: el dato va en la cabecera
             call_method(sub, m, arg);
+            macro_flush();
             break;
-        case 5: // crece una vez
-            for (uint32_t k = 0; k < arg && i < words; k++) call_method(sub, k ? m + 1 : m, pb[i++]);
-            break;
+        case 0: case 2: break; // SetSubDeviceMask y compañía: una sola GPU
         default:
             if (h) fprintf(stderr, "[RED] GPU: cabecera de pushbuffer 0x%08x\n", h);
         }
-        macro_flush(); // una macro corre cuando termina el comando que la llamó
     }
 }
 
 void nx_gpu_submit(const uint64_t *entries, uint32_t n) {
     pthread_mutex_lock(&gpu_lock);
-    if (traza_gpu < 0) traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
+    static int iniciada;
+    if (!iniciada++) traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
     nx_gl_invalidate_all();
     for (uint32_t k = 0; k < n; k++) {
         uint64_t e = entries[k];

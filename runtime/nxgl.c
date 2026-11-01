@@ -45,6 +45,8 @@ static void APIENTRY depurar(GLenum src, GLenum type, GLuint id, GLenum sev, GLs
     if (type == GL_DEBUG_TYPE_ERROR || sev == GL_DEBUG_SEVERITY_HIGH) fprintf(stderr, "[nxgl] OpenGL: %s\n", msg);
 }
 
+static void contadores_empezar(void);
+
 static int iniciar(void) {
     if (estado) return estado > 0;
     estado = -1;
@@ -90,6 +92,7 @@ static int iniciar(void) {
     glNamedBufferData(ibo_ring, RING, NULL, GL_STREAM_DRAW);
     glVertexArrayElementBuffer(vao, ibo_ring);
     glEnable(GL_FRAMEBUFFER_SRGB); // como la GPU: los render targets sRGB convierten al escribir
+    contadores_empezar();
     estado = 1;
     return 1;
 }
@@ -99,6 +102,63 @@ static void tomar(void) {
         eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
         actual = 1;
     }
+}
+
+// ---------- contadores (reportes de oclusión, primitivas y estadísticas del pipeline) ----------
+// Cada uno es una consulta de OpenGL que corre siempre; al reportar se cierra, se suma su resultado
+// y se abre otra. Tipo de reporte de la GPU → consulta de OpenGL y valor de CounterReset.
+static const struct {
+    uint8_t tipo, reinicio;
+    GLenum gl;
+} contadores[] = {
+    {0x15, 0x01, GL_SAMPLES_PASSED},
+    {0x12, 0x1F, GL_PRIMITIVES_GENERATED},
+    {0x0B, 0x10, GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN},
+    {0x01, 0x12, GL_VERTICES_SUBMITTED},
+    {0x03, 0x13, GL_PRIMITIVES_SUBMITTED},
+    {0x05, 0x15, GL_VERTEX_SHADER_INVOCATIONS},
+    {0x1B, 0x16, GL_TESS_CONTROL_SHADER_PATCHES},
+    {0x1D, 0x17, GL_TESS_EVALUATION_SHADER_INVOCATIONS},
+    {0x07, 0x1A, GL_GEOMETRY_SHADER_INVOCATIONS},
+    {0x09, 0x1B, GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED},
+    {0x0F, 0x1C, GL_CLIPPING_INPUT_PRIMITIVES},
+    {0x11, 0x1D, GL_CLIPPING_OUTPUT_PRIMITIVES},
+    {0x13, 0x1E, GL_FRAGMENT_SHADER_INVOCATIONS},
+};
+#define NCONT (sizeof contadores / sizeof *contadores)
+static GLuint consultas[NCONT];
+static uint64_t acumulado[NCONT];
+
+static void contadores_empezar(void) {
+    glGenQueries(NCONT, consultas);
+    for (unsigned i = 0; i < NCONT; i++) glBeginQuery(contadores[i].gl, consultas[i]);
+}
+
+static uint64_t contador_leer(unsigned i) {
+    glEndQuery(contadores[i].gl);
+    GLuint64 r = 0;
+    glGetQueryObjectui64v(consultas[i], GL_QUERY_RESULT, &r);
+    acumulado[i] += r;
+    glBeginQuery(contadores[i].gl, consultas[i]);
+    return acumulado[i];
+}
+
+uint64_t nx_gl_contador(uint32_t tipo) {
+    if (!iniciar()) return 0;
+    tomar();
+    for (unsigned i = 0; i < NCONT; i++)
+        if (contadores[i].tipo == tipo) return contador_leer(i);
+    return 0; // estadísticas de zcull y otros: no se cuentan
+}
+
+void nx_gl_contador_reiniciar(uint32_t v) {
+    if (!iniciar()) return;
+    tomar();
+    for (unsigned i = 0; i < NCONT; i++)
+        if (contadores[i].reinicio == (v & 0xFF)) {
+            contador_leer(i);
+            acumulado[i] = 0;
+        }
 }
 
 // Copia `size` bytes a un anillo y devuelve el offset (alineado a `align`).
@@ -1065,6 +1125,13 @@ static void estado_raster(const uint32_t *R) {
     } else {
         glDisable(GL_PRIMITIVE_RESTART);
     }
+    // Operación lógica (0x671/0x672): reemplaza al blending.
+    if (R[0x671] & 1) {
+        glEnable(GL_COLOR_LOGIC_OP);
+        glLogicOp(R[0x672] < 16 ? 0x1500 + R[0x672] : R[0x672]);
+    } else {
+        glDisable(GL_COLOR_LOGIC_OP);
+    }
     // Blending y máscaras de color por render target.
     glBlendColor(f32(R[0x4C7]), f32(R[0x4C8]), f32(R[0x4C9]), f32(R[0x4CA]));
     int indep = R[0x4B9] & 1;
@@ -1371,6 +1438,11 @@ int nx_gl_draw(const NxDraw *d) {
         k.img_binding = e == 4 ? 0 : e == 0 ? 4 : 6; // OpenGL da 8 unidades de imagen en total
         k.tess_mode = (uint16_t)R[0x0C8];
         k.gs_input = topo == 0 ? 0 : topo <= 3 ? 1 : topo == 10 || topo == 11 ? 2 : topo == 12 || topo == 13 ? 4 : 3;
+        if (e == 4 && (R[0x4BB] & 1)) { // alpha test: va dentro del shader
+            uint32_t f = R[0x4C5];
+            k.alpha_func = (uint8_t)(f >= 0x200 && f <= 0x207 ? f - 0x1FF : f >= 1 && f <= 8 ? f : 8);
+            k.alpha_ref = R[0x4C4];
+        }
         if (e == 4) // render targets enteros: las salidas del fragmento son ivec4/uvec4
             for (uint32_t j = 0; j < (R[0x487] & 15) && j < 8; j++) {
                 const Formato *f = formato(R[0x200 + (R[0x487] >> (4 + j * 3) & 7) * 0x10 + 4]);

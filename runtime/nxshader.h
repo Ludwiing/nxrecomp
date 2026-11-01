@@ -23,6 +23,8 @@ typedef struct {
     uint8_t img_fmt[8];
     uint16_t local[3];    // cómputo: hilos por grupo (de la QMD)
     uint32_t shared_bytes, local_bytes; // cómputo: memoria compartida y local (las gráficas la leen de su cabecera)
+    uint8_t alpha_func;   // fragmento: alpha test (OpenGL core no lo tiene): 0 apagado, 1-8 Never..Always
+    uint32_t alpha_ref;   // valor de referencia (bits de un float)
 } NxShaderKey;
 
 #define NX_MAX_SSBO 16
