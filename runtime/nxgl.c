@@ -121,6 +121,7 @@ typedef struct {
     uint32_t bpp;
     int depth; // 0 color, 1 profundidad, 2 profundidad y stencil
     int rot8;  // la memoria tiene la profundidad en los 24 bits bajos: rotar al subir y al bajar
+    int entero; // 1 con signo, 2 sin signo
 } Formato;
 
 static const Formato formatos[] = {
@@ -145,6 +146,26 @@ static const Formato formatos[] = {
     {0xEE, GL_R16, GL_RED, GL_UNSIGNED_SHORT, 2},
     {0xF2, GL_R16F, GL_RED, GL_HALF_FLOAT, 2},
     {0xF3, GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1},
+    // Enteros: el shader escribe ivec4/uvec4.
+    {0xC1, GL_RGBA32I, GL_RGBA_INTEGER, GL_INT, 16, 0, 0, 1},
+    {0xC2, GL_RGBA32UI, GL_RGBA_INTEGER, GL_UNSIGNED_INT, 16, 0, 0, 2},
+    {0xC8, GL_RGBA16I, GL_RGBA_INTEGER, GL_SHORT, 8, 0, 0, 1},
+    {0xC9, GL_RGBA16UI, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, 8, 0, 0, 2},
+    {0xCC, GL_RG32I, GL_RG_INTEGER, GL_INT, 8, 0, 0, 1},
+    {0xCD, GL_RG32UI, GL_RG_INTEGER, GL_UNSIGNED_INT, 8, 0, 0, 2},
+    {0xD2, GL_RGB10_A2UI, GL_RGBA_INTEGER, GL_UNSIGNED_INT_2_10_10_10_REV, 4, 0, 0, 2},
+    {0xD8, GL_RGBA8I, GL_RGBA_INTEGER, GL_BYTE, 4, 0, 0, 1},
+    {0xD9, GL_RGBA8UI, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, 4, 0, 0, 2},
+    {0xDC, GL_RG16I, GL_RG_INTEGER, GL_SHORT, 4, 0, 0, 1},
+    {0xDD, GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT, 4, 0, 0, 2},
+    {0xE3, GL_R32I, GL_RED_INTEGER, GL_INT, 4, 0, 0, 1},
+    {0xE4, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, 4, 0, 0, 2},
+    {0xEC, GL_RG8I, GL_RG_INTEGER, GL_BYTE, 2, 0, 0, 1},
+    {0xED, GL_RG8UI, GL_RG_INTEGER, GL_UNSIGNED_BYTE, 2, 0, 0, 2},
+    {0xF0, GL_R16I, GL_RED_INTEGER, GL_SHORT, 2, 0, 0, 1},
+    {0xF1, GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT, 2, 0, 0, 2},
+    {0xF5, GL_R8I, GL_RED_INTEGER, GL_BYTE, 1, 0, 0, 1},
+    {0xF6, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 1, 0, 0, 2},
     // Superficies de profundidad (DepthTargetFormat), con códigos que no chocan con los de color.
     {0x0A, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, 4, 1},
     {0x13, GL_DEPTH_COMPONENT16, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 2, 1},
@@ -620,13 +641,18 @@ static void tex_subir(Tex *x, const Tic *t, const TexFmt *f, const uint8_t *mem,
     }
 }
 
+static Tex *ultima_tex;  // la entrada de la caché que devolvió textura() (NULL si fue un render target)
+static Rt *ultimo_rt;
+
 static GLuint textura(const uint32_t *tic_words, int shader_type) {
     Tic t;
     tic_leer(tic_words, &t);
+    ultima_tex = NULL, ultimo_rt = NULL;
     // Una textura que es un render target se lee directo de la GPU.
     for (int i = 0; i < nrts; i++)
         if (rts[i].addr == t.addr && (shader_type & 15) == NX_TEX_2D) {
             if (rts[i].stale) rt_cargar(&rts[i]);
+            ultimo_rt = &rts[i];
             return rts[i].tex;
         }
     GLenum target;
@@ -663,10 +689,11 @@ static GLuint textura(const uint32_t *tic_words, int shader_type) {
             x = &texs[i];
             break;
         }
-    if (x && x->visto == envio) return x->tex;
+    if (x && x->visto == envio) return ultima_tex = x, x->tex;
     uint64_t h = hash_mem(mem, bytes);
     if (x) {
         x->visto = envio;
+        ultima_tex = x;
         if (x->hash == h) return x->tex;
         x->hash = h;
         tex_subir(x, &t, f, mem, layers);
@@ -691,6 +718,7 @@ static GLuint textura(const uint32_t *tic_words, int shader_type) {
         glTextureParameteriv(x->tex, GL_TEXTURE_SWIZZLE_RGBA, sw);
     }
     tex_subir(x, &t, f, mem, layers);
+    ultima_tex = x;
     if (traza)
         fprintf(stderr, "[nxgl] textura 0x%llx: formato 0x%x/%u %ux%ux%u, %u niveles, tipo %u, versión %u, bloque %u/%u, swizzle %u%u%u%u\n",
                 (unsigned long long)t.addr, t.fmt, t.comp, t.w, t.h, t.d, t.levels, t.type, t.version, t.bhl, t.bdl, t.swz[0],
@@ -736,6 +764,29 @@ static GLuint sampler(const uint32_t *tsc) {
 }
 
 // `R`: registros del motor (3D o cómputo, mismas posiciones); `cbs`: los constbufs de la etapa.
+// Qué texturas del shader son enteras (según su TIC): va en la clave, porque cambia el tipo del sampler.
+static int img_fmt_actual(const NxShaderKey *k, int handle) {
+    for (int i = 0; i < 8; i++)
+        if (k->img_fmt[i] && k->img_handle[i] == handle) return k->img_fmt[i];
+    return NX_IMG_RGBA8; // lo que el traductor supone sin clave
+}
+
+static int texturas_enteras(const uint32_t *R, const uint64_t *cbs, const NxShaderInfo *info, NxShaderKey *k) {
+    int n = 0, slot = R[0x982] & 7;
+    uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], avail;
+    for (int i = 0; i < info->ntex && n < 8; i++) {
+        const uint32_t *hp = cbs[slot] ? nx_gpu_ptr_n(cbs[slot] + info->tex[i].handle * 4u, &avail) : NULL;
+        if (!hp || avail < 4) continue;
+        const uint32_t *tw = nx_gpu_ptr_n(tic_pool + (*hp & 0xFFFFF) * 32ull, &avail);
+        if (!tw || avail < 32) continue;
+        const TexFmt *f = tex_fmt(tw[0] & 0x7F, tw[0] >> 7 & 7);
+        int kind = !f ? 0 : f->format == GL_RGBA_INTEGER || f->format == GL_RG_INTEGER || f->format == GL_RED_INTEGER
+                                ? (f->type == GL_INT || f->type == GL_SHORT || f->type == GL_BYTE ? 1 : 2) : 0;
+        if (kind) k->tex_int_handle[n] = info->tex[i].handle, k->tex_int_kind[n++] = (uint8_t)kind;
+    }
+    return n;
+}
+
 static void texturas(const uint32_t *R, const uint64_t *cbs, int stage, const NxShaderInfo *info, int base) {
     int slot = R[0x982] & 7;
     uint64_t cb = cbs[slot];
@@ -819,9 +870,13 @@ int nx_gl_clear(const uint32_t *R, uint32_t v) {
         glNamedFramebufferTexture(fb, GL_COLOR_ATTACHMENT0, c->tex, 0);
         glNamedFramebufferDrawBuffer(fb, GL_COLOR_ATTACHMENT0);
         glColorMaski(0, v >> 2 & 1, v >> 3 & 1, v >> 4 & 1, v >> 5 & 1);
-        float col[4];
-        memcpy(col, &R[0x360], 16);
-        glClearNamedFramebufferfv(fb, GL_COLOR, 0, col);
+        if (c->f->entero == 1) glClearNamedFramebufferiv(fb, GL_COLOR, 0, (const GLint *)&R[0x360]);
+        else if (c->f->entero == 2) glClearNamedFramebufferuiv(fb, GL_COLOR, 0, &R[0x360]);
+        else {
+            float col[4];
+            memcpy(col, &R[0x360], 16);
+            glClearNamedFramebufferfv(fb, GL_COLOR, 0, col);
+        }
         glNamedFramebufferTexture(fb, GL_COLOR_ATTACHMENT0, 0, 0);
     }
     if (z && traza) fprintf(stderr, "[nxgl] limpio la profundidad: tex %u en 0x%llx %ux%u fmt 0x%x\n", z->tex, (unsigned long long)z->addr, z->w, z->h, z->fmt);
@@ -1147,6 +1202,94 @@ static void constbufs(const uint64_t *cb_addr, const uint32_t *cb_size, int stag
     }
 }
 
+
+// ---------- imágenes ----------
+static const GLenum gl_img_fmt[NX_IMG_COUNT] = {0, GL_R8UI, GL_R8I, GL_R16UI, GL_R16I, GL_R32UI, GL_RG32UI, GL_RGBA32UI,
+    GL_RGBA8, GL_RGBA8_SNORM, GL_RGBA16F, GL_RGBA32F, GL_R32F, GL_RG16F, GL_R11F_G11F_B10F, GL_RGB10_A2, GL_RGBA8UI,
+    GL_RGBA16UI, GL_R32I, GL_RG32F, GL_R16F, GL_RG8, GL_R8};
+
+static int img_de_formato(GLenum internal) {
+    for (int i = 1; i < NX_IMG_COUNT; i++)
+        if (gl_img_fmt[i] == internal) return i;
+    return internal == GL_SRGB8_ALPHA8 ? NX_IMG_RGBA8 : 0;
+}
+
+// Escribe una textura de la caché (nivel 0) en la memoria del juego: una imagen que el shader modificó.
+static void tex_escribir(Tex *x) {
+    Tic t;
+    tic_leer(x->tic, &t);
+    const TexFmt *f = tex_fmt(t.fmt, t.comp);
+    if (!f || f->format == 0 || f->astc) return; // comprimidas: no se escriben desde un shader
+    uint32_t layers = x->target == GL_TEXTURE_2D_ARRAY ? t.d : 1, d3 = x->target == GL_TEXTURE_3D ? t.d : 1;
+    uint64_t level_off[16], layer_size, avail;
+    tex_layout(&t, f, layers, level_off, &layer_size);
+    uint8_t *mem = nx_gpu_ptr_n(t.addr, &avail);
+    if (!mem) return;
+    uint32_t row = t.w * f->bpb, nz = layers > d3 ? layers : d3;
+    size_t n = (size_t)row * t.h * nz;
+    uint8_t *lin = tmp_buf(n);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTextureImage(x->tex, 0, f->format, f->type, (GLsizei)n, lin);
+    uint32_t bhl = ajustar(t.bhl, 8, t.h), bdl = ajustar(t.bdl, 1, d3), wgobs = (row + 63) / 64;
+    for (uint32_t z = 0; z < nz; z++) {
+        uint8_t *base = mem + (x->target == GL_TEXTURE_3D ? 0 : layer_size * z);
+        for (uint32_t y = 0; y < t.h; y++) {
+            const uint8_t *src = lin + ((size_t)z * t.h + y) * row;
+            if (t.version < 3) memcpy(base + (uint64_t)y * t.pitch, src, row);
+            else
+                for (uint32_t xb = 0; xb < row; xb += 16)
+                    memcpy(base + bl3(xb, y, x->target == GL_TEXTURE_3D ? z : 0, wgobs, t.h, bhl, bdl), src + xb, row - xb < 16 ? row - xb : 16);
+        }
+    }
+    x->hash = hash_mem(mem, x->bytes); // lo que hay en memoria es lo que tiene la GPU
+}
+
+// Formatos reales de las imágenes del shader (van en la clave, por las operaciones con formato).
+static int imagenes_clave(const uint32_t *R, const uint64_t *cbs, const NxShaderInfo *info, NxShaderKey *k) {
+    int n = 0, slot = R[0x982] & 7;
+    uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], avail;
+    for (int i = 0; i < info->nimg && n < 8; i++) {
+        const uint32_t *hp = cbs[slot] ? nx_gpu_ptr_n(cbs[slot] + info->img[i].handle * 4u, &avail) : NULL;
+        if (!hp || avail < 4) continue;
+        const uint32_t *tw = nx_gpu_ptr_n(tic_pool + (*hp & 0xFFFFF) * 32ull, &avail);
+        if (!tw || avail < 32) continue;
+        const TexFmt *f = tex_fmt(tw[0] & 0x7F, tw[0] >> 7 & 7);
+        int fmt = f ? img_de_formato(f->internal) : 0;
+        if (fmt && fmt != img_fmt_actual(k, info->img[i].handle)) k->img_handle[n] = info->img[i].handle, k->img_fmt[n++] = (uint8_t)fmt;
+    }
+    return n;
+}
+
+typedef struct {
+    Tex *tex;
+    Rt *rt;
+} ImgEscrita;
+static ImgEscrita img_escritas[16];
+static int nimg_escritas;
+
+static void imagenes(const uint32_t *R, const uint64_t *cbs, const NxShaderInfo *info, int base) {
+    int slot = R[0x982] & 7;
+    uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], avail;
+    for (int i = 0; i < info->nimg; i++) {
+        const uint32_t *hp = cbs[slot] ? nx_gpu_ptr_n(cbs[slot] + info->img[i].handle * 4u, &avail) : NULL;
+        const uint32_t *tw = hp && avail >= 4 ? nx_gpu_ptr_n(tic_pool + (*hp & 0xFFFFF) * 32ull, &avail) : NULL;
+        GLuint tex = tw && avail >= 32 ? textura(tw, info->img[i].type) : 0;
+        int capas = (info->img[i].type & 15) != NX_TEX_2D;
+        glBindImageTexture(base + i, tex, 0, capas ? GL_TRUE : GL_FALSE, 0, GL_READ_WRITE, gl_img_fmt[info->img[i].fmt]);
+        if (tex && info->img[i].written && nimg_escritas < 16) img_escritas[nimg_escritas++] = (ImgEscrita){ultima_tex, ultimo_rt};
+    }
+}
+
+static void imagenes_volver(void) {
+    if (!nimg_escritas) return;
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    for (int i = 0; i < nimg_escritas; i++) {
+        if (img_escritas[i].rt) img_escritas[i].rt->dirty = 1; // un render target: queda en la GPU
+        else if (img_escritas[i].tex) tex_escribir(img_escritas[i].tex);
+    }
+    nimg_escritas = 0;
+}
+
 // ---------- storage buffers (memoria global de los shaders) ----------
 // Cada SSBO del shader nombra un descriptor en un constbuf: dirección de 64 bits y tamaño de 32. Se
 // copia esa memoria a un buffer de OpenGL, y lo que el shader escribe vuelve a la memoria del juego
@@ -1224,9 +1367,17 @@ int nx_gl_draw(const NxDraw *d) {
         NxShaderKey k = {0};
         if (e == 0) claves(R, &k);
         k.cb_binding = (uint8_t)(e * 16), k.tex_binding = (uint8_t)(e * 32), k.sb_binding = (uint8_t)(e * 16);
+        k.img_binding = e == 4 ? 0 : e == 0 ? 4 : 6; // OpenGL da 8 unidades de imagen en total
         k.tess_mode = (uint16_t)R[0x0C8];
         k.gs_input = topo == 0 ? 0 : topo <= 3 ? 1 : topo == 10 || topo == 11 ? 2 : topo == 12 || topo == 13 ? 4 : 3;
+        if (e == 4) // render targets enteros: las salidas del fragmento son ivec4/uvec4
+            for (uint32_t j = 0; j < (R[0x487] & 15) && j < 8; j++) {
+                const Formato *f = formato(R[0x200 + (R[0x487] >> (4 + j * 3) & 7) * 0x10 + 4]);
+                k.rt_int[j] = f ? (uint8_t)f->entero : 0;
+            }
         st[e] = shader(region + R[0x801 + i * 0x10], stage, &k);
+        if (st[e] && (texturas_enteras(R, d->cb_addr[e], &st[e]->info, &k) | imagenes_clave(R, d->cb_addr[e], &st[e]->info, &k)))
+            st[e] = shader(region + R[0x801 + i * 0x10], stage, &k); // otra traducción con los tipos reales
     }
     Shader *vs = st[0];
     if (!vs) return 1;
@@ -1277,6 +1428,7 @@ int nx_gl_draw(const NxDraw *d) {
         if (st[e]) {
             constbufs(d->cb_addr[e], d->cb_size[e], e, &st[e]->info, e * 16);
             texturas(R, d->cb_addr[e], e, &st[e]->info, e * 32);
+            imagenes(R, d->cb_addr[e], &st[e]->info, st[e]->key.img_binding);
             nsb = ssbos(d->cb_addr[e], &st[e]->info, e * 16, nsb);
         }
 
@@ -1322,6 +1474,7 @@ int nx_gl_draw(const NxDraw *d) {
         glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, (GLsizei)n, GL_UNSIGNED_INT, (void *)o, d->ninstances,
                                                       d->indexed ? (GLint)R[0x50D] : 0, R[0x50E] + d->instance);
         sb_volver(nsb);
+        imagenes_volver();
         if (traza) fprintf(stderr, "[nxgl] draw de cuadriláteros: %u vértices → %zu índices\n", d->count, n);
         depurar_rts("cuadriláteros");
         return 1;
@@ -1340,6 +1493,7 @@ int nx_gl_draw(const NxDraw *d) {
         glDrawArraysInstancedBaseInstance(mode, d->first, d->count, d->ninstances, R[0x50E] + d->instance);
     }
     sb_volver(nsb);
+    imagenes_volver();
     if (traza)
         fprintf(stderr, "[nxgl] draw %u: %u vértices desde %u, %u instancias desde %u%s\n", mode, d->count, d->first,
                 d->ninstances, d->instance, d->indexed ? " (índices)" : "");
@@ -1359,19 +1513,22 @@ int nx_gl_dispatch(const uint32_t *C, const uint32_t *q) {
     k.local[0] = (uint16_t)(q[18] >> 16), k.local[1] = (uint16_t)q[19], k.local[2] = (uint16_t)(q[19] >> 16);
     k.shared_bytes = q[17] & 0x3FFFF;
     k.local_bytes = (q[45] & 0xFFFFFF) + (q[46] & 0xFFFFFF);
-    Shader *s = shader(region + q[8], NX_SH_COMPUTE, &k);
-    if (!s) return 1;
     uint64_t cba[18] = {0};
     uint32_t cbs[18] = {0};
     for (int i = 0; i < 8; i++)
         if (q[20] >> i & 1) cba[i] = (uint64_t)(q[30 + 2 * i] & 0xFF) << 32 | q[29 + 2 * i], cbs[i] = q[30 + 2 * i] >> 15;
+    Shader *s = shader(region + q[8], NX_SH_COMPUTE, &k);
+    if (s && (texturas_enteras(C, cba, &s->info, &k) | imagenes_clave(C, cba, &s->info, &k))) s = shader(region + q[8], NX_SH_COMPUTE, &k);
+    if (!s) return 1;
     constbufs(cba, cbs, 5, &s->info, 0);
     texturas(C, cba, 5, &s->info, 0);
+    imagenes(C, cba, &s->info, 0);
     int nsb = ssbos(cba, &s->info, 0, 0);
     glUseProgram(s->prog);
     glDispatchCompute(q[12], q[13] & 0xFFFF ? q[13] & 0xFFFF : 1, q[13] >> 16 ? q[13] >> 16 : 1);
     glUseProgram(0);
     sb_volver(nsb);
+    imagenes_volver();
     if (traza) fprintf(stderr, "[nxgl] dispatch %u×%u×%u grupos de %u×%u×%u\n", q[12], q[13] & 0xFFFF, q[13] >> 16, k.local[0], k.local[1], k.local[2]);
     return 1;
 }

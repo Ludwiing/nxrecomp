@@ -50,7 +50,7 @@ typedef struct {
     NxShaderInfo *info;
     uint32_t sph[20];
     uint8_t *visited, *leader;
-    int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared, uses_subgroup;
+    int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared, uses_subgroup, tex_int;
     uint8_t reg_used[256];
     uint32_t in_flat, in_linear; // atributos de entrada del fragmento por modo de interpolación
     uint32_t out_comps[32];
@@ -312,7 +312,9 @@ static void frag_outputs(T *t) {
     int base = 0;
     for (int rt = 0; rt < 8; rt++) {
         for (int c = 0; c < 4; c++)
-            if (omap >> (rt * 4 + c) & 1) L(t, "frag%d.%c = uintBitsToFloat(%s);", rt, "xyzw"[c], R(t, base + c));
+            if (omap >> (rt * 4 + c) & 1)
+                L(t, "frag%d.%c = %s(%s);", rt, "xyzw"[c],
+                  t->key->rt_int[rt] == 1 ? "int" : t->key->rt_int[rt] == 2 ? "uint" : "uintBitsToFloat", R(t, base + c));
         if (omap >> (rt * 4) & 15) base += 4;
     }
     if (t->sph[19] & 2) {
@@ -949,8 +951,15 @@ static const char *const tex_glsl[] = {"sampler2D", "sampler3D", "samplerCube", 
 static const char *const tex_glsl_shadow[] = {"sampler2DShadow", "sampler3D", "samplerCubeShadow", "sampler2DArrayShadow",
                                               "samplerCubeArrayShadow", "sampler2DMS", "samplerBuffer"};
 
+static int tex_entera(T *t, int64_t handle) {
+    for (int i = 0; i < 8; i++)
+        if (t->key->tex_int_kind[i] && t->key->tex_int_handle[i] == handle) return t->key->tex_int_kind[i];
+    return 0;
+}
+
 static char *tex_sampler(T *t, int64_t handle, int type) {
     NxShaderInfo *in = t->info;
+    t->tex_int = (type & NX_TEX_SHADOW) ? 0 : tex_entera(t, handle);
     for (int i = 0; i < in->ntex; i++)
         if (in->tex[i].handle == handle && in->tex[i].type == type) return S(t, "tex%d", i);
     if (in->ntex == NX_MAX_TEX) {
@@ -959,6 +968,7 @@ static char *tex_sampler(T *t, int64_t handle, int type) {
     }
     in->tex[in->ntex].handle = (uint16_t)handle;
     in->tex[in->ntex].type = (uint8_t)type;
+    in->tex[in->ntex].entera = (uint8_t)t->tex_int;
     return S(t, "tex%d", in->ntex++);
 }
 
@@ -981,6 +991,8 @@ static char *nextB(T *t, Srcs *s) { return s->rb >= 255 ? (char *)"0u" : R(t, s-
 
 // Escribe los componentes de `v` (vec4) elegidos por `mask` en los registros de destino.
 static void tex_write(T *t, const char *v, int mask, const int *dest_of) {
+    // Las texturas enteras devuelven ivec4/uvec4: se pasan por los bits de un vec4.
+    if (t->tex_int) v = S(t, "uintBitsToFloat(uvec4(%s))", v);
     L(t, "{ vec4 tv = %s;", v);
     int k = 0;
     for (int c = 0; c < 4; c++)
@@ -1686,6 +1698,234 @@ static void emit_tmml(T *t) {
     L(t, "}");
 }
 
+
+// ---------- comparaciones y selección con códigos de condición; LEA; video ----------
+
+static void emit_icmp(T *t) { // d = (C cmp 0) ? A : B
+    char *a = R(t, G(SrcA)), *b, *c;
+    if (t->var == V_RC) b = R(t, G(SrcC)), c = cbuf(t, G(CbufSlot), G(CbufOffset) * 4);
+    else b = B(t, 0), c = R(t, G(SrcC));
+    WR(t, G(Dest), S(t, "(%s ? %s : %s)", icmp(t, G(IComp), G(Signed), c, "0u"), a, b));
+}
+
+static void emit_lea(T *t, int hi) {
+    char *a = R(t, G(SrcA)), *b = t->var == V_I ? B(t, 0) : t->var == V_C ? cbuf(t, G(CbufSlot), G(CbufOffset) * 4) : R(t, G(SrcB));
+    int sh = (int)G(ImmU5);
+    if (!hi) {
+        char *x = S(t, "(%s << %du)", a, sh);
+        if (G(NegA) == 1) x = S(t, "(0u - %s)", x);
+        WR(t, G(Dest), S(t, "(%s + %s)", x, b));
+        return;
+    }
+    char *c = R(t, G(SrcC)); // parte alta de A (A:C es un valor de 64 bits)
+    L(t, "{ uint64_t x = ((uint64_t(%s) << 32) | uint64_t(%s)) << %d;", c, a, sh);
+    if (G(NegA) == 1) L(t, "x = 0ul - x;");
+    WR(t, G(Dest), S(t, "(uint(x >> 32) + %s)", b));
+    L(t, "}");
+}
+
+static void emit_cset(T *t, int pred) {
+    char *c = ccc(t, G(Ccc)), *p = P(t, G(SrcPred), G(SrcPredInv));
+    if (pred) {
+        L(t, "{ bool c = %s;", c);
+        WP(t, G(DestPred), bop(t, G(Bop), "c", p));
+        WP(t, G(DestPredInv), bop(t, G(Bop), "!c", p));
+        L(t, "}");
+    } else {
+        WR(t, G(Dest), S(t, "(%s ? %s : 0u)", bop(t, G(Bop), c, p), G(BVal) == 1 ? "0x3f800000u" : "0xffffffffu"));
+    }
+}
+
+static void emit_pset(T *t) {
+    char *a = P(t, G(Src2Pred), G(Src2PredInv)), *b = P(t, G(Src1Pred), G(Src1PredInv)), *c = P(t, G(SrcPred), G(SrcPredInv));
+    char *r = bop(t, G(BoolOpC), bop(t, G(BoolOpAB), a, b), c);
+    WR(t, G(Dest), S(t, "(%s ? %s : 0u)", r, G(BVal) == 1 ? "0x3f800000u" : "0xffffffffu"));
+}
+
+// Selector de vídeo: un byte, una mitad o los 32 bits, con o sin signo.
+static char *video_sel(T *t, const char *v, int64_t sel) {
+    int sg = sel >= 8, s = (int)(sel & 7);
+    if (s == 6) return (char *)v;
+    int pos = s < 4 ? s * 8 : (s - 4) * 16, bits = s < 4 ? 8 : 16;
+    return sg ? S(t, "uint(bitfieldExtract(int(%s), %d, %d))", v, pos, bits) : S(t, "bitfieldExtract(%s, %d, %d)", v, pos, bits);
+}
+static char *video_b(T *t) {
+    if (G(BVideo) == 1) return video_sel(t, R(t, G(SrcB)), G(BSelect));
+    int64_t imm = G(Imm16);
+    if (G(BSelect) >= 8) imm = (int16_t)imm;
+    return S(t, "%uu", (uint32_t)imm);
+}
+
+static void emit_vmad(T *t) {
+    int64_t as = G(ASelect), bs = G(BSelect), avg = G(AvgMode);
+    int sa = as >= 8, sb = bs >= 8;
+    L(t, "{ int64_t a = %s, b = %s;", sa ? S(t, "int64_t(int(%s))", video_sel(t, R(t, G(SrcA)), as)) : S(t, "int64_t(%s)", video_sel(t, R(t, G(SrcA)), as)),
+      sb ? S(t, "int64_t(int(%s))", video_b(t)) : S(t, "int64_t(%s)", video_b(t)));
+    L(t, "int64_t r = a * b;");
+    if (avg == 2) L(t, "r = -r;");
+    L(t, "r += %s;", avg == 1 ? S(t, "-int64_t(int(%s))", R(t, G(SrcC))) : S(t, "int64_t(%s)", R(t, G(SrcC))));
+    if (avg == 3) L(t, "r += 1;");
+    int64_t vs = G(VideoScale);
+    if (vs == 1) L(t, "r >>= 7;");
+    if (vs == 2) L(t, "r >>= 15;");
+    int sg = (as & 7) == 6 && as >= 8 ? 1 : (bs & 7) == 6 && bs >= 8 ? 1 : avg == 1 || avg == 2;
+    if (G(Sat) == 1) L(t, sg ? "r = clamp(r, -2147483648l, 2147483647l);" : "r = clamp(r, 0l, 4294967295l);");
+    WR(t, G(Dest), "uint(r)");
+    L(t, "}");
+}
+
+static void emit_vmnmx(T *t) {
+    int64_t as = G(ASelect), bs = G(BSelect);
+    char *a = video_sel(t, R(t, G(SrcA)), as), *b = video_b(t), *c = R(t, G(SrcC));
+    int sa = as >= 8, sb = bs >= 8, mx = G(Mn) == 1, rs;
+    L(t, "{ uint a = %s, b = %s, c = %s, r;", a, b, c);
+    if (sa != sb) { // un operando con signo y otro sin: el máximo cabe en U32 y el mínimo en S32
+        rs = !mx;
+        L(t, mx ? "r = max(a, b);" : "r = uint(min(int(a), int(b)));");
+        L(t, "if (int(%s) < 0) r = %s;", sa ? "b" : "a", sa ? "b" : "a");
+    } else {
+        rs = sa;
+        if (mx) L(t, rs ? "r = uint(max(int(a), int(b)));" : "r = max(a, b);");
+        else L(t, rs ? "r = uint(min(int(a), int(b)));" : "r = min(a, b);");
+    }
+    int df = G(DFormat) == 1;
+    if (G(Sat) == 1) {
+        if (df && !rs) L(t, "r = min(r, 0x7fffffffu);");
+        else if (!df && rs) L(t, "r = uint(max(int(r), 0));");
+    }
+    switch (G(VideoOp)) {
+    case 4: L(t, "r += c;"); break;
+    case 5: L(t, df ? "r = uint(min(int(r), int(c)));" : "r = min(r, c);"); break;
+    case 6: L(t, df ? "r = uint(max(int(r), int(c)));" : "r = max(r, c);"); break;
+    case 0: L(t, "r = bitfieldInsert(c, r, 16, 16);"); break;
+    case 1: L(t, "r = bitfieldInsert(c, r, 0, 16);"); break;
+    case 2: L(t, "r = bitfieldInsert(c, r, 0, 8);"); break;
+    case 3: L(t, "r = bitfieldInsert(c, r, 16, 8);"); break;
+    }
+    WR(t, G(Dest), "r");
+    L(t, "}");
+}
+
+static void emit_vsetp(T *t) {
+    int64_t as = G(ASelect), bs = G(BSelect);
+    int sa = as >= 8, sb = bs >= 8;
+    char *a = video_sel(t, R(t, G(SrcA)), as), *b = video_b(t), *c;
+    if (sa != sb && ((as & 7) == 6 || (bs & 7) == 6)) c = (char *)"false"; // como Ryujinx: caso sin resolver
+    else c = icmp(t, G(VComp), sa || sb, a, b);
+    char *p = P(t, G(SrcPred), G(SrcPredInv));
+    L(t, "{ bool c = %s;", c);
+    WP(t, G(DestPred), bop(t, G(BoolOp), "c", p));
+    WP(t, G(DestPredInv), bop(t, G(BoolOp), "!c", p));
+    L(t, "}");
+}
+
+
+// ---------- imágenes (SULD / SUST) ----------
+// Las versiones "D" leen o escriben los bits crudos (la imagen se ve con un formato entero del mismo
+// tamaño de texel: r32ui, rg32ui...); las "P" usan el formato real, que el host pone en la clave.
+
+static const char *const img_qual[NX_IMG_COUNT] = {"", "r8ui", "r8i", "r16ui", "r16i", "r32ui", "rg32ui", "rgba32ui",
+    "rgba8", "rgba8_snorm", "rgba16f", "rgba32f", "r32f", "rg16f", "r11f_g11f_b10f", "rgb10_a2", "rgba8ui",
+    "rgba16ui", "r32i", "rg32f", "r16f", "rg8", "r8"};
+static int img_entero(int f) { // 0 float, 1 con signo, 2 sin signo
+    return f == NX_IMG_R8I || f == NX_IMG_R16I || f == NX_IMG_R32I ? 1
+         : (f >= NX_IMG_R8UI && f <= NX_IMG_RGBA32UI) || f == NX_IMG_RGBA8UI || f == NX_IMG_RGBA16UI ? 2 : 0;
+}
+
+static int img_tipo(T *t, int64_t dim, int *nc) {
+    switch (dim) {
+    case 0: *nc = 1; return NX_TEX_2D;          // 1D: como 2D de una fila
+    case 2: *nc = 1; return NX_TEX_2D_ARRAY;    // arreglo 1D: x y la capa como y
+    case 3: *nc = 2; return NX_TEX_2D;
+    case 4: *nc = 2; return NX_TEX_2D_ARRAY;
+    case 5: *nc = 3; return NX_TEX_3D;
+    }
+    red(t, "imagen de buffer");
+    *nc = 1;
+    return -1;
+}
+
+static char *img_nombre(T *t, int64_t handle, int type, int fmt, int write) {
+    NxShaderInfo *in = t->info;
+    for (int i = 0; i < in->nimg; i++)
+        if (in->img[i].handle == handle && in->img[i].type == type && in->img[i].fmt == fmt) {
+            in->img[i].written |= write;
+            return S(t, "img%d", i);
+        }
+    if (in->nimg == NX_MAX_IMG) {
+        red(t, "demasiadas imágenes");
+        return S(t, "img0");
+    }
+    in->img[in->nimg] = (typeof(in->img[0])){(uint16_t)handle, (uint8_t)type, (uint8_t)fmt, (uint8_t)write};
+    return S(t, "img%d", in->nimg++);
+}
+
+static int img_fmt_clave(T *t, int64_t handle) {
+    for (int i = 0; i < 8; i++)
+        if (t->key->img_fmt[i] && t->key->img_handle[i] == handle) return t->key->img_fmt[i];
+    return NX_IMG_RGBA8;
+}
+
+static char *img_coord(T *t, int type, int nc, Srcs *s, int shift) {
+    char *c[3];
+    for (int i = 0; i < nc; i++) c[i] = nextA(t, s);
+    char *x = shift ? S(t, "(int(%s) >> %d)", c[0], shift) : S(t, "int(%s)", c[0]);
+    if (type == NX_TEX_3D) return S(t, "ivec3(%s, int(%s), int(%s))", x, c[1], c[2]);
+    if (type == NX_TEX_2D_ARRAY) { // la capa viene después de las coordenadas
+        char *l = nextA(t, s);
+        return nc == 1 ? S(t, "ivec3(%s, 0, int(%s))", x, l) : S(t, "ivec3(%s, int(%s), int(%s))", x, c[1], l);
+    }
+    return nc == 1 ? S(t, "ivec2(%s, 0)", x) : S(t, "ivec2(%s, int(%s))", x, c[1]);
+}
+
+static void emit_suld_sust(T *t, int store) {
+    int op = t->op, crudo = op == MXOP_SuldD || op == MXOP_SustD;
+    if (op == MXOP_SuldDB || op == MXOP_SustDB || op == MXOP_SustB || op == MXOP_SuldB) {
+        red(t, "imagen sin handle constante");
+        return;
+    }
+    int nc, type = img_tipo(t, G(Dim), &nc);
+    if (type < 0) return;
+    int64_t d = G(Dest);
+    Srcs s = {(int)G(SrcA), 255};
+    if (crudo) {
+        int64_t size = G(Size);
+        static const int fmts[] = {NX_IMG_R8UI, NX_IMG_R8I, NX_IMG_R16UI, NX_IMG_R16I, NX_IMG_R32UI, NX_IMG_RG32UI, NX_IMG_RGBA32UI, NX_IMG_RGBA32UI};
+        static const int shifts[] = {0, 0, 1, 1, 2, 3, 4, 4};
+        int fmt = fmts[size & 7], nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
+        char *img = img_nombre(t, G(TidB), type, fmt, store);
+        char *co = img_coord(t, type, nc, &s, G(Ba) == 1 ? shifts[size & 7] : 0);
+        if (store) {
+            char *v[4];
+            for (int k = 0; k < 4; k++) v[k] = k < nw ? R(t, d + k) : (char *)"0u";
+            L(t, "imageStore(%s, %s, %s(%s, %s, %s, %s));", img, co, fmt == NX_IMG_R8I || fmt == NX_IMG_R16I ? "ivec4" : "uvec4",
+              v[0], v[1], v[2], v[3]);
+        } else {
+            L(t, "{ uvec4 iv = uvec4(imageLoad(%s, %s));", img, co);
+            for (int k = 0; k < nw; k++) WR(t, d + k, S(t, "iv.%c", "xyzw"[k]));
+            L(t, "}");
+        }
+        return;
+    }
+    // Con formato: las componentes que pide la máscara (RGBA), en el formato real de la imagen.
+    int fmt = img_fmt_clave(t, G(TidB)), ent = img_entero(fmt), mask = (int)G(Rgba);
+    char *img = img_nombre(t, G(TidB), type, fmt, store);
+    char *co = img_coord(t, type, nc, &s, 0);
+    if (store) {
+        char *v[4];
+        int k = 0;
+        for (int c = 0; c < 4; c++) v[c] = mask >> c & 1 ? R(t, d + k++) : (char *)"0u";
+        if (ent) L(t, "imageStore(%s, %s, %s(%s, %s, %s, %s));", img, co, ent == 1 ? "ivec4" : "uvec4", v[0], v[1], v[2], v[3]);
+        else L(t, "imageStore(%s, %s, uintBitsToFloat(uvec4(%s, %s, %s, %s)));", img, co, v[0], v[1], v[2], v[3]);
+    } else {
+        L(t, "{ uvec4 iv = %s;", ent ? S(t, "uvec4(imageLoad(%s, %s))", img, co) : S(t, "floatBitsToUint(imageLoad(%s, %s))", img, co));
+        int k = 0;
+        for (int c = 0; c < 4; c++)
+            if (mask >> c & 1) WR(t, d + k++, S(t, "iv.%c", "xyzw"[c]));
+        L(t, "}");
+    }
+}
+
 static void emit_insn(T *t) {
     switch (t->op) {
     case MXOP_Ald: emit_ald(t); break;
@@ -1755,6 +1995,17 @@ static void emit_insn(T *t) {
     case MXOP_Txd: case MXOP_TxdB: emit_txd(t); break;
     case MXOP_Tmml: case MXOP_TmmlB: emit_tmml(t); break;
     case MXOP_Shfl: emit_shfl(t); break;
+    case MXOP_SuldD: case MXOP_Suld: case MXOP_SuldDB: emit_suld_sust(t, 0); break;
+    case MXOP_SustD: case MXOP_Sust: case MXOP_SustDB: case MXOP_SustB: emit_suld_sust(t, 1); break;
+    case MXOP_IcmpR: case MXOP_IcmpI: case MXOP_IcmpC: case MXOP_IcmpRc: emit_icmp(t); break;
+    case MXOP_LeaR: case MXOP_LeaI: case MXOP_LeaC: emit_lea(t, 0); break;
+    case MXOP_LeaHiR: case MXOP_LeaHiC: emit_lea(t, 1); break;
+    case MXOP_Cset: emit_cset(t, 0); break;
+    case MXOP_Csetp: emit_cset(t, 1); break;
+    case MXOP_Pset: emit_pset(t); break;
+    case MXOP_Vmad: emit_vmad(t); break;
+    case MXOP_Vmnmx: emit_vmnmx(t); break;
+    case MXOP_Vsetp: emit_vsetp(t); break;
     case MXOP_Fswzadd: emit_fswzadd(t); break;
     case MXOP_Hadd232i: case MXOP_Hadd2C: case MXOP_Hadd2I: case MXOP_Hadd2R:
     case MXOP_Hmul232i: case MXOP_Hmul2C: case MXOP_Hmul2I: case MXOP_Hmul2R:
@@ -1872,7 +2123,8 @@ static void header(T *t, Sb *h) {
         uint32_t omap = t->sph[18];
         t->info->omap = omap;
         for (int rt = 0; rt < 8; rt++)
-            if (omap >> (rt * 4) & 15) sb_add(h, "layout(location = %d) out vec4 frag%d;\n", rt, rt);
+            if (omap >> (rt * 4) & 15)
+                sb_add(h, "layout(location = %d) out %s frag%d;\n", rt, t->key->rt_int[rt] == 1 ? "ivec4" : t->key->rt_int[rt] == 2 ? "uvec4" : "vec4", rt);
     }
     if (t->stage == NX_SH_COMPUTE)
         sb_add(h, "layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;\n", t->key->local[0] ? t->key->local[0] : 1,
@@ -1881,6 +2133,12 @@ static void header(T *t, Sb *h) {
         uint32_t n = (t->key->shared_bytes + 3) / 4;
         sb_add(h, "const uint SMEM = %uu;\nshared uint smem[SMEM];\n", n ? n : 1);
     }
+    static const char *const img_glsl[] = {"image2D", "image3D", "imageCube", "image2DArray"};
+    for (int i = 0; i < t->info->nimg; i++) {
+        int f = t->info->img[i].fmt, ent = img_entero(f);
+        sb_add(h, "layout(binding = %d, %s) uniform coherent %s%s img%d;\n", t->key->img_binding + i, img_qual[f],
+               ent == 1 ? "i" : ent == 2 ? "u" : "", img_glsl[t->info->img[i].type & 3], i);
+    }
     for (int k = 0; k < t->info->nssbo; k++)
         sb_add(h, "layout(std430, binding = %d) buffer Sb%d { uint sb%d[]; };\n", t->key->sb_binding + k, k, k);
     for (int s = 0; s < 18; s++)
@@ -1888,7 +2146,8 @@ static void header(T *t, Sb *h) {
             sb_add(h, "layout(std140, binding = %d) uniform Cb%d { uvec4 cb%d[4096]; };\n", t->key->cb_binding + s, s, s);
     for (int i = 0; i < t->info->ntex; i++) {
         int ty = t->info->tex[i].type;
-        sb_add(h, "layout(binding = %d) uniform %s tex%d;\n", t->key->tex_binding + i,
+        sb_add(h, "layout(binding = %d) uniform %s%s tex%d;\n", t->key->tex_binding + i,
+               t->info->tex[i].entera == 1 ? "i" : t->info->tex[i].entera == 2 ? "u" : "",
                ty & NX_TEX_SHADOW ? tex_glsl_shadow[ty & 15] : tex_glsl[ty & 15], i);
     }
     if (t->info->uses_instance) sb_add(h, "layout(location = 0) uniform uint nx_inst0;\n");
@@ -1900,7 +2159,8 @@ static void header(T *t, Sb *h) {
     sb_add(h, "    bool cc_z = false, cc_n = false, cc_c = false, cc_v = false;\n");
     if (t->stage == NX_SH_FRAGMENT)
         for (int rt = 0; rt < 8; rt++)
-            if (t->sph[18] >> (rt * 4) & 15) sb_add(h, "    frag%d = vec4(0.0);\n", rt);
+            if (t->sph[18] >> (rt * 4) & 15)
+                sb_add(h, "    frag%d = %s(0);\n", rt, t->key->rt_int[rt] == 1 ? "ivec4" : t->key->rt_int[rt] == 2 ? "uvec4" : "vec4");
     if (t->stage == NX_SH_VERTEX || t->stage == NX_SH_TESS_EVAL)
         for (int i = 0; i < 32; i++)
             if (t->info->outputs >> i & 1) sb_add(h, "    out_attr%d = vec4(0.0, 0.0, 0.0, 1.0);\n", i);

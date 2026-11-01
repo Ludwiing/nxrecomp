@@ -1,0 +1,15 @@
+#version 460
+layout(local_size_x = 32) in;
+layout(binding = 0, r32ui) uniform uimage2D img;
+layout(binding = 1, rgba8) uniform image2D img2;
+layout(std430, binding = 0) buffer A { uint a[]; };
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    ivec2 p = ivec2(id % 16u, id / 16u);
+    uint v = imageLoad(img, p).x;
+    imageStore(img, p, uvec4(v * 3u + id));
+    uint old = imageLoad(img, p + ivec2(0, 8)).x;
+    vec4 c = imageLoad(img2, p);
+    imageStore(img2, p, c.wzyx);
+    a[id] = old + uint(c.x * 255.0);
+}

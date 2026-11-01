@@ -85,6 +85,8 @@ static char *translate(Prog *p, int binding, NxShaderInfo *info) {
     NxShaderKey key = {0};
     key.cb_binding = (uint8_t)binding;
     key.tex_binding = 8;
+    key.tex_int_handle[0] = 425, key.tex_int_kind[0] = 2; // las texturas 5 y 6 del comparador son enteras
+    key.tex_int_handle[1] = 426, key.tex_int_kind[1] = 1;
     return nx_shader_glsl(p->code, p->size, p->stage, &key, info);
 }
 
@@ -144,7 +146,7 @@ static void render(GLuint prog, float *out) {
 }
 
 // Texturas de prueba en las unidades 0-4 (las del GLSL original); la traducción usa 8 en adelante.
-static GLuint texturas[5];
+static GLuint texturas[7];
 
 static void crear_texturas(void) {
     static float d[16 * 16 * 16 * 4 * 6];
@@ -171,7 +173,17 @@ static void crear_texturas(void) {
     glTextureSubImage2D(texturas[4], 0, 0, 0, 16, 16, GL_DEPTH_COMPONENT, GL_FLOAT, d + 5);
     glTextureParameteri(texturas[4], GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
     glTextureParameteri(texturas[4], GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
-    for (int i = 0; i < 5; i++) glBindTextureUnit(i, texturas[i]);
+    // 5 y 6: enteras (sin y con signo), para las lecturas con usampler/isampler.
+    static uint32_t e[16 * 16 * 4];
+    for (int i = 0; i < 16 * 16 * 4; i++) x = x * 1664525 + 1013904223, e[i] = x >> 12;
+    glCreateTextures(GL_TEXTURE_2D, 1, &texturas[5]);
+    glTextureStorage2D(texturas[5], 1, GL_RGBA32UI, 16, 16);
+    glTextureSubImage2D(texturas[5], 0, 0, 0, 16, 16, GL_RGBA_INTEGER, GL_UNSIGNED_INT, e);
+    glCreateTextures(GL_TEXTURE_2D, 1, &texturas[6]);
+    glTextureStorage2D(texturas[6], 1, GL_RGBA16I, 16, 16);
+    for (int i = 0; i < 16 * 16 * 4; i++) e[i] = (uint32_t)((int)(e[i] & 0xFFFF) - 32768);
+    glTextureSubImage2D(texturas[6], 0, 0, 0, 16, 16, GL_RGBA_INTEGER, GL_INT, e);
+    for (int i = 0; i < 7; i++) glBindTextureUnit(i, texturas[i]);
 }
 
 static int iguales(float a, float b) {
@@ -192,7 +204,7 @@ static int comparar(const char *orig, const char *dksh) {
     if (!texturas[0]) crear_texturas();
     for (int i = 0; i < info.ntex; i++) { // el handle de deko3d para el binding b del fragmento es 420 + b
         int b = info.tex[i].handle - 420;
-        if (b >= 0 && b < 5) glBindTextureUnit(8 + i, texturas[b]);
+        if (b >= 0 && b < 7) glBindTextureUnit(8 + i, texturas[b]);
     }
     GLuint v = compile(GL_VERTEX_SHADER, vs_comun), a = compile(GL_FRAGMENT_SHADER, src), b = compile(GL_FRAGMENT_SHADER, tr);
     if (!v || !a || !b) {
@@ -268,6 +280,9 @@ static int comparar_comp(const char *orig, const char *dksh) {
     key.cb_binding = 18, key.tex_binding = 8, key.sb_binding = 8;
     key.local[0] = 32, key.local[1] = key.local[2] = 1; // los shaders de prueba usan local_size_x = 32
     key.shared_bytes = 4096;
+    key.img_binding = 4; // imágenes del GLSL original: 0 = r32ui, 1 = rgba8 (handles 72 y 73 en el cómputo de deko3d)
+    key.img_handle[0] = 72, key.img_fmt[0] = NX_IMG_R32UI;
+    key.img_handle[1] = 73, key.img_fmt[1] = NX_IMG_RGBA8;
     NxShaderInfo info;
     char *tr = nx_shader_glsl(cs.code, cs.size, NX_SH_COMPUTE, &key, &info);
     if (!tr) return 1;
@@ -301,7 +316,24 @@ static int comparar_comp(const char *orig, const char *dksh) {
     glCreateBuffers(1, &cb);
     glNamedBufferData(cb, sizeof c0, c0, GL_STATIC_DRAW);
     glBindBufferBase(GL_UNIFORM_BUFFER, 18, cb);
+    static uint32_t img_ini[2][16 * 16], img_r[2][2][16 * 16];
+    for (int k = 0; k < 2; k++)
+        for (int i = 0; i < 256; i++) x = x * 1103515245 + 12345, img_ini[k][i] = x >> 4;
     for (int pasada = 0; pasada < 2; pasada++) {
+        GLuint im[2];
+        glCreateTextures(GL_TEXTURE_2D, 2, im);
+        glTextureStorage2D(im[0], 1, GL_R32UI, 16, 16);
+        glTextureSubImage2D(im[0], 0, 0, 0, 16, 16, GL_RED_INTEGER, GL_UNSIGNED_INT, img_ini[0]);
+        glTextureStorage2D(im[1], 1, GL_RGBA8, 16, 16);
+        glTextureSubImage2D(im[1], 0, 0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, img_ini[1]);
+        if (pasada == 0) {
+            glBindImageTexture(0, im[0], 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+            glBindImageTexture(1, im[1], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA8);
+        } else {
+            static const GLenum gl_img[NX_IMG_COUNT] = {0, GL_R8UI, GL_R8I, GL_R16UI, GL_R16I, GL_R32UI, GL_RG32UI, GL_RGBA32UI, GL_RGBA8};
+            for (int i = 0; i < info.nimg; i++)
+                glBindImageTexture(4 + i, im[(info.img[i].handle - 72) & 1], 0, GL_FALSE, 0, GL_READ_WRITE, gl_img[info.img[i].fmt]);
+        }
         GLuint sb[4];
         glCreateBuffers(4, sb);
         for (int k = 0; k < 4; k++) {
@@ -314,6 +346,9 @@ static int comparar_comp(const char *orig, const char *dksh) {
         glDispatchCompute(GRUPOS, 1, 1);
         glMemoryBarrier(GL_ALL_BARRIER_BITS);
         for (int k = 0; k < 4; k++) glGetNamedBufferSubData(sb[k], 0, PALABRAS * 4, pasada ? rb[k] : ra[k]);
+        glGetTextureImage(im[0], 0, GL_RED_INTEGER, GL_UNSIGNED_INT, sizeof img_r[0][0], img_r[pasada][0]);
+        glGetTextureImage(im[1], 0, GL_RGBA, GL_UNSIGNED_BYTE, sizeof img_r[0][1], img_r[pasada][1]);
+        glDeleteTextures(2, im);
         glDeleteBuffers(4, sb);
     }
     int malos = 0;
@@ -325,6 +360,10 @@ static int comparar_comp(const char *orig, const char *dksh) {
             if (ra[k][i] != rb[k][i] && !iguales(fa, fb) && malos++ < 8)
                 fprintf(stderr, "%s: buffer %d palabra %d: original %08x (%g), traducido %08x (%g)\n", orig, k, i, ra[k][i], fa, rb[k][i], fb);
         }
+    for (int k = 0; k < 2; k++)
+        for (int i = 0; i < 256; i++)
+            if (img_r[0][k][i] != img_r[1][k][i] && malos++ < 8)
+                fprintf(stderr, "%s: imagen %d texel %d: original %08x, traducido %08x\n", orig, k, i, img_r[0][k][i], img_r[1][k][i]);
     if (malos) fprintf(stderr, "%s: %d palabras distintas\n", orig, malos);
     if (malos && getenv("NX_VER_GLSL")) fprintf(stderr, "%s", tr);
     return malos != 0 || info.errors;
