@@ -113,6 +113,7 @@ static const struct {
     {"appletAE", "appletAE", nx_am_oe},
     {"acc:u0", "acc:u0", nx_acc},
     {"acc:u1", "acc:u1", nx_acc},
+    {"acc:su", "acc:su", nx_acc},
     {"hid", "hid", nx_hid},
     {"time:u", "time:u", nx_time},
     {"time:a", "time:a", nx_time},

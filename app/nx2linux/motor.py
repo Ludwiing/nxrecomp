@@ -418,9 +418,17 @@ class Construccion:
             self._ejecutar("extraer", [exe, llaves, "--aoc", ruta, os.path.join(j.carpeta, "aoc", f"{indice}.img"),
                                        "--romfs-image"])
 
-    # Paso 2: el recompilador estático.
+    # Paso 2: el recompilador estático. Antes, qué servicios del sistema nombra el juego y cuáles
+    # faltan en el runtime (solo informa: el registro dice qué arreglar si no arranca).
     def _recompilar(self):
         j = self.juego
+        try:
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "servicios.py"), os.path.join(j.carpeta, "ExeFS")],
+                               capture_output=True, text=True, timeout=600)
+            for linea in r.stdout.splitlines():
+                self._linea("recompilar", 0, linea)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
         def prog(linea):
             m = re.match(r"progreso (\d+)/(\d+)", linea)
