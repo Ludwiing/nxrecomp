@@ -36,7 +36,9 @@ Se marca [x] lo hecho.
 12. [ ] Etapas y registros: geometría *passthrough*, VertexA, primitive ID, máscaras de hilos.
 13. [ ] Estado por canal (cada cola de NVN es un canal), espacio de direcciones con sparse y Remap,
     páginas sin mapear que leen 0.
-14. [ ] Presentación: intervalo de swap (30 fps) y recorte del QueueBuffer; nvdec/vic para videos.
+14. [~] Presentación: [x] intervalo de swap (30 fps), [x] recorte y espejos del QueueBuffer.
+    Falta: nvdec/vic para videos; presentar directo desde la textura de la GPU (hoy se deshace el
+    block linear en la CPU en cada cuadro).
 
 ## CPU y recompilador
 

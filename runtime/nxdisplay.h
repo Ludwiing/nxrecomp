@@ -15,6 +15,9 @@ typedef struct {
     uint32_t width, height, pitch, format;
     uint32_t layout;            // 1 lineal, 3 block linear
     uint32_t block_height_log2;
+    int32_t crop[4];            // recorte del QueueBuffer (izquierda, arriba, derecha, abajo); vacío = todo
+    uint32_t transform;         // 1 espejo horizontal, 2 vertical (4, rotar 90°, no se aplica)
+    uint32_t interval;          // intervalo de swap: cuántos vsync dura el cuadro (0 = no esperar)
 } NxFrame;
 
 void nx_display_present(const NxFrame *f); // lo llama el hilo del juego; marca el ritmo de 60 Hz

@@ -34,15 +34,27 @@ static inline uint64_t block_linear_offset(uint32_t xb, uint32_t y, uint32_t wid
     return block + (gx / 32) * 256 + (gy / 2) * 64 + ((gx % 32) / 16) * 32 + (gy % 2) * 16 + gx % 16;
 }
 
+// El rectángulo visible del cuadro: el recorte del QueueBuffer si es válido (un juego en modo
+// portátil puede dibujar 1280x720 dentro de un buffer de 1920x1080, como Link's Awakening).
+static void visible(const NxFrame *f, uint32_t *x0, uint32_t *y0, uint32_t *w, uint32_t *h) {
+    const int32_t *c = f->crop;
+    if (c[2] > c[0] && c[3] > c[1] && c[0] >= 0 && c[1] >= 0 && (uint32_t)c[2] <= f->width && (uint32_t)c[3] <= f->height)
+        *x0 = (uint32_t)c[0], *y0 = (uint32_t)c[1], *w = (uint32_t)(c[2] - c[0]), *h = (uint32_t)(c[3] - c[1]);
+    else
+        *x0 = *y0 = 0, *w = f->width, *h = f->height;
+}
+
 static void to_rgba(const NxFrame *f, uint8_t *dst) {
     uint32_t bpp = f->format == NX_FMT_RGB565 || f->format == NX_FMT_RGBA4444 ? 2 : 4;
-    uint32_t width_gobs = (f->pitch + 63) / 64;
-    for (uint32_t y = 0; y < f->height; y++)
-        for (uint32_t x = 0; x < f->width; x++) {
+    uint32_t width_gobs = (f->pitch + 63) / 64, x0, y0, vw, vh;
+    visible(f, &x0, &y0, &vw, &vh);
+    for (uint32_t oy = 0; oy < vh; oy++)
+        for (uint32_t ox = 0; ox < vw; ox++) {
+            uint32_t x = x0 + (f->transform & 1 ? vw - 1 - ox : ox), y = y0 + (f->transform & 2 ? vh - 1 - oy : oy);
             uint64_t off = f->layout == 3 ? block_linear_offset(x * bpp, y, width_gobs, f->block_height_log2)
                                           : (uint64_t)y * f->pitch + (uint64_t)x * bpp;
             const uint8_t *p = f->data + off;
-            uint8_t *d = dst + ((size_t)y * f->width + x) * 4;
+            uint8_t *d = dst + ((size_t)oy * vw + ox) * 4;
             switch (f->format) {
             case NX_FMT_BGRA8888: d[0] = p[2], d[1] = p[1], d[2] = p[0], d[3] = p[3]; break;
             case NX_FMT_RGB565: {
@@ -71,12 +83,14 @@ static void capture(const char *path) {
 }
 
 void nx_display_present(const NxFrame *f) {
+    uint32_t x0, y0, vw, vh;
+    visible(f, &x0, &y0, &vw, &vh);
     pthread_mutex_lock(&lock);
-    if (!frame || frame_w != (int)f->width || frame_h != (int)f->height) {
+    if (!frame || frame_w != (int)vw || frame_h != (int)vh) {
         free(frame);
-        frame = malloc((size_t)f->width * f->height * 4);
-        frame_w = (int)f->width;
-        frame_h = (int)f->height;
+        frame = malloc((size_t)vw * vh * 4);
+        frame_w = (int)vw;
+        frame_h = (int)vh;
     }
     to_rgba(f, frame);
     frames++;
@@ -94,8 +108,10 @@ void nx_display_present(const NxFrame *f) {
     pthread_cond_signal(&cond);
     pthread_mutex_unlock(&lock);
 
-    // 60 cuadros por segundo: el cuadro siguiente se acepta en el próximo vsync.
-    uint64_t now = nx_now_ns(), period = 16666667;
+    // 60 Hz: el cuadro dura `interval` vsyncs (2 en un juego a 30 fps) y el siguiente se acepta
+    // después; con 0 no se espera.
+    if (!f->interval) return;
+    uint64_t now = nx_now_ns(), period = 16666667ull * (f->interval > 4 ? 4 : f->interval);
     if (!next_vsync_ns || now > next_vsync_ns + period) next_vsync_ns = now;
     next_vsync_ns += period;
     if (next_vsync_ns > now) {

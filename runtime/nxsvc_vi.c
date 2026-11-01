@@ -68,7 +68,7 @@ static void put_flat(Reply *r, const void *obj, uint32_t n) { // objeto aplanado
     r->size += (n + 3) & ~3u;
 }
 
-static void present(int s) {
+static void present(int s, const uint8_t *qbi) {
     Slot *sl = &slots[s];
     NvMapObj *m = nvmap_by_id(sl->nvmap_id);
     if (!m || !m->addr) {
@@ -76,13 +76,19 @@ static void present(int s) {
         return;
     }
     NxFrame f = {(const uint8_t *)(uintptr_t)(m->addr + sl->offset), sl->width, sl->height,
-                 sl->pitch ? sl->pitch : sl->stride * 4, sl->format, sl->layout, sl->block_height_log2};
+                 sl->pitch ? sl->pitch : sl->stride * 4, sl->format, sl->layout, sl->block_height_log2,
+                 {0, 0, 0, 0}, 0, 1};
+    if (qbi) { // QueueBufferInput: marca de tiempo (8), auto (4), recorte (16), escalado, transformación,
+               // transformación fija, async, intervalo de swap, cercas
+        for (int k = 0; k < 4; k++) f.crop[k] = (int32_t)u32at(qbi + 12 + k * 4);
+        f.transform = u32at(qbi + 32);
+        f.interval = u32at(qbi + 44);
+    }
     nx_display_present(&f);
 }
 
 // Transacción de IGraphicBufferProducer. `in` es el payload (después del token de interfaz).
 static void transact(uint32_t code, const uint8_t *in, uint32_t in_size, Reply *out) {
-    (void)in_size;
     switch (code) {
     case 10: { // CONNECT → QueueBufferOutput
         uint32_t o[4] = {1280, 720, 0, 0};
@@ -135,7 +141,7 @@ static void transact(uint32_t code, const uint8_t *in, uint32_t in_size, Reply *
     case 7: { // QUEUE_BUFFER(ranura, entrada) → el cuadro a la pantalla
         int32_t s = (int32_t)u32at(in);
         if (s >= 0 && s < SLOTS) {
-            present(s);
+            present(s, in_size >= 12 + 48 ? in + 12 : NULL); // después de la ranura, largo y fds
             slots[s].dequeued = 0;
         }
         uint32_t o[4] = {1280, 720, 0, 0};
