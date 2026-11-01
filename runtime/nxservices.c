@@ -114,6 +114,7 @@ static const struct {
     {"vi:s", "vi:s", nx_vi},
     {"vi:m", "vi:m", nx_vi},
     {"nvdrv", "nvdrv", nx_nvdrv},
+    {"audout:u", "audout:u", nx_audout},
     {"nvdrv:a", "nvdrv:a", nx_nvdrv},
     {"nvdrv:s", "nvdrv:s", nx_nvdrv},
     {"nvdrv:t", "nvdrv:t", nx_nvdrv},

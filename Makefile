@@ -12,6 +12,8 @@ LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
 # Mandos: un guion aprieta botones en cuadros fijos y se compara lo que el programa vio.
 LIBNX_MANDOS := $(if $(wildcard $(DEVKITPRO)/libnx),mandos)
 PULSAR := 10:a,20:b+x,30:up,40:zl+r,50:minus,60:plus
+# Audio: el ejemplo oficial playtone toca tres notas (A, B, X); se compara el WAV grabado.
+LIBNX_AUDIO := $(if $(wildcard $(DEVKITPRO)/libnx),playtone)
 
 
 OPT ?= -O2
@@ -27,11 +29,11 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_MANDOS:%=$(B)/libnx_%)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -116,6 +118,12 @@ test: all
 		NX_SIN_VENTANA=1 NX_PULSAR="$(PULSAR)" timeout 60 $(B)/libnx_$$p > $(B)/$$p.salida.txt; \
 		if diff -u guest/esperado/$$p.txt $(B)/$$p.salida.txt; then echo "OK: $$p (libnx, mandos) vio los botones esperados"; \
 		else ok=0; fi; \
+	done; \
+	for p in $(LIBNX_AUDIO); do \
+		rm -f $(B)/$$p.wav; NX_SIN_VENTANA=1 NX_SIN_AUDIO=1 NX_AUDIO_WAV=$(B)/$$p.wav NX_PULSAR="10:a,20:b,30:x,40:plus" \
+			timeout 60 $(B)/libnx_$$p >/dev/null; \
+		if [ "$$(sha256sum < $(B)/$$p.wav | cut -d' ' -f1)" = "$$(cat guest/esperado/$$p.wav.sha256)" ]; then \
+			echo "OK: $$p (libnx, audio) tocó el sonido esperado"; else echo "MAL: $$p tocó otro sonido"; ok=0; fi; \
 	done; test $$ok = 1
 
 $(B):
