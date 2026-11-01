@@ -356,7 +356,7 @@ static int discover(T *t) {
             t->op = decode(t, i, &t->o);
             int fall = 1;
             switch (t->op) {
-            case MXOP_Bra: case MXOP_Ssy: case MXOP_Pbk: case MXOP_Pcnt: case MXOP_Cal: {
+            case MXOP_Bra: case MXOP_Ssy: case MXOP_Pbk: case MXOP_Pcnt: case MXOP_Cal: case MXOP_Pret: {
                 if (G(Ca) == 1) {
                     red(t, "salto a una dirección de constbuf");
                     break;
@@ -1569,6 +1569,10 @@ static void emit_insn(T *t) {
         if (G(Ca) == 1) break;
         L(t, "if (sp < 16) stk[sp++] = %uu | %uu;", target(t, t->idx, t->o),
           (t->op == MXOP_Ssy ? 1u : t->op == MXOP_Pbk ? 2u : 3u) << 28);
+        break;
+    case MXOP_Pret: // apila un retorno (para RET) sin saltar
+        if (G(Ca) == 1) break;
+        L(t, "if (sp < 16) stk[sp++] = %uu | %uu;", target(t, t->idx, t->o), 4u << 28);
         break;
     case MXOP_Cal:
         L(t, "if (sp < 16) stk[sp++] = %uu | %uu;", next_idx(t->idx), 4u << 28);

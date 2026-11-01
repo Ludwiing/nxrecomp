@@ -55,11 +55,11 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(if $(DEKO_EJEMPLOS),$(B)/libnx_deko_examples) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh) $(SHADERS_COMP:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(B)/astc_test $(if $(LIBNX_GPU),$(B)/libnx_deko_astc) $(if $(DEKO_EJEMPLOS),$(B)/libnx_deko_examples) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh) $(SHADERS_COMP:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -117,6 +117,10 @@ $(B)/multi_ref: guest/multi/main.c guest/multi/sdk.c guest/multi/ref.c guest/min
 $(M):
 	mkdir -p $@
 
+# ASTC: el decodificador contra el de Mesa (llvmpipe), con bloques aleatorios de los 14 tamaños.
+$(B)/astc_test: tests/astc_test.c runtime/nxastc.c runtime/nxastc.h | $(B)
+	$(CLANG) -O2 -Iruntime tests/astc_test.c runtime/nxastc.c -lEGL -lOpenGL -o $@
+
 $(B)/shader_test: tests/shader_test.c runtime/nxshader.c runtime/nxshader.h runtime/mxisa.h | $(B)
 	$(CLANG) -O1 -Iruntime tests/shader_test.c runtime/nxshader.c -lEGL -lOpenGL -o $@
 
@@ -156,6 +160,15 @@ test: all
 		if [ "$$(sha256sum < $(B)/$$p.ppm | cut -d' ' -f1)" = "$$(cat guest/esperado/$$p.sha256)" ]; then \
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
+	$(B)/astc_test 20000 >/dev/null 2>$(B)/astc.err; r=$$?; \
+	if [ $$r = 0 ]; then echo "OK: el decodificador ASTC da lo mismo que Mesa en 560 mil bloques (14 tamaños, lineal y sRGB)"; \
+	elif [ $$r = 77 ]; then echo "(sin el llvmpipe de Mesa no se prueba ASTC)"; else echo "MAL: ASTC distinto de Mesa"; ok=0; fi; \
+	if [ -n "$(LIBNX_GPU)" ]; then \
+		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/deko_astc.ppm NX_CAPTURA_CUADRO=3 timeout 60 $(B)/libnx_deko_astc >/dev/null 2>&1; \
+		$(B)/astc_test --captura guest/libnx/deko_astc/romfs $(B)/deko_astc.ppm 2>>$(B)/astc.err; r=$$?; \
+		if [ $$r = 0 ]; then echo "OK: deko_astc dibuja sus texturas ASTC como las decodifica Mesa"; \
+		elif [ $$r != 77 ]; then echo "MAL: deko_astc dibujó otras texturas"; ok=0; fi; \
+	fi; \
 	if [ -n "$(SHADERS_COMP)" ]; then \
 		if $(B)/shader_test --comparar-comp $(foreach s,$(SHADERS_COMP),tests/shaders/$(s).comp $(B)/shaders/$(s).dksh); then \
 			echo "OK: los $(words $(SHADERS_COMP)) shaders de cómputo traducidos escriben lo mismo que su GLSL original"; \

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "nxastc.h"
 #include "nxgpu.h"
 #include "nxshader.h"
 
@@ -391,6 +392,7 @@ typedef struct {
     uint8_t fmt, comp; // formato de imagen del TIC y tipo de componente (0 = cualquiera)
     GLenum internal, srgb, format, type;
     uint8_t bpb, bw, bh, depth; // bytes por bloque, tamaño del bloque, es de profundidad
+    uint8_t astc;               // ASTC: se descomprime en la CPU a RGBA8
 } TexFmt;
 
 static const TexFmt tex_fmts[] = {
@@ -453,6 +455,11 @@ static const TexFmt tex_fmts[] = {
     {0x2F, 0, GL_DEPTH_COMPONENT32F, 0, GL_DEPTH_COMPONENT, GL_FLOAT, 4, 1, 1, 1},
     {0x30, 0, GL_DEPTH32F_STENCIL8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 8, 1, 1, 1},
     {0x3A, 0, GL_DEPTH_COMPONENT16, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 2, 1, 1, 1},
+#define ASTC(f, w, h) {f, 0, GL_RGBA8, GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE, 16, w, h, 0, 1}
+    ASTC(0x40, 4, 4), ASTC(0x41, 5, 5), ASTC(0x42, 6, 6), ASTC(0x44, 8, 8), ASTC(0x45, 10, 10), ASTC(0x46, 12, 12),
+    ASTC(0x50, 5, 4), ASTC(0x51, 6, 5), ASTC(0x52, 8, 6), ASTC(0x53, 10, 8), ASTC(0x54, 12, 10), ASTC(0x55, 8, 5),
+    ASTC(0x56, 10, 5), ASTC(0x57, 10, 6),
+#undef ASTC
 };
 
 static const TexFmt *tex_fmt(uint32_t fmt, uint32_t comp) {
@@ -592,6 +599,15 @@ static void tex_subir(Tex *x, const Tic *t, const TexFmt *f, const uint8_t *mem,
         }
         int comprimido = f->format == 0;
         GLenum fmt = f->format;
+        if (f->astc) { // bloques ASTC (ya en orden lineal) → RGBA8
+            static uint8_t *rgba;
+            static size_t cap;
+            size_t need = (size_t)w * h * nz * 4;
+            if (need > cap) rgba = realloc(rgba, cap = need);
+            for (uint32_t z = 0; z < nz; z++)
+                nx_astc_imagen(lin + (size_t)z * row * rows, w, h, f->bw, f->bh, t->srgb, rgba + (size_t)z * w * h * 4);
+            lin = rgba;
+        }
         switch (x->target) {
         case GL_TEXTURE_2D:
             if (comprimido) glCompressedTextureSubImage2D(x->tex, l, 0, 0, w, h, f->internal, (GLsizei)((size_t)row * rows), lin);
