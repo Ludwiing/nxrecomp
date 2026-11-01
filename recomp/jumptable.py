@@ -14,13 +14,36 @@ código válidas.
 from a64 import bits, decode, sext
 
 M64 = (1 << 64) - 1
-MAX_BACK = 32       # instrucciones que se miran hacia atrás desde el BR
+MAX_BACK = 64       # instrucciones que se miran hacia atrás desde el BR
 MAX_ENTRIES = 1024  # tope sin cota conocida
+COND_HI, COND_HS, COND_LS, COND_LO = 0b1000, 0b0010, 0b1001, 0b0011
+CALLER_SAVED = set(range(19)) | {30}
 
 
 def _flow_stop(w):
     """Instrucciones que cortan un camino lineal: B, BL, BR, BLR, RET."""
     return bits(w, 30, 26) == 0b00101 or bits(w, 31, 25) == 0b1101011
+
+
+def _uncond(w):
+    """Después de B, BR o RET no se sigue de largo (BL sí: la llamada vuelve)."""
+    return (bits(w, 30, 26) == 0b00101 and not bits(w, 31, 31)) or bits(w, 31, 25) == 0b1101011
+
+
+def _is_call(w):
+    return (bits(w, 30, 26) == 0b00101 and bits(w, 31, 31)) or (bits(w, 31, 25) == 0b1101011 and bits(w, 24, 21) == 1)
+
+
+def _branch(w, q):
+    """Destino y condición de B, B.cond, CBZ/CBNZ o TBZ/TBNZ (o None)."""
+    if bits(w, 31, 26) == 0b000101:
+        return (q + (sext(bits(w, 25, 0), 26) << 2)) & M64, None
+    if bits(w, 31, 24) == 0b01010100 and not bits(w, 4, 4):
+        return (q + (sext(bits(w, 23, 5), 19) << 2)) & M64, bits(w, 3, 0)
+    if bits(w, 30, 25) in (0b011010, 0b011011):
+        imm = sext(bits(w, 23, 5), 19) if bits(w, 25, 25) == 0 else sext(bits(w, 18, 5), 14)
+        return (q + (imm << 2)) & M64, "cb"
+    return None
 
 
 def _cmp_imm(w):
@@ -30,104 +53,153 @@ def _cmp_imm(w):
     return None
 
 
-def find_bound(mod, pc):
-    """Busca hacia atrás un CMP #N seguido de B.HI / B.HS antes del BR.
+_branch_maps = {}
 
-    Devuelve (registro, pc del CMP, cantidad de entradas) o None.
+
+def _preds(mod, lo, hi):
+    """Para cada dirección de [lo, hi), los saltos que llegan a ella: {destino: [(origen, condición)]}."""
+    key = (id(mod), lo, hi)
+    if key not in _branch_maps:
+        m = {}
+        for q in range(lo, hi, 4):
+            if not mod.in_text(q):
+                break
+            b = _branch(mod.word(q), q)
+            if b:
+                m.setdefault(b[0], []).append((q, b[1]))
+        _branch_maps[key] = m
+    return _branch_maps[key]
+
+
+def backward_path(mod, pc, lo):
+    """Camino hacia atrás desde pc siguiendo el flujo de control: [(dirección, cómo se llegó)].
+
+    De cada bloque se pasa a su único predecesor: la instrucción anterior si se sigue de largo
+    ("cae"), o el salto que lleva a él ("salta", condición). Si hay más de uno, se para.
     """
-    cond = None
-    q = pc - 4
-    for _ in range(MAX_BACK):
-        if not mod.in_text(q):
+    hi = pc + 0x4000
+    preds = _preds(mod, lo, hi)
+    path, seen, q = [], set(), pc
+    while len(path) < MAX_BACK:
+        prev = q - 4
+        falls = prev >= lo and mod.in_text(prev) and not _uncond(mod.word(prev))
+        jumps = preds.get(q, [])
+        if falls and not jumps:
+            step = (prev, "cae")
+        elif not falls and len(jumps) == 1:
+            step = (jumps[0][0], ("salta", jumps[0][1]))
+        else:
             break
-        w = mod.word(q)
-        if bits(w, 31, 24) == 0b01010100 and not bits(w, 4, 4):  # B.cond
-            c = bits(w, 3, 0)
-            if c in (0b1000, 0b0010):  # HI, HS
-                cond = c
-        elif _flow_stop(w):
+        if step[0] in seen:
             break
-        elif cond is not None:
-            cmp = _cmp_imm(w)
+        seen.add(step[0])
+        path.append(step)
+        q = step[0]
+    return path
+
+
+def find_bound(mod, path):
+    """La cota del índice en el camino: CMP #N y B.HI/B.HS sin saltar, o B.LS/B.LO saltando.
+
+    Devuelve (registro, posición del CMP en el camino, cantidad de entradas) o None.
+    """
+    for i, (addr, how) in enumerate(path):
+        w = mod.word(addr)
+        if not (bits(w, 31, 24) == 0b01010100 and not bits(w, 4, 4)):
+            continue
+        c = bits(w, 3, 0)
+        taken = how != "cae"
+        if not taken and c in (COND_HI, COND_HS):
+            extra = 1 if c == COND_HI else 0
+        elif taken and c in (COND_LS, COND_LO):
+            extra = 1 if c == COND_LS else 0
+        else:
+            continue
+        for j in range(i + 1, min(i + 4, len(path))):
+            cmp = _cmp_imm(mod.word(path[j][0]))
             if cmp:
-                reg, n = cmp
-                return reg, q, n + 1 if cond == 0b1000 else n
-        q -= 4
+                return cmp[0], j, cmp[1] + extra
     return None
 
 
 class Slicer:
-    """Reconstruye el valor de un registro como expresión, hacia atrás desde un pc."""
+    """Reconstruye el valor de un registro como expresión, hacia atrás por el camino del BR."""
 
-    def __init__(self, mod, bound, entry):
+    def __init__(self, mod, path, bound, entry):
         self.mod = mod
+        self.path = path
         self.bound = bound
         self.entry = entry
+        self.preds = _preds(mod, entry, (path[0][0] if path else entry) + 0x4000)
 
-    def reg(self, r, pc, depth=0):
+    def reg(self, r, pos=0, depth=0):
         if r == 31:
             return ("const", 0)
         if depth > 12:
             return ("var",)
-        q = pc - 4
-        for _ in range(MAX_BACK):
-            if not self.mod.in_text(q):
-                break
-            if self.bound and r == self.bound[0] and q < self.bound[1] + 4:
+        for i in range(pos, len(self.path)):
+            if self.bound and r == self.bound[0] and i >= self.bound[1]:
                 return ("var",)  # el valor que acota el CMP
+            q = self.path[i][0]
             w = self.mod.word(q)
-            if _flow_stop(w):
-                break
-            e = self.effect(w, q, r, depth)
+            if _is_call(w) and r in CALLER_SAVED:
+                return ("var",)  # la llamada pudo cambiarlo
+            e = self.effect(w, q, r, depth, lambda reg, i=i: self.reg(reg, i + 1, depth + 1), i)
             if e is not None:
                 return e
-            q -= 4
         if self.bound and r == self.bound[0]:
             return ("var",)
-        return self.invariant(r, pc, depth)
+        return self.merged(r, self.path[-1][0] if self.path else self.entry, depth)
 
-    def forward(self, base, off, size, q, depth):
+    def merged(self, r, q, depth):
+        """Valor de r antes de q juntando todos los caminos que llegan (el camino único se cortó en
+        un bloque con varios predecesores, como la cabeza de un bucle). Los caminos que dan la vuelta
+        sin cambiar r no aportan; si los demás coinciden, vale ese valor."""
+        found, seen, work = [], set(), [q]
+        while work and len(seen) < 20000:
+            cur = work.pop()
+            preds = [s for s, _ in self.preds.get(cur, [])]
+            prev = cur - 4
+            if prev >= self.entry and self.mod.in_text(prev) and not _uncond(self.mod.word(prev)):
+                preds.append(prev)
+            if not preds and cur <= self.entry:
+                return ("var",)  # se llegó al inicio de la función sin encontrar el valor
+            for p in preds:
+                if p in seen:
+                    continue
+                seen.add(p)
+                w = self.mod.word(p)
+                if _is_call(w) and r in CALLER_SAVED:
+                    return ("var",)
+                e = self.effect(w, p, r, depth, lambda reg, p=p: self.merged(reg, p, depth + 1) if depth < 6 else ("var",), None)
+                if e is None:
+                    work.append(p)
+                elif e == ("var",) or has_var(e):
+                    return ("var",)
+                else:
+                    found.append(e)
+        if work or not found or any(e != found[0] for e in found):
+            return ("var",)
+        return found[0]
+
+    def forward(self, base, off, size, i, depth):
         """Busca hacia atrás el guardado en [base + off] que alimenta una carga (código -O0)."""
-        p = q - 4
-        for _ in range(2 * MAX_BACK):
-            if not self.mod.in_text(p):
-                return None
+        for j in range(i + 1, len(self.path)):
+            p = self.path[j][0]
             w = self.mod.word(p)
-            if _flow_stop(w):
+            if _is_call(w):
                 return None
-            i = decode(p, w)
-            if i.kind == "op" and f"{'c->sp' if base == 31 else f'c->x[{base}]'} = " in " ".join(i.lines):
+            d = decode(p, w)
+            if d.kind == "op" and f"{'c->sp' if base == 31 else f'c->x[{base}]'} = " in " ".join(d.lines):
                 return None  # la base cambió
             unscaled = w & 0x3BE00C00 == 0x38000000
             if (w & 0x3BC00000 == 0x39000000 or unscaled) and not bits(w, 26, 26) and bits(w, 9, 5) == base:
                 s_off = sext(bits(w, 20, 12), 9) if unscaled else bits(w, 21, 10) << bits(w, 31, 30)
                 if s_off == off and bits(w, 31, 30) == size:
-                    return self.reg(bits(w, 4, 0), p, depth + 1)
-            p -= 4
+                    return self.reg(bits(w, 4, 0), j + 1, depth + 1)
         return None
 
-    def invariant(self, r, pc, depth):
-        """Valores que el compilador sacó del bucle (la dirección de la tabla, por ejemplo):
-        si todas las escrituras de r en la función dan la misma constante, vale esa."""
-        found = None
-        for q in range(self.entry, pc, 4):
-            w = self.mod.word(q)
-            i = decode(q, w)
-            if i.kind != "op" or f"c->x[{r}] = " not in " ".join(i.lines):
-                continue
-            e = self.effect(w, q, r, depth + 1)
-            if e is None or has_var(e):
-                return ("var",)
-            try:
-                v = evaluate(self.mod, e, 0)
-            except ValueError:
-                return ("var",)
-            if found is not None and v != found:
-                return ("var",)
-            found = v
-        return ("const", found) if found is not None else ("var",)
-
-    def effect(self, w, q, r, depth):
+    def effect(self, w, q, r, depth, rec, pos):
         """Si la instrucción en q escribe r, devuelve su valor como expresión (si no, None)."""
         rd, rn, rm = bits(w, 4, 0), bits(w, 9, 5), bits(w, 20, 16)
         i = decode(q, w)
@@ -139,7 +211,6 @@ class Slicer:
         if rd != r:  # escribe r de otra forma (writeback, segundo registro de un par)
             return ("var",)
         sf = bits(w, 31, 31)
-        rec = lambda reg: self.reg(reg, q, depth + 1)  # noqa: E731
         wrap = (lambda e: e) if sf else (lambda e: ("ext", e, 2))
         if w & 0x7F800000 == 0x11000000:  # ADD inmediato
             imm = bits(w, 21, 10) << (12 if bits(w, 22, 22) else 0)
@@ -177,8 +248,8 @@ class Slicer:
             if opc == 0:
                 return None
             off = sext(bits(w, 20, 12), 9) if unscaled else bits(w, 21, 10) << size
-            if rn in (29, 31) and opc == 1:  # variable local: el valor del último STR a esa ranura
-                fwd = self.forward(rn, off, size, q, depth)
+            if rn in (29, 31) and opc == 1 and pos is not None:  # variable local: el último STR a esa ranura
+                fwd = self.forward(rn, off, size, pos, depth)
                 if fwd is not None:
                     return fwd if size == 3 else ("ext", fwd, {0: 0, 1: 1, 2: 2}[size])
             e = ("load", ("add", rec(rn), ("const", off & M64)), 1 << size, opc >= 2)
@@ -219,8 +290,10 @@ def evaluate(mod, e, k):
 
 def resolve(mod, br_pc, reg, entry):
     """Destinos posibles de `BR reg` en br_pc, o [] si no se reconoce una tabla."""
-    bound = find_bound(mod, br_pc)
-    expr = Slicer(mod, bound, min(entry, br_pc)).reg(reg, br_pc)
+    lo = min(entry, br_pc)
+    path = backward_path(mod, br_pc, lo)
+    bound = find_bound(mod, path)
+    expr = Slicer(mod, path, bound, lo).reg(reg)
     if expr == ("var",):
         return []
     if not has_var(expr):  # destino fijo (un veneer, por ejemplo)

@@ -110,6 +110,13 @@ static const struct {
     {"time:u", "time:u", nx_time},
     {"time:a", "time:a", nx_time},
     {"time:s", "time:s", nx_time},
+    {"vi:u", "vi:u", nx_vi},
+    {"vi:s", "vi:s", nx_vi},
+    {"vi:m", "vi:m", nx_vi},
+    {"nvdrv", "nvdrv", nx_nvdrv},
+    {"nvdrv:a", "nvdrv:a", nx_nvdrv},
+    {"nvdrv:s", "nvdrv:s", nx_nvdrv},
+    {"nvdrv:t", "nvdrv:t", nx_nvdrv},
 };
 
 static uint32_t sm_handle(ServiceObject *self, NxRequest *r) {

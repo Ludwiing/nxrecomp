@@ -46,6 +46,8 @@ Con devkitPro instalado (`tools/instalar-devkitpro.sh`, que necesita sudo y se c
 - `guest/libnx/basico`: el arranque completo de libnx (`crt0`, reubicación, heap, `sm`, `set:sys`, `appletOE`, `hid`, `time`, `fs`), `main` y la salida por `ISelfController::Exit`.
 - `guest/libnx/sistema`: las API de libnx como las usa cualquier homebrew: hilos con `Mutex` y `CondVar`, idioma, versión del sistema, relojes y calendario, archivos y carpetas en la SD con `fopen`/`opendir`, mandos con `padUpdate` y `malloc` de 64 MiB.
 
+Además corren dos ejemplos oficiales de devkitPro con pantalla, sin tocar: `printing/hello-world` (la consola de texto de libnx) y `simplegfx` (dibuja píxeles directo en el framebuffer). `make test` compara la huella del décimo cuadro.
+
 Para probar uno nuevo: `tools/probar_libnx.sh <nombre>` lo compila, lo recompila con `--traza` y lo corre. Para depurar:
 - Con `NX_TRAZA_SVC=1` se ven las llamadas al kernel.
 - Con `NX_TRAZA_FUNC=1`, cada función que se ejecuta. `aarch64-none-elf-addr2line` traduce la dirección a función y línea.
@@ -63,6 +65,10 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
   - `hid`, con su memoria compartida, en `nxsvc_hid.c`. Por ahora sin mandos conectados.
   - `time:u/a/s`, con la memoria compartida de los relojes, la hora real y la zona horaria del anfitrión, en `nxsvc_time.c`.
   - `fsp-srv`, en `nxsvc_fs.c`. La SD es una carpeta: `NX_SDMC`, por defecto `~/.local/share/nxrecomp/sdmc`. El RomFS es una imagen (`NX_ROMFS`).
+
+  - `vi:u/s/m` (pantalla y capas), el binder con la cola de buffers de Android (`IGraphicBufferProducer`) y `nvdrv` con `/dev/nvmap`, en `nxsvc_vi.c`. Cada cuadro encolado pasa por `runtime/nxdisplay.c`: se reordena del formato "block linear" de la GPU, se convierte a RGBA y se muestra en una ventana SDL3 a 60 cuadros por segundo. Variables:
+    - `NX_SIN_VENTANA=1`: no abre ventana.
+    - `NX_CAPTURA=f.ppm`: guarda el cuadro número `NX_CAPTURA_CUADRO` (30 por defecto) y termina.
 
   Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.
 
@@ -94,7 +100,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 - **Arranque de un juego real**: después de los constructores se salta directo a `nnMain`. Un juego con el SDK de Nintendo necesita antes la secuencia de `nn::init::Start` (`nnosInitialize`, `nninitStartup`...), y esa secuencia necesita hilos, SVC y servicios de Horizon. Es el siguiente paso.
 - **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
-- **Servicios**: faltan los mandos de verdad (llenar la memoria de `hid` con SDL), `vi`/`nvdrv` (pantalla y GPU, la parte más grande), `audren`/`audout`, `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
+- **Servicios**: faltan los mandos de verdad (llenar la memoria de `hid` con SDL), la GPU (NVN sobre Vulkan, la parte más grande; hoy solo se muestran cuadros dibujados por la CPU), `audren`/`audout`, `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
 - **Excepciones de C++ y `longjmp`**: un RET a una dirección que no es inicio de función (el destino de un `longjmp`, o una plataforma de aterrizaje de una excepción) todavía no se resuelve.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.
 - **Velocidad**: el código traducido es entre 2 y 4,5 veces más lento que el nativo. Los registros viven en memoria y todavía no hay optimizaciones.

@@ -123,6 +123,15 @@ KThread *nx_kernel_main_thread(void) {
 }
 KThread *nx_current_thread(void) { return cur; }
 
+// El hilo principal del juego corre en un pthread propio (el principal del proceso es la ventana).
+void nx_kernel_adopt(KThread *t) {
+    cur = t;
+    nx_set_crash_ctx(t->ctx);
+    static __thread char altstack[64 * 1024];
+    stack_t ss = {.ss_sp = altstack, .ss_size = sizeof altstack};
+    sigaltstack(&ss, NULL);
+}
+
 static void *thread_main(void *arg) {
     KThread *t = arg;
     cur = t;

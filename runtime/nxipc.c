@@ -225,3 +225,16 @@ uint32_t nx_in32(NxRequest *r, uint32_t off) {
     if (off + 4 <= r->in_size) memcpy(&v, r->in + off, 4);
     return v;
 }
+
+// Buffers "auto-select" de libnx: llegan los dos descriptores (A y X de entrada, B y C de
+// salida) y se usa el que tiene tamaño.
+NxBuffer *nx_in_buffer(NxRequest *r, int k) {
+    if (k < r->nx && r->x[k].size) return &r->x[k];
+    if (k < r->na && r->a[k].size) return &r->a[k];
+    return k < r->nx ? &r->x[k] : k < r->na ? &r->a[k] : NULL;
+}
+NxBuffer *nx_out_buffer(NxRequest *r, int k) {
+    if (k < r->nc && r->c[k].size) return &r->c[k];
+    if (k < r->nb && r->b[k].size) return &r->b[k];
+    return k < r->nc ? &r->c[k] : k < r->nb ? &r->b[k] : NULL;
+}

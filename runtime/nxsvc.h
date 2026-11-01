@@ -43,6 +43,8 @@ void nx_out_object(NxRequest *r, ServiceObject *o);
 void nx_out_copy_handle(NxRequest *r, uint32_t h);
 void nx_out_bytes(NxRequest *r, const void *p, uint32_t n);
 void nx_out8(NxRequest *r, uint8_t v);
+NxBuffer *nx_in_buffer(NxRequest *r, int k);
+NxBuffer *nx_out_buffer(NxRequest *r, int k);
 uint32_t nx_in32(NxRequest *r, uint32_t off);
 uint64_t nx_in64(NxRequest *r, uint32_t off);
 
@@ -55,3 +57,5 @@ uint32_t nx_am_oe(ServiceObject *self, NxRequest *r);
 uint32_t nx_hid(ServiceObject *self, NxRequest *r);
 uint32_t nx_time(ServiceObject *self, NxRequest *r);
 uint32_t nx_fsp(ServiceObject *self, NxRequest *r);
+uint32_t nx_vi(ServiceObject *self, NxRequest *r);
+uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r);

@@ -15,7 +15,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FLAGS = ["-march=x86-64-v3", f"-I{ROOT}/runtime", "-w"]
+SDL = subprocess.run(["pkg-config", "--cflags", "--libs", "sdl3"], capture_output=True, text=True).stdout.split()
+FLAGS = ["-march=x86-64-v3", f"-I{ROOT}/runtime", "-w"] + [f for f in SDL if f.startswith("-I")]
 
 
 def main():
@@ -25,7 +26,7 @@ def main():
     ap.add_argument("-j", type=int, default=os.cpu_count())
     ap.add_argument("-O", dest="opt", default="2", help="nivel de optimización de clang (por defecto 2)")
     args = ap.parse_args()
-    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c"]
+    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c"]
     srcs = sorted(glob.glob(os.path.join(args.carpeta, "*.c"))) + [os.path.join(ROOT, "runtime", f) for f in runtime]
     objdir = os.path.join(args.carpeta, "obj")
     os.makedirs(objdir, exist_ok=True)
@@ -45,7 +46,7 @@ def main():
     errors = [e for _, e in results if e]
     if errors:
         sys.exit(errors[0])
-    subprocess.run(["clang", *[o for o, _ in results], "-lm", "-lpthread", "-o", args.salida], check=True)
+    subprocess.run(["clang", *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-o", args.salida], check=True)
     print(f"{args.salida}: {len(srcs)} archivos compilados con {args.j} hilos")
 
 

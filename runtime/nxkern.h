@@ -50,6 +50,7 @@ typedef struct KTmem {     // memoria de transferencia: el juego le presta una z
 
 KThread *nx_kernel_main_thread(void);
 KThread *nx_current_thread(void);
+void nx_kernel_adopt(KThread *t);
 __attribute__((noreturn)) void nx_exit_thread(void);
 void nx_memory_init(void);
 void nx_memory_add_stack(uint64_t addr, uint64_t size);
