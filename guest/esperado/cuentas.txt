@@ -1,0 +1,10 @@
+cuentas: 0x0, 1 usuario(s), preseleccionado 0x0: el mismo
+perfil: apodo sí, avatar JPEG: sí
+guardado de la cuenta: 0x0
+leído de vuelta: "nivel 7, 3 vidas"
+guardado del dispositivo: 0x0, aparte de la cuenta: sí
+fuentes: 0x0 0x0, TTF: sí
+csrng: bytes al azar
+nifm: 0x0, conexión: no hay
+control parental: 0x0, restringido: no
+teclado: 0x0, texto ""

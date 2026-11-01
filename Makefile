@@ -6,7 +6,7 @@ PROGS := hola neon vm multi
 PROGS_ESPERADO := hilos servicios
 # Homebrew hechos con libnx (devkitPro): se compilan con su toolchain si está instalado.
 DEVKITPRO ?= /opt/devkitpro
-LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema kernel)
+LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema kernel cuentas)
 # Ejemplos oficiales de libnx con pantalla: se compara la huella del cuadro 10 (sin ventana).
 LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
 # deko3d por la GPU: el color de limpieza y el triángulo con sus colores interpolados.
@@ -63,7 +63,7 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
@@ -159,7 +159,7 @@ test: all
 		else ok=0; fi; \
 	done; \
 	for p in $(LIBNX_PROGS); do \
-		mkdir -p $(B)/sdmc; NX_SDMC=$(B)/sdmc $(B)/libnx_$$p > $(B)/$$p.salida.txt; \
+		mkdir -p $(B)/sdmc; rm -rf $(B)/guardado; NX_SDMC=$(B)/sdmc NX_GUARDADO=$(B)/guardado $(B)/libnx_$$p > $(B)/$$p.salida.txt; \
 		if diff -u guest/esperado/$$p.txt $(B)/$$p.salida.txt; then echo "OK: $$p (libnx) es idéntico a lo esperado"; \
 		else ok=0; fi; \
 	done; \

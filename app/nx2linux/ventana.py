@@ -524,6 +524,17 @@ class Preferencias(Adw.PreferencesDialog):
         g.add(self.fila_llaves)
         pag.add(g)
 
+        g = Adw.PreferencesGroup(title="Usuario", description="El nombre que ven los juegos en tu perfil.")
+        nombre = Adw.EntryRow(title="Nombre", text=motor.leer_config().get("usuario", ""), show_apply_button=True)
+
+        def aplicar(fila):
+            cfg = motor.leer_config()
+            cfg["usuario"] = fila.get_text().strip()[:32]
+            motor.guardar_config(cfg)
+        nombre.connect("apply", aplicar)
+        g.add(nombre)
+        pag.add(g)
+
         g = Adw.PreferencesGroup(title="Biblioteca")
         fila = Adw.ActionRow(title="Carpeta de los juegos construidos", subtitle=motor.carpeta_juegos())
         b = Gtk.Button(icon_name="folder-open-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Abrir")

@@ -111,6 +111,8 @@ static const struct {
     {"apm", "apm", apm_handle},
     {"appletOE", "appletOE", nx_am_oe},
     {"appletAE", "appletAE", nx_am_oe},
+    {"acc:u0", "acc:u0", nx_acc},
+    {"acc:u1", "acc:u1", nx_acc},
     {"hid", "hid", nx_hid},
     {"time:u", "time:u", nx_time},
     {"time:a", "time:a", nx_time},
@@ -138,6 +140,11 @@ static uint32_t sm_handle(ServiceObject *self, NxRequest *r) {
                 nx_out_object(r, nx_object(registry[k].label, registry[k].fn, NULL));
                 return 0;
             }
+        ServiceObject *otro = nx_servicio_otro(name);
+        if (otro) {
+            nx_out_object(r, otro);
+            return 0;
+        }
         fprintf(stderr, "[RED] servicio no implementado: %s\n", name);
         return 0xE15u; // sm: no registrado
     }

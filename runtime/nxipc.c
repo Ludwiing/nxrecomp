@@ -151,6 +151,9 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
     } else {
         r.session_is_domain = s->domain;
         result = target->handle(target, &r);
+        static int traza = -1; // NX_TRAZA_IPC: cada comando, con su objeto y su resultado
+        if (traza < 0) traza = getenv("NX_TRAZA_IPC") != NULL;
+        if (traza) fprintf(stderr, "[ipc] %s %u → 0x%x\n", target->name, r.cmd, result);
         if (result == R_CMIF_UNKNOWN_CMD)
             fprintf(stderr, "[RED] %s: comando %u no implementado\n", target->name, r.cmd);
     }

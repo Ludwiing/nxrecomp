@@ -49,6 +49,10 @@ uint32_t nx_in32(NxRequest *r, uint32_t off);
 uint64_t nx_in64(NxRequest *r, uint32_t off);
 
 ServiceObject *nx_service_sm(void);
+// El usuario de la consola (nxsvc_acc.c) y un IStorage de am con una copia de `data` (nxsvc_am.c).
+void nx_usuario(uint8_t uid[16]);
+const char *nx_usuario_nombre(void);
+ServiceObject *nx_storage_new(const void *data, uint64_t size);
 ServiceObject *nx_object(const char *name, uint32_t (*fn)(ServiceObject *, NxRequest *), void *state);
 uint64_t nx_lang_code(const char *s);
 // Modo de la consola (NX_MODO=base|portatil, por defecto base): 1 en la base, 0 portátil.
@@ -56,6 +60,8 @@ int nx_en_base(void);
 
 // Servicios por archivo
 uint32_t nx_am_oe(ServiceObject *self, NxRequest *r);
+uint32_t nx_acc(ServiceObject *self, NxRequest *r);
+ServiceObject *nx_servicio_otro(const char *nombre); // nxsvc_otros.c: stubs y servicios menores
 uint32_t nx_hid(ServiceObject *self, NxRequest *r);
 uint32_t nx_time(ServiceObject *self, NxRequest *r);
 uint32_t nx_fsp(ServiceObject *self, NxRequest *r);

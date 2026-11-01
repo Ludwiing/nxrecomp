@@ -262,7 +262,8 @@ def clasificar(rutas, llaves):
         raise RuntimeError("hay más de un juego base en la selección: agrega uno a la vez")
     t, base = bases[0]
     upd = sorted((a for u, a in updates if u == t | 0x800), key=_version_del_nombre)
-    dlc = [a for d, a in sorted(dlcs) if (d & ~0xFFF) - 0x1000 == t]
+    # Un DLC es base + 0x1000 + índice; el juego lo abre por ese id.
+    dlc = [{"ruta": a, "indice": d - t - 0x1000} for d, a in sorted(dlcs) if t + 0x1000 < d < t + 0x2000]
     return {"title": f"{t:016x}", "base": base, "update": upd[-1] if upd else None, "dlc": dlc}
 
 
@@ -413,7 +414,8 @@ class Construccion:
         for k, d in enumerate(o.get("dlc") or []):
             self._linea("extraer", (k + 1) / n, f"Contenido descargable {k + 1} de {n - 1}")
             os.makedirs(os.path.join(j.carpeta, "aoc"), exist_ok=True)
-            self._ejecutar("extraer", [exe, llaves, "--aoc", d, os.path.join(j.carpeta, "aoc", f"{k}.img"),
+            ruta, indice = (d["ruta"], d["indice"]) if isinstance(d, dict) else (d, k + 1)
+            self._ejecutar("extraer", [exe, llaves, "--aoc", ruta, os.path.join(j.carpeta, "aoc", f"{indice}.img"),
                                        "--romfs-image"])
 
     # Paso 2: el recompilador estático.
@@ -472,6 +474,8 @@ def entorno_juego(j):
     env["NX_GUARDADO"] = os.path.join(j.carpeta, "guardado")
     env["NX_TITLE_ID"] = j.id
     env["NX_TITULO"] = j.nombre
+    if leer_config().get("usuario"):
+        env["NX_USUARIO"] = leer_config()["usuario"]
     env["NX_IDIOMA"] = aj["idioma"]
     env["NX_MODO"] = aj["modo"]
     if os.path.isdir(os.path.join(j.carpeta, "aoc")):

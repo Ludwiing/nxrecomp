@@ -71,12 +71,18 @@ Se marca [x] lo hecho.
 
 ## Servicios
 
-1. [ ] `acc:u0` (usuario, perfil) y el parámetro de lanzamiento con el usuario preseleccionado.
-2. [ ] Partidas guardadas en `fsp-srv` (22, 32, 51, 61, caché, dispositivo, temporal, 202, 203,
-   Commit); `am` 25/26/27.
-3. [ ] Servicios que responden "sin conexión" o "aceptado": aoc, pl (fuentes compartidas), pctl,
-   friends, prepo, nifm, csrng, bcat, olsc, nfp, caps, ldn, npns, mii, ngc, irs, bsd/sfdnsres, ssl.
-4. [ ] `am`: applets que cierran al momento, notificaciones, estadísticas, idioma desde NX_IDIOMA.
+1. [x] `acc:u0`/`acc:u1`: un usuario (apodo de NX_USUARIO o del de Linux), perfil y avatar; la cuenta
+   de Nintendo responde "no disponible". `am`: usuario preseleccionado (PopLaunchParameter tipo 2).
+2. [x] Partidas guardadas en `fsp-srv` (51/52/53 abren y crean la carpeta; cuenta, dispositivo,
+   caché, temporal y sistema por separado; 22-36 aceptan; lectores de guardados vacíos; 202 abre los
+   DLC por su id); `am` 25/26/27.
+3. [x] Stubs por tabla (nxsvc_otros.c): friends, prepo, pctl, olsc, npns, ssl, bcat, nfp/nfc, irs,
+   caps, ldn, mii, lm, mm, audin, spl, notif, ectx, pdm, sfdnsres, nifm (IRequest en espera y después
+   sin red), aoc (DLC de NX_AOC), fatal. Con implementación: pl:u (una fuente TTF del anfitrión en las
+   6 del sistema), csrng, bsd (todo falla con ENETDOWN; Poll y Select duermen), ngc.
+4. [x] `am`: applets que cierran al momento (selector de usuario, teclado, mandos, errores) con sus
+   eventos, IStorage, notificaciones vacías, idioma desde NX_IDIOMA.
 5. [ ] `hid` (evento de estilos), `time` (zonas horarias, snapshots), `apm`, `set` (región, mapa).
 6. [ ] Audio con las revisiones del SDK (5–15), efectos, IAudioDevice, `audout` Stop, `hwopus`.
 7. [ ] Herramienta que lista los servicios que nombra el juego antes del primer arranque.
+   Prueba: guest/libnx/cuentas (guest/esperado/cuentas.txt). NX_TRAZA_IPC=1 muestra cada comando.

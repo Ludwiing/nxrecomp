@@ -243,6 +243,71 @@ static ServiceObject *sdcard(void) {
     return nx_object("IFileSystem (SD)", filesystem_handle, fs);
 }
 
+// ---------- partidas guardadas ----------
+// Cada guardado es una carpeta del anfitrión, creada la primera vez que el juego la abre:
+//   $NX_GUARDADO (por defecto ~/.local/share/nxrecomp/guardado/<program id>)/
+//     cuenta/<uid>     las del usuario (tipo 1)          dispositivo/   las de la consola (tipo 3)
+//     cache/<índice>   almacenamiento de caché (tipo 5)  temporal/, bcat/, sistema/<id>
+// Las de la cuenta y las del dispositivo van aparte: Mario Odyssey pedía elegir Mii en cada arranque
+// cuando compartían carpeta (nxnative).
+static uint64_t programa_actual(void) {
+    const char *e = getenv("NX_TITLE_ID");
+    if (e && *e) return strtoull(e, NULL, 16);
+    return nx_program_id;
+}
+
+static ServiceObject *guardado(const uint8_t *attr) {
+    uint64_t prog, sys;
+    uint8_t tipo = attr[0x20];
+    uint16_t indice;
+    memcpy(&prog, attr, 8);
+    memcpy(&sys, attr + 0x18, 8);
+    memcpy(&indice, attr + 0x22, 2);
+    char base[700];
+    const char *env = getenv("NX_GUARDADO");
+    if (env && *env) snprintf(base, sizeof base, "%s", env);
+    else snprintf(base, sizeof base, "%s/.local/share/nxrecomp/guardado/%016llx", getenv("HOME") ? getenv("HOME") : ".",
+                  (unsigned long long)(prog ? prog : programa_actual()));
+    FsRoot *fs = calloc(1, sizeof *fs);
+    switch (tipo) {
+    case 0: snprintf(fs->root, sizeof fs->root, "%s/sistema/%016llx", base, (unsigned long long)sys); break;
+    case 1: {
+        char u[33];
+        for (int i = 0; i < 16; i++) sprintf(u + i * 2, "%02x", attr[8 + i]);
+        snprintf(fs->root, sizeof fs->root, "%s/cuenta/%s", base, u);
+        break;
+    }
+    case 2: snprintf(fs->root, sizeof fs->root, "%s/bcat", base); break;
+    case 3: snprintf(fs->root, sizeof fs->root, "%s/dispositivo", base); break;
+    case 4: snprintf(fs->root, sizeof fs->root, "%s/temporal", base); break;
+    case 5: snprintf(fs->root, sizeof fs->root, "%s/cache/%u", base, indice); break;
+    default: snprintf(fs->root, sizeof fs->root, "%s/otro%u", base, tipo);
+    }
+    if (mkdir_p(fs->root)) {
+        free(fs);
+        return NULL;
+    }
+    return nx_object("IFileSystem (guardado)", filesystem_handle, fs);
+}
+
+// ISaveDataInfoReader: la lista de guardados existentes; se responde vacía (el juego los crea o los abre igual).
+static uint32_t lector_guardados(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    if (r->cmd == 0) { nx_out64(r, 0); return OK; } // ReadSaveDataInfo
+    return NX_R_UNKNOWN_CMD;
+}
+
+// IDeviceOperator: hay tarjeta SD, no hay cartucho.
+static uint32_t operador(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    switch (r->cmd) {
+    case 0: nx_out8(r, 1); return OK;   // IsSdCardInserted
+    case 200: nx_out8(r, 0); return OK; // IsGameCardInserted
+    }
+    nx_out64(r, 0);
+    return OK;
+}
+
 uint32_t nx_fsp(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
@@ -269,6 +334,52 @@ uint32_t nx_fsp(ServiceObject *self, NxRequest *r) {
         return OK;
     }
     case 1005: nx_out32(r, 0); return OK; // GetGlobalAccessLogMode
+    case 1004: case 1016: return OK;      // SetGlobalAccessLogMode, FlushAccessLogOnSdCard
+    case 1011: nx_out32(r, 0); nx_out32(r, 1); return OK; // GetProgramIndexForAccessLog
+    // Guardados: crear, borrar y extender no hace falta (las carpetas se crean al abrirlas).
+    case 22: case 23: case 24: case 25: case 26: case 28: case 32: case 35: case 36: return OK;
+    case 27: nx_out8(r, 1); return OK;    // IsExFatSupported
+    case 51: case 52: case 53: { // OpenSaveDataFileSystem / BySystemSaveDataId / ReadOnly(espacio, atributo)
+        if (r->in_size < 0x48) return R_FS_INVALID_PATH;
+        ServiceObject *o = guardado(r->in + 8);
+        if (!o) return R_FS_INVALID_PATH;
+        nx_out_object(r, o);
+        return OK;
+    }
+    case 57: case 58: { // ReadSaveDataFileSystemExtraData*: datos extra en cero
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (b) memset((void *)(uintptr_t)b->addr, 0, b->size);
+        return OK;
+    }
+    case 60: case 61: case 62: case 68: // OpenSaveDataInfoReader*
+        nx_out_object(r, nx_object("ISaveDataInfoReader", lector_guardados, NULL));
+        return OK;
+    case 67: nx_out64(r, 0); return OK;   // FindSaveDataWithFilter: ninguno
+    case 205: if (nx_in32(r, 0) & 0xFF) return 0x7D402u; // OpenDataStorageWithProgramIndex: solo el 0
+              r->cmd = 200; return nx_fsp(self, r);
+    case 202: { // OpenDataStorageByDataId(almacenamiento, id): un DLC del juego es $NX_AOC/<índice>.img
+        uint64_t id = r->in_size >= 16 ? nx_in64(r, 8) : 0, base = programa_actual() + 0x1000;
+        const char *dir = getenv("NX_AOC");
+        if (dir && id > base && id - base < 0x1000) {
+            char ruta[1100];
+            snprintf(ruta, sizeof ruta, "%s/%llu.img", dir, (unsigned long long)(id - base));
+            FILE *f = fopen(ruta, "rb");
+            if (f) {
+                Storage *s = calloc(1, sizeof *s);
+                s->f = f;
+                fseeko(f, 0, SEEK_END);
+                s->size = (uint64_t)ftello(f);
+                nx_out_object(r, nx_object("IStorage (DLC)", storage_handle, s));
+                return OK;
+            }
+        }
+    }
+    /* fallthrough */
+    case 203: case 30: // datos del sistema, OpenPatchDataStorage..., cartucho
+        fprintf(stderr, "[nxrt] fsp-srv %u: datos que no hay (dato 0x%llx)\n", r->cmd,
+                (unsigned long long)(r->in_size >= 16 ? nx_in64(r, 8) : 0));
+        return 0x7D402u; // fs: no existe
+    case 400: nx_out_object(r, nx_object("IDeviceOperator", operador, NULL)); return OK;
     }
     return NX_R_UNKNOWN_CMD;
 }
