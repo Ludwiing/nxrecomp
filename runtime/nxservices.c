@@ -52,6 +52,19 @@ static uint32_t set_handle(ServiceObject *self, NxRequest *r) {
     case 3: case 6: // GetAvailableLanguageCodeCount(2)
         nx_out32(r, NLANG);
         return 0;
+    case 4: nx_out32(r, 1); return 0;          // GetRegionCode: América
+    case 7: case 9: { // GetKeyCodeMap(2): el mapa del teclado (vacío)
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (b) memset((void *)(uintptr_t)b->addr, 0, b->size);
+        return 0;
+    }
+    case 8: nx_out8(r, 0); return 0;           // GetQuestFlag: no es una consola de tienda
+    case 10: case 11: { // GetFirmwareVersionForDebug, GetDeviceNickName
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (b) memset((void *)(uintptr_t)b->addr, 0, b->size);
+        if (b && r->cmd == 11) snprintf((char *)(uintptr_t)b->addr, b->size, "nxrecomp");
+        return 0;
+    }
     }
     return NX_R_UNKNOWN_CMD;
 }
@@ -76,6 +89,10 @@ static uint32_t setsys_handle(ServiceObject *self, NxRequest *r) {
         strcpy((char *)v + 0x80, "NintendoSDK Firmware for NX 18.1.0-1.0");
         return 0;
     }
+    case 23: nx_out32(r, 1); return 0;        // GetColorSetId: tema oscuro
+    case 37: nx_out64(r, 0); return 0;        // GetSettingsItemValueSize: no hay ese ajuste
+    case 38: nx_out64(r, 0); return 0;        // GetSettingsItemValue
+    case 90: { uint8_t id[16] = {0x6e, 0x78}; nx_out_bytes(r, id, 16); return 0; } // GetMiiAuthorId
     }
     return NX_R_UNKNOWN_CMD;
 }
@@ -86,6 +103,7 @@ static uint32_t apm_session_handle(ServiceObject *self, NxRequest *r) {
     switch (r->cmd) {
     case 0: return 0;                         // SetPerformanceConfiguration
     case 1: nx_out32(r, 0x00010000); return 0; // GetPerformanceConfiguration: CPU 1020 MHz, GPU 384 MHz
+    case 2: return 0;                         // SetCpuOverclockEnabled
     }
     return NX_R_UNKNOWN_CMD;
 }
@@ -108,6 +126,7 @@ static const struct {
     {"set", "set", set_handle},
     {"fsp-srv", "fsp-srv", nx_fsp},
     {"set:sys", "set:sys", setsys_handle},
+    {"set:fd", "set:fd", setsys_handle},
     {"apm", "apm", apm_handle},
     {"appletOE", "appletOE", nx_am_oe},
     {"appletAE", "appletAE", nx_am_oe},

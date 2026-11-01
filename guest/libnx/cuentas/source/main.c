@@ -86,6 +86,16 @@ int main(int argc, char **argv) {
     pctlIsRestrictionEnabled(&restringido);
     fprintf(o, "control parental: 0x%x, restringido: %s\n", rc, restringido ? "sí" : "no");
 
+    setInitialize();
+    SetRegion region = 0;
+    Result rr = setGetRegionCode(&region);
+    timeInitialize();
+    static TimeZoneRule regla;
+    TimeLocationName lugar;
+    Result rl = timeGetDeviceLocationName(&lugar);
+    Result rz = timeLoadTimeZoneRule(&lugar, &regla);
+    fprintf(o, "región: 0x%x (%d), zona horaria: 0x%x 0x%x\n", rr, (int)region, rl, rz);
+
     SwkbdConfig kbd;
     char texto[64] = "x";
     rc = swkbdCreate(&kbd, 0);

@@ -104,13 +104,66 @@ static void calendar(uint64_t posix, CalendarTime *ct, CalendarInfo *ci) {
     ci->utc_offset = (int32_t)tm.tm_gmtoff;
 }
 
+static const char *zona(void) {
+    const char *tz = getenv("TZ");
+    return tz && *tz ? tz : "America/Bogota";
+}
+
+// ClockSnapshot (0xD0): contextos de usuario y red, sus horas POSIX y de calendario, el instante del
+// reloj continuo, la zona y el tipo. Lo usan los juegos para medir tiempo entre sesiones.
+static void snapshot(uint8_t *s, uint8_t tipo) {
+    memset(s, 0, 0xD0);
+    ClockContext c = context_now();
+    memcpy(s, &c, sizeof c);
+    memcpy(s + 0x20, &c, sizeof c);
+    int64_t t = (int64_t)time(NULL);
+    memcpy(s + 0x40, &t, 8);
+    memcpy(s + 0x48, &t, 8);
+    CalendarTime ct;
+    CalendarInfo ci;
+    calendar((uint64_t)t, &ct, &ci);
+    memcpy(s + 0x50, &ct, 8);
+    memcpy(s + 0x58, &ct, 8);
+    memcpy(s + 0x60, &ci, sizeof ci);
+    memcpy(s + 0x78, &ci, sizeof ci);
+    int64_t steady = steady_seconds();
+    memcpy(s + 0x90, &steady, 8);
+    memcpy(s + 0x98, source_id, 16);
+    strncpy((char *)s + 0xA8, zona(), 0x23);
+    s[0xCD] = tipo;
+}
+
 static uint32_t timezone_service(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
+    case 1: return OK;                     // SetDeviceLocationName
+    case 2: nx_out32(r, 1); return OK;     // GetTotalLocationNameCount
+    case 3: { // LoadLocationNameList: solo la zona del anfitrión
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (b && b->size >= 0x24) {
+            memset((void *)(uintptr_t)b->addr, 0, 0x24);
+            strncpy((char *)(uintptr_t)b->addr, zona(), 0x23);
+        }
+        nx_out32(r, b && b->size >= 0x24 ? 1 : 0);
+        return OK;
+    }
+    case 4: { // LoadTimeZoneRule: la regla binaria no se usa (ToCalendarTime convierte con la del anfitrión)
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (b) memset((void *)(uintptr_t)b->addr, 0, b->size);
+        return OK;
+    }
+    case 5: { char v[16] = "2024a"; nx_out_bytes(r, v, 16); return OK; } // GetTimeZoneRuleVersion
+    case 6: { // GetDeviceLocationNameAndUpdatedTime
+        char name[0x24] = {0};
+        strncpy(name, zona(), sizeof name - 1);
+        nx_out_bytes(r, name, sizeof name);
+        uint8_t tp[0x18] = {0};
+        nx_out_bytes(r, tp, sizeof tp);
+        return OK;
+    }
     case 0: { // GetDeviceLocationName
         char name[0x24] = {0};
-        const char *tz = getenv("TZ");
-        strncpy(name, tz && *tz ? tz : "America/Bogota", sizeof name - 1);
+        strncpy(name, zona(), sizeof name - 1);
         nx_out_bytes(r, name, sizeof name);
         return OK;
     }
@@ -150,6 +203,24 @@ uint32_t nx_time(ServiceObject *self, NxRequest *r) {
     case 100: nx_out8(r, 0); return OK;       // IsStandardUserSystemClockAutomaticCorrectionEnabled
     case 101: return OK;
     case 200: nx_out8(r, 1); return OK;       // IsStandardNetworkSystemClockAccuracySufficient
+    case 300: { // CalculateMonotonicSystemClockBaseTimePoint(contexto): la hora POSIX del instante 0
+        nx_out64(r, (uint64_t)(time(NULL) - steady_seconds()));
+        return OK;
+    }
+    case 400: case 401: { // GetClockSnapshot(tipo) / FromSystemClockContext
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (b && b->size >= 0xD0) snapshot((uint8_t *)(uintptr_t)b->addr, r->in_size ? r->in[0] : 0);
+        return OK;
+    }
+    case 500: nx_out64(r, 0); return OK;      // CalculateStandardUserSystemClockDifferenceByUser
+    case 501: { // CalculateSpanBetween(a, b): segundos entre dos snapshots
+        NxBuffer *a = nx_in_buffer(r, 0), *b = nx_in_buffer(r, 1);
+        int64_t ta = 0, tb = 0;
+        if (a && a->size >= 0x98) memcpy(&ta, (void *)(uintptr_t)(a->addr + 0x90), 8);
+        if (b && b->size >= 0x98) memcpy(&tb, (void *)(uintptr_t)(b->addr + 0x90), 8);
+        nx_out64(r, (uint64_t)(tb - ta));
+        return OK;
+    }
     }
     return NX_R_UNKNOWN_CMD;
 }

@@ -83,7 +83,9 @@ Se marca [x] lo hecho.
    6 del sistema), csrng, bsd (todo falla con ENETDOWN; Poll y Select duermen), ngc.
 4. [x] `am`: applets que cierran al momento (selector de usuario, teclado, mandos, errores) con sus
    eventos, IStorage, notificaciones vacías, idioma desde NX_IDIOMA.
-5. [ ] `hid` (evento de estilos), `time` (zonas horarias, snapshots), `apm`, `set` (región, mapa).
+5. [x] `hid` (evento de estilos ya avisando), `time` (zonas 1-6, ClockSnapshot 400/401, 300, 500,
+   CalculateSpanBetween), `apm` (overclock), `set` (región, mapa de teclas, apodo), `set:sys`/`set:fd`
+   (tema, ajustes de depuración, autor de Mii).
 6. [ ] Audio con las revisiones del SDK (5–15), efectos, IAudioDevice, `audout` Stop, `hwopus`.
 7. [ ] Herramienta que lista los servicios que nombra el juego antes del primer arranque.
    Prueba: guest/libnx/cuentas (guest/esperado/cuentas.txt). NX_TRAZA_IPC=1 muestra cada comando.

@@ -42,7 +42,14 @@ uint32_t nx_hid(ServiceObject *self, NxRequest *r) {
     case 1003:
         return OK;
     case 101: nx_out32(r, 0x3F); return OK;   // GetSupportedNpadStyleSet
-    case 106: { KEvent *e; nx_out_copy_handle(r, nx_event_new(&e)); return OK; } // AcquireNpadStyleSetUpdateEventHandle
+    case 106: { // AcquireNpadStyleSetUpdateEventHandle: ya avisando (hay mando conectado desde el arranque;
+                // algunos juegos lo esperan antes de leer la entrada)
+        KEvent *e;
+        uint32_t h = nx_event_new(&e);
+        nx_event_signal(e);
+        nx_out_copy_handle(r, h);
+        return OK;
+    }
     case 107: return OK;                      // DisconnectNpad
     case 127: nx_out32(r, 0); return OK;      // GetNpadJoyHoldType? (variantes según versión)
     }

@@ -7,4 +7,5 @@ fuentes: 0x0 0x0, TTF: sí
 csrng: bytes al azar
 nifm: 0x0, conexión: no hay
 control parental: 0x0, restringido: no
+región: 0x0 (1), zona horaria: 0x0 0x0
 teclado: 0x0, texto ""
