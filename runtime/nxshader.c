@@ -229,7 +229,10 @@ static char *attr_load(T *t, int a, int out) {
         if (a == 0x2E0 || a == 0x2E4) return U(t, S(t, "gl_PointCoord.%c", "xy"[(a >> 2) & 1]));
     } else {
         if (a == 0x2FC) return (char *)"uint(gl_VertexID)";
-        if (a == 0x2F8) return (char *)"uint(gl_InstanceID)";
+        if (a == 0x2F8) { // las instancias de varios draws se juntan en uno: nx_inst0 es la primera
+            t->info->uses_instance = 1;
+            return (char *)"(uint(gl_InstanceID) + nx_inst0)";
+        }
     }
     if (a >= 0x80 && a < 0x280 && !out) {
         int i = (a - 0x80) >> 4, c = (a >> 2) & 3;
@@ -884,6 +887,320 @@ static void emit_local(T *t, int store) {
     L(t, "}");
 }
 
+
+// ---------- texturas ----------
+//
+// Cada textura que se lee con un handle constante (palabra `TidB` del constbuf de texturas) es un
+// sampler de GLSL; el host lee el handle en cada draw y enlaza la textura y el sampler que nombra.
+
+static const char *const tex_glsl[] = {"sampler2D", "sampler3D", "samplerCube", "sampler2DArray", "samplerCubeArray",
+                                       "sampler2DMS", "samplerBuffer"};
+static const char *const tex_glsl_shadow[] = {"sampler2DShadow", "sampler3D", "samplerCubeShadow", "sampler2DArrayShadow",
+                                              "samplerCubeArrayShadow", "sampler2DMS", "samplerBuffer"};
+
+static char *tex_sampler(T *t, int64_t handle, int type) {
+    NxShaderInfo *in = t->info;
+    for (int i = 0; i < in->ntex; i++)
+        if (in->tex[i].handle == handle && in->tex[i].type == type) return S(t, "tex%d", i);
+    if (in->ntex == NX_MAX_TEX) {
+        red(t, "demasiadas texturas");
+        return S(t, "tex0");
+    }
+    in->tex[in->ntex].handle = (uint16_t)handle;
+    in->tex[in->ntex].type = (uint8_t)type;
+    return S(t, "tex%d", in->ntex++);
+}
+
+// Tipo de TexDim: 1D se lee como 2D de una fila (como hace Ryujinx).
+static int tex_type_dim(int64_t dim, int *ncoords, int *array) {
+    *array = dim == 1 || dim == 3 || dim == 5 || dim == 7;
+    switch (dim) {
+    case 0: case 1: *ncoords = 1; return *array ? NX_TEX_2D_ARRAY : NX_TEX_2D;
+    case 2: case 3: *ncoords = 2; return *array ? NX_TEX_2D_ARRAY : NX_TEX_2D;
+    case 4: case 5: *ncoords = 3; return NX_TEX_3D;
+    default: *ncoords = 3; return *array ? NX_TEX_CUBE_ARRAY : NX_TEX_CUBE;
+    }
+}
+
+typedef struct {
+    int ra, rb; // próximos registros de A y B
+} Srcs;
+static char *nextA(T *t, Srcs *s) { return s->ra >= 255 ? (char *)"0u" : R(t, s->ra++); }
+static char *nextB(T *t, Srcs *s) { return s->rb >= 255 ? (char *)"0u" : R(t, s->rb++); }
+
+// Escribe los componentes de `v` (vec4) elegidos por `mask` en los registros de destino.
+static void tex_write(T *t, const char *v, int mask, const int *dest_of) {
+    L(t, "{ vec4 tv = %s;", v);
+    int k = 0;
+    for (int c = 0; c < 4; c++)
+        if (mask >> c & 1) {
+            int d = dest_of[k++];
+            if (d < 255) WR(t, d, U(t, S(t, "tv.%c", "xyzw"[c])));
+        }
+    L(t, "}");
+}
+
+// Coordenadas float de un acceso: x[, y[, z]] más la capa como último componente si es arreglo.
+static char *tex_coords(T *t, int type, char **c, int nc, const char *layer, const char *ref) {
+    int n2d = nc == 1 ? 2 : nc; // 1D → 2D con y = 0.5? no: y = 0 en coordenadas normalizadas
+    char *xs[6];
+    int k = 0;
+    for (int i = 0; i < nc; i++) xs[k++] = F(t, c[i]);
+    if (nc == 1) xs[k++] = (char *)"0.0";
+    if (layer) xs[k++] = S(t, "float(%s)", layer);
+    if (ref) xs[k++] = F(t, ref);
+    (void)n2d, (void)type;
+    if (k == 1) return xs[0];
+    char *r = S(t, "vec%d(%s", k, xs[0]);
+    for (int i = 1; i < k; i++) r = S(t, "%s, %s", r, xs[i]);
+    return S(t, "%s)", r);
+}
+static char *tex_icoords(T *t, char **c, int nc, const char *layer) {
+    char *xs[5];
+    int k = 0;
+    for (int i = 0; i < nc; i++) xs[k++] = S(t, "int(%s)", c[i]);
+    if (nc == 1) xs[k++] = (char *)"0";
+    if (layer) xs[k++] = S(t, "int(%s)", layer);
+    char *r = S(t, "ivec%d(%s", k, xs[0]);
+    for (int i = 1; i < k; i++) r = S(t, "%s, %s", r, xs[i]);
+    return S(t, "%s)", r);
+}
+
+// Muestreo con coordenadas float. lod: 0 normal, 1 nivel 0, 2 sesgo, 3 nivel dado.
+static char *tex_sample(T *t, const char *smp, int type, char **c, int nc, const char *layer, const char *ref,
+                        int lod, const char *lodv) {
+    char *coords = tex_coords(t, type, c, nc, layer, ref);
+    int shadow = ref != NULL;
+    char *r;
+    if (shadow && (type == NX_TEX_2D_ARRAY || type == NX_TEX_CUBE || type == NX_TEX_CUBE_ARRAY) && (lod == 1 || lod == 3)) {
+        // GLSL no tiene textureLod para estos: el nivel 0 se pide con derivadas nulas.
+        const char *g = type == NX_TEX_2D_ARRAY ? "vec2(0.0)" : "vec3(0.0)";
+        r = S(t, "textureGrad(%s, %s, %s, %s)", smp, coords, g, g);
+    } else if (shadow && type == NX_TEX_CUBE_ARRAY) {
+        r = S(t, "texture(%s, %s, %s)", smp, S(t, "vec4(%s, %s, %s, float(%s))", F(t, c[0]), F(t, c[1]), F(t, c[2]), layer), F(t, ref));
+    } else if (lod == 1) r = S(t, "textureLod(%s, %s, 0.0)", smp, coords);
+    else if (lod == 3) r = S(t, "textureLod(%s, %s, %s)", smp, coords, F(t, lodv));
+    else if (lod == 2) r = S(t, "texture(%s, %s, %s)", smp, coords, F(t, lodv));
+    else r = S(t, "texture(%s, %s)", smp, coords);
+    return shadow ? S(t, "vec4(%s)", r) : r;
+}
+
+static void emit_tex(T *t) {
+    if (t->op == MXOP_TexB) {
+        red(t, "TEX sin handle constante (bindless)");
+        return;
+    }
+    int64_t dim = G(Dim), lodm = G(Lod), mask = G(WMask), d = G(Dest);
+    if (d == 255) return;
+    int nc, array, type = tex_type_dim(dim, &nc, &array);
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *layer = array ? nextA(t, &s) : NULL;
+    char *c[3];
+    for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
+    int has_lod = lodm > 1;
+    char *lodv = has_lod ? nextB(t, &s) : NULL;
+    if (G(Aoffi) == 1) nextB(t, &s), red(t, "TEX con desplazamiento"); // TODO: offsets
+    char *ref = G(Dc) == 1 ? nextB(t, &s) : NULL;
+    if (ref) type |= NX_TEX_SHADOW;
+    char *smp = tex_sampler(t, G(TidB), type);
+    int lm = lodm == 1 ? 1 : lodm == 2 || lodm == 6 ? 2 : lodm == 3 || lodm == 7 ? 3 : 0;
+    char *v = tex_sample(t, smp, type & 15, c, nc, layer, ref, lm, lodv);
+    int dest_of[4];
+    for (int k = 0; k < 4; k++) dest_of[k] = (int)d + k < 255 ? (int)d + k : 255;
+    tex_write(t, v, (int)mask, dest_of);
+}
+
+static const int texs_mask[2][8] = {{1, 2, 4, 8, 3, 9, 10, 12}, {7, 11, 13, 14, 15, 0, 0, 0}};
+
+static void texs_dests(T *t, int *dest_of) {
+    int64_t d = G(Dest), d2 = G(Dest2);
+    dest_of[0] = (int)d;
+    dest_of[1] = d < 255 ? (int)d + 1 : 255;
+    dest_of[2] = (int)d2;
+    dest_of[3] = d2 < 255 ? (int)d2 + 1 : 255;
+}
+
+static void emit_texs(T *t) {
+    if (t->op == MXOP_TexsF16) {
+        red(t, "TEXS de media precisión");
+        return;
+    }
+    int64_t tg = G(Target), d2 = G(Dest2);
+    if (G(Dest) == 255 && d2 == 255) return;
+    int mask = texs_mask[d2 == 255 ? 0 : 1][G(WMask) & 7];
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *c[3] = {0}, *layer = NULL, *ref = NULL, *lodv = NULL;
+    int type = NX_TEX_2D, nc = 2, lm = 0;
+    switch (tg) {
+    case 0: c[0] = nextA(t, &s), nc = 1, lm = 1; break;                                        // 1D, nivel 0
+    case 1: c[0] = nextA(t, &s), c[1] = nextB(t, &s); break;                                    // 2D
+    case 2: c[0] = nextA(t, &s), c[1] = nextB(t, &s), lm = 1; break;                            // 2D, nivel 0
+    case 3: c[0] = nextA(t, &s), c[1] = nextA(t, &s), lodv = nextB(t, &s), lm = 3; break;       // 2D, nivel dado
+    case 4: c[0] = nextA(t, &s), c[1] = nextA(t, &s), ref = nextB(t, &s); break;                // 2D, comparación
+    case 5: c[0] = nextA(t, &s), c[1] = nextA(t, &s), lodv = nextB(t, &s), ref = nextB(t, &s), lm = 3; break;
+    case 6: c[0] = nextA(t, &s), c[1] = nextA(t, &s), ref = nextB(t, &s), lm = 1; break;
+    case 7: case 8: case 9: // arreglo 2D: capa, x en A; y (y referencia) en B
+        layer = nextA(t, &s), c[0] = nextA(t, &s), c[1] = nextB(t, &s), type = NX_TEX_2D_ARRAY;
+        if (tg == 9) ref = nextB(t, &s);
+        if (tg != 7) lm = 1;
+        break;
+    case 10: case 11: c[0] = nextA(t, &s), c[1] = nextA(t, &s), c[2] = nextB(t, &s), nc = 3, type = NX_TEX_3D, lm = tg == 11; break;
+    case 12: c[0] = nextA(t, &s), c[1] = nextA(t, &s), c[2] = nextB(t, &s), nc = 3, type = NX_TEX_CUBE; break;
+    case 13: c[0] = nextA(t, &s), c[1] = nextA(t, &s), c[2] = nextB(t, &s), nc = 3, type = NX_TEX_CUBE, lodv = nextB(t, &s), lm = 3; break;
+    default: red(t, "TEXS con destino desconocido"); return;
+    }
+    if (ref) type |= NX_TEX_SHADOW;
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *v = tex_sample(t, smp, type & 15, c, nc, layer, ref, lm, lodv);
+    int dest_of[4], seq[4], k = 0;
+    texs_dests(t, dest_of);
+    for (int i = 0; i < 4; i++) seq[i] = 255;
+    for (int i = 0; i < 4 && k < 4; i++)
+        if (mask >> i & 1) seq[k] = dest_of[k], k++;
+    tex_write(t, v, mask, seq);
+}
+
+static void emit_tlds(T *t) {
+    if (t->op == MXOP_TldsF16) {
+        red(t, "TLDS de media precisión");
+        return;
+    }
+    int64_t tg = G(Target), d2 = G(Dest2);
+    if (G(Dest) == 255 && d2 == 255) return;
+    int mask = texs_mask[d2 == 255 ? 0 : 1][G(WMask) & 7];
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *c[3] = {0}, *layer = NULL, *lod = (char *)"0u", *off = NULL;
+    int type = NX_TEX_2D, nc = 2;
+    switch (tg) {
+    case 0: c[0] = nextA(t, &s), nc = 1; break;
+    case 1: c[0] = nextA(t, &s), nc = 1, lod = nextB(t, &s); break;
+    case 2: c[0] = nextA(t, &s), c[1] = nextB(t, &s); break;
+    case 4: c[0] = nextA(t, &s), c[1] = nextA(t, &s), off = nextB(t, &s); break;
+    case 5: c[0] = nextA(t, &s), c[1] = nextA(t, &s), lod = nextB(t, &s); break;
+    case 6: c[0] = nextA(t, &s), c[1] = nextA(t, &s), lod = nextB(t, &s), type = NX_TEX_2D_MS; break;
+    case 7: c[0] = nextA(t, &s), c[1] = nextA(t, &s), c[2] = nextB(t, &s), nc = 3, type = NX_TEX_3D; break;
+    case 8: c[0] = nextB(t, &s), c[1] = nextB(t, &s), layer = nextA(t, &s), type = NX_TEX_2D_ARRAY; break;
+    case 12: c[0] = nextA(t, &s), c[1] = nextA(t, &s), lod = nextB(t, &s), off = nextB(t, &s); break;
+    default: red(t, "TLDS con destino desconocido"); return;
+    }
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *ic = tex_icoords(t, c, nc, layer);
+    if (off) ic = S(t, "(%s + ivec2(bitfieldExtract(int(%s), 0, 4), bitfieldExtract(int(%s), 4, 4)))", ic, off, off);
+    char *v = S(t, "texelFetch(%s, %s, int(%s))", smp, ic, lod);
+    int dest_of[4], seq[4], k = 0;
+    texs_dests(t, dest_of);
+    for (int i = 0; i < 4; i++) seq[i] = 255;
+    for (int i = 0; i < 4 && k < 4; i++)
+        if (mask >> i & 1) seq[k] = dest_of[k], k++;
+    tex_write(t, v, mask, seq);
+}
+
+static void emit_tld(T *t) {
+    if (t->op != MXOP_Tld) {
+        red(t, "TLD sin handle constante");
+        return;
+    }
+    int64_t d = G(Dest);
+    if (d == 255) return;
+    int nc, array, type = tex_type_dim(G(Dim), &nc, &array);
+    if (G(Ms) == 1) type = NX_TEX_2D_MS;
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *layer = array ? nextA(t, &s) : NULL;
+    char *c[3];
+    for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
+    char *lod = G(Lod) == 1 ? nextB(t, &s) : (char *)"0u";
+    char *off = G(Toff) == 1 ? nextB(t, &s) : NULL;
+    char *ms = type == NX_TEX_2D_MS ? nextB(t, &s) : NULL;
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *ic = tex_icoords(t, c, nc, layer);
+    if (off && nc >= 2) ic = S(t, "(%s + ivec%d(bitfieldExtract(int(%s), 0, 4), bitfieldExtract(int(%s), 4, 4)%s))", ic,
+                               layer || nc == 3 ? 3 : 2, off, off, layer || nc == 3 ? ", 0" : "");
+    char *v = S(t, "texelFetch(%s, %s, int(%s))", smp, ic, ms ? ms : lod);
+    int dest_of[4];
+    for (int k = 0; k < 4; k++) dest_of[k] = (int)d + k < 255 ? (int)d + k : 255;
+    tex_write(t, v, (int)G(WMask), dest_of);
+}
+
+static void emit_tld4(T *t, int scalar) {
+    int64_t d = G(Dest);
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *c[3], *layer = NULL, *ref = NULL;
+    int type = NX_TEX_2D, nc = 2, mask = 15;
+    if (scalar) {
+        mask = texs_mask[G(Dest2) == 255 ? 0 : 1][4];
+        if (t->op == MXOP_Tld4sF16) {
+            red(t, "TLD4S de media precisión");
+            return;
+        }
+        int dc = G(Dc) == 1, off = G(Aoffi) == 1;
+        c[0] = nextA(t, &s);
+        c[1] = dc || off ? nextA(t, &s) : nextB(t, &s);
+        if (off) nextB(t, &s), red(t, "TLD4S con desplazamiento");
+        if (dc) ref = nextB(t, &s);
+    } else {
+        if (t->op != MXOP_Tld4) {
+            red(t, "TLD4 sin handle constante");
+            return;
+        }
+        int array;
+        type = tex_type_dim(G(Dim), &nc, &array);
+        if (array) layer = nextA(t, &s);
+        for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
+        if (G(Toff) != 0) nextB(t, &s), red(t, "TLD4 con desplazamiento");
+        if (G(Dc) == 1) ref = nextB(t, &s);
+        mask = (int)G(WMask);
+    }
+    if (ref) type |= NX_TEX_SHADOW;
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *coords = tex_coords(t, type & 15, c, nc, layer, NULL);
+    char *v = ref ? S(t, "textureGather(%s, %s, %s)", smp, coords, F(t, ref))
+                  : S(t, "textureGather(%s, %s, %d)", smp, coords, (int)(G(TexComp) & 3));
+    int dest_of[4];
+    if (scalar) {
+        int dd[4], seq[4];
+        texs_dests(t, dd);
+        for (int k = 0; k < 4; k++) seq[k] = dd[k];
+        tex_write(t, v, mask, seq);
+        return;
+    }
+    if (d == 255) return;
+    for (int k = 0; k < 4; k++) dest_of[k] = (int)d + k < 255 ? (int)d + k : 255;
+    tex_write(t, v, mask, dest_of);
+}
+
+static void emit_txq(T *t) {
+    if (t->op != MXOP_Txq) {
+        red(t, "TXQ sin handle constante");
+        return;
+    }
+    int64_t d = G(Dest), q = G(TexQuery), mask = G(WMask);
+    if (d == 255) return;
+    if (q != 1) {
+        red(t, "TXQ de otra consulta");
+        return;
+    }
+    // TXQ no dice el tipo: si el shader ya leyó esa textura se usa ese tipo, si no 2D.
+    int type = NX_TEX_2D;
+    for (int i = 0; i < t->info->ntex; i++)
+        if (t->info->tex[i].handle == G(TidB)) type = t->info->tex[i].type;
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *lod = R(t, G(SrcA));
+    const char *sz;
+    switch (type & 15) {
+    case NX_TEX_3D: case NX_TEX_2D_ARRAY: case NX_TEX_CUBE_ARRAY: sz = S(t, "ivec4(textureSize(%s, int(%s)), 0)", smp, lod); break;
+    case NX_TEX_2D_MS: sz = S(t, "ivec4(textureSize(%s), 1, 0)", smp); break;
+    default: sz = S(t, "ivec4(textureSize(%s, int(%s)), 1, 0)", smp, lod);
+    }
+    L(t, "{ ivec4 ts = %s; ts.w = %s;", sz, (type & 15) == NX_TEX_2D_MS ? "1" : S(t, "textureQueryLevels(%s)", smp));
+    int k = 0;
+    for (int c = 0; c < 4; c++)
+        if (mask >> c & 1) {
+            if (d + k < 255) WR(t, d + k, S(t, "uint(ts.%c)", "xyzw"[c]));
+            k++;
+        }
+    L(t, "}");
+}
+
 static void emit_insn(T *t) {
     switch (t->op) {
     case MXOP_Ald: emit_ald(t); break;
@@ -933,6 +1250,13 @@ static void emit_insn(T *t) {
     case MXOP_I2iR: case MXOP_I2iI: case MXOP_I2iC: emit_i2i(t); break;
     case MXOP_S2r: emit_s2r(t); break;
     case MXOP_Ldl: emit_local(t, 0); break;
+    case MXOP_Tex: case MXOP_TexB: emit_tex(t); break;
+    case MXOP_Texs: case MXOP_TexsF16: emit_texs(t); break;
+    case MXOP_Tlds: case MXOP_TldsF16: emit_tlds(t); break;
+    case MXOP_Tld: case MXOP_TldB: emit_tld(t); break;
+    case MXOP_Tld4: case MXOP_Tld4B: emit_tld4(t, 0); break;
+    case MXOP_Tld4s: case MXOP_Tld4sF16: emit_tld4(t, 1); break;
+    case MXOP_Txq: case MXOP_TxqB: emit_txq(t); break;
     case MXOP_Stl: emit_local(t, 1); break;
     case MXOP_Vote: { // un solo hilo: todos/alguno/igual valen lo mismo que el predicado
         char *p = P(t, G(SrcPred), G(SrcPredInv));
@@ -1011,6 +1335,12 @@ static void header(T *t, Sb *h) {
     for (int s = 0; s < 18; s++)
         if (t->info->cbufs >> s & 1)
             sb_add(h, "layout(std140, binding = %d) uniform Cb%d { uvec4 cb%d[4096]; };\n", t->key->cb_binding + s, s, s);
+    for (int i = 0; i < t->info->ntex; i++) {
+        int ty = t->info->tex[i].type;
+        sb_add(h, "layout(binding = %d) uniform %s tex%d;\n", t->key->tex_binding + i,
+               ty & NX_TEX_SHADOW ? tex_glsl_shadow[ty & 15] : tex_glsl[ty & 15], i);
+    }
+    if (t->info->uses_instance) sb_add(h, "layout(location = 0) uniform uint nx_inst0;\n");
     if (t->uses_local) sb_add(h, "const uint LMEM = %du;\nuint lmem[LMEM];\n", t->local_words);
     sb_add(h, "void main() {\n");
     for (int r = 0; r < 255; r++)

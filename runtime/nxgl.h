@@ -6,7 +6,7 @@ typedef struct {
     const uint32_t *regs;            // registros del motor 3D
     const uint64_t (*cb_addr)[18];   // constbufs enlazados por etapa (0 vértice ... 4 fragmento)
     const uint32_t (*cb_size)[18];
-    uint32_t topology, first, count, instance;
+    uint32_t topology, first, count, instance, ninstances; // instancias [instance, instance + ninstances)
     int indexed;
 } NxDraw;
 

@@ -10,7 +10,12 @@ enum { NX_SH_VERTEX_A, NX_SH_VERTEX, NX_SH_TESS_CTRL, NX_SH_TESS_EVAL, NX_SH_GEO
 typedef struct {
     uint8_t attr_int[32]; // atributos de vértice: 0 float, 1 entero con signo, 2 sin signo
     uint8_t cb_binding;   // primer punto de enlace de los constbufs de esta etapa
+    uint8_t tex_binding;  // primera unidad de textura de esta etapa
 } NxShaderKey;
+
+// Tipos de textura que usa un shader (lo que dice la instrucción, no el descriptor).
+enum { NX_TEX_2D, NX_TEX_3D, NX_TEX_CUBE, NX_TEX_2D_ARRAY, NX_TEX_CUBE_ARRAY, NX_TEX_2D_MS, NX_TEX_BUFFER, NX_TEX_SHADOW = 0x10 };
+#define NX_MAX_TEX 32
 
 // Lo que el traductor encontró en el shader.
 typedef struct {
@@ -19,6 +24,12 @@ typedef struct {
     uint32_t outputs;     // atributos genéricos que escribe
     uint32_t omap;        // fragmento: componentes de color que escribe (4 bits por render target)
     uint32_t code_size;   // bytes del programa (cabecera incluida) hasta la última instrucción usada
+    int ntex;             // texturas: palabra del handle en el constbuf de texturas y tipo; la i-ésima
+    struct {              // va en la unidad key.tex_binding + i
+        uint16_t handle;
+        uint8_t type;
+    } tex[NX_MAX_TEX];
+    int uses_instance;    // lee el índice de instancia (uniform nx_inst0 en la location 0)
     int errors;           // instrucciones que no supo traducir
 } NxShaderInfo;
 

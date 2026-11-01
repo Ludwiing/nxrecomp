@@ -84,6 +84,7 @@ static void egl_init(void) {
 static char *translate(Prog *p, int binding, NxShaderInfo *info) {
     NxShaderKey key = {0};
     key.cb_binding = (uint8_t)binding;
+    key.tex_binding = 8;
     return nx_shader_glsl(p->code, p->size, p->stage, &key, info);
 }
 
@@ -141,6 +142,37 @@ static void render(GLuint prog, float *out) {
     glDeleteVertexArrays(1, &vao);
 }
 
+// Texturas de prueba en las unidades 0-4 (las del GLSL original); la traducción usa 8 en adelante.
+static GLuint texturas[5];
+
+static void crear_texturas(void) {
+    static float d[16 * 16 * 16 * 4 * 6];
+    uint32_t x = 777;
+    for (size_t i = 0; i < sizeof d / sizeof *d; i++) {
+        x = x * 1664525 + 1013904223;
+        d[i] = (float)(x >> 8) / 16777216.0f;
+    }
+    glCreateTextures(GL_TEXTURE_2D, 1, &texturas[0]);
+    glTextureStorage2D(texturas[0], 5, GL_RGBA32F, 16, 16);
+    for (int l = 0; l < 5; l++) glTextureSubImage2D(texturas[0], l, 0, 0, 16 >> l, 16 >> l, GL_RGBA, GL_FLOAT, d + l * 300);
+    glTextureParameteri(texturas[0], GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &texturas[1]);
+    glTextureStorage3D(texturas[1], 1, GL_RGBA32F, 8, 8, 4);
+    glTextureSubImage3D(texturas[1], 0, 0, 0, 0, 8, 8, 4, GL_RGBA, GL_FLOAT, d + 7);
+    glCreateTextures(GL_TEXTURE_3D, 1, &texturas[2]);
+    glTextureStorage3D(texturas[2], 1, GL_RGBA32F, 8, 8, 8);
+    glTextureSubImage3D(texturas[2], 0, 0, 0, 0, 8, 8, 8, GL_RGBA, GL_FLOAT, d + 13);
+    glCreateTextures(GL_TEXTURE_CUBE_MAP, 1, &texturas[3]);
+    glTextureStorage2D(texturas[3], 1, GL_RGBA32F, 8, 8);
+    glTextureSubImage3D(texturas[3], 0, 0, 0, 0, 8, 8, 6, GL_RGBA, GL_FLOAT, d + 21);
+    glCreateTextures(GL_TEXTURE_2D, 1, &texturas[4]);
+    glTextureStorage2D(texturas[4], 1, GL_DEPTH_COMPONENT32F, 16, 16);
+    glTextureSubImage2D(texturas[4], 0, 0, 0, 16, 16, GL_DEPTH_COMPONENT, GL_FLOAT, d + 5);
+    glTextureParameteri(texturas[4], GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    glTextureParameteri(texturas[4], GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    for (int i = 0; i < 5; i++) glBindTextureUnit(i, texturas[i]);
+}
+
 static int iguales(float a, float b) {
     if (a != a || b != b) return a != a && b != b;
     float d = a > b ? a - b : b - a, m = a < 0 ? -a : a;
@@ -156,6 +188,11 @@ static int comparar(const char *orig, const char *dksh) {
     src[n] = 0;
     NxShaderInfo info;
     char *tr = translate(&fs, 18, &info);
+    if (!texturas[0]) crear_texturas();
+    for (int i = 0; i < info.ntex; i++) { // el handle de deko3d para el binding b del fragmento es 420 + b
+        int b = info.tex[i].handle - 420;
+        if (b >= 0 && b < 5) glBindTextureUnit(8 + i, texturas[b]);
+    }
     GLuint v = compile(GL_VERTEX_SHADER, vs_comun), a = compile(GL_FRAGMENT_SHADER, src), b = compile(GL_FRAGMENT_SHADER, tr);
     if (!v || !a || !b) {
         fprintf(stderr, "%s", tr);
@@ -264,7 +301,9 @@ int main(int argc, char **argv) {
         }
         NxShaderInfo info;
         char *g = translate(&p, p.stage == NX_SH_FRAGMENT ? 18 : 0, &info);
-        printf("// ---- %s (etapa %d, %d errores)\n%s", argv[i], p.stage, info.errors, g);
+        printf("// ---- %s (etapa %d, %d errores)\n", argv[i], p.stage, info.errors);
+        for (int k = 0; k < info.ntex; k++) printf("// tex%d: handle %d, tipo 0x%x\n", k, info.tex[k].handle, info.tex[k].type);
+        printf("%s", g);
         GLenum type = p.stage == NX_SH_FRAGMENT ? GL_FRAGMENT_SHADER
                       : p.stage == NX_SH_COMPUTE ? GL_COMPUTE_SHADER
                       : p.stage == NX_SH_GEOMETRY ? GL_GEOMETRY_SHADER : GL_VERTEX_SHADER;

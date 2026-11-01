@@ -22,12 +22,19 @@
 #include "nxgpu.h"
 #include "nxshader.h"
 
+#ifndef GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT // de EXT_texture_sRGB, que glcorearb.h no trae
+#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT 0x8C4D
+#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT 0x8C4E
+#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT 0x8C4F
+#endif
+
 static EGLDisplay dpy;
 static EGLContext ctx;
 static int estado; // 0 sin probar, 1 listo, -1 sin OpenGL
 static int actual; // el contexto está tomado por el hilo de la GPU
 static GLuint pipeline, vao, fbo, ubo_ring, vbo_ring, ibo_ring;
 static int traza = -1;
+static uint32_t envio; // número de envío a la GPU (para no volver a mirar una textura en el mismo)
 
 #define RING (64u << 20)
 static GLintptr ubo_off, vbo_off, ibo_off;
@@ -264,19 +271,9 @@ void nx_gl_release(void) {
     actual = 0;
 }
 
-void nx_gl_cpu_write(uint64_t gpu, uint64_t size) {
-    if (estado <= 0) return;
-    for (int i = 0; i < nrts; i++)
-        if (rts[i].addr < gpu + size && gpu < rts[i].addr + rt_bytes(&rts[i])) {
-            if (rts[i].dirty) {
-                tomar();
-                rt_escribir(&rts[i]);
-            }
-            rts[i].stale = 1;
-        }
-}
 
 void nx_gl_invalidate_all(void) {
+    envio++;
     for (int i = 0; i < nrts; i++)
         if (!rts[i].dirty) rts[i].stale = 1;
 }
@@ -329,6 +326,381 @@ static Shader *shader(uint64_t addr, int stage, const NxShaderKey *key) {
     }
     free(glsl);
     return s->prog ? s : NULL;
+}
+
+
+// ---------- texturas ----------
+//
+// Un handle de textura (en el constbuf que elige SetBindlessTexture) tiene el índice del descriptor
+// de imagen (TIC, 20 bits) y el del sampler (TSC, 12 bits); los dos son entradas de 32 bytes en sus
+// pools. Las texturas se copian a OpenGL deshaciendo el "block linear" de cada nivel de mipmap y se
+// guardan en una caché; en cada envío se vuelve a mirar si la memoria cambió.
+
+typedef struct {
+    uint8_t fmt, comp; // formato de imagen del TIC y tipo de componente (0 = cualquiera)
+    GLenum internal, srgb, format, type;
+    uint8_t bpb, bw, bh, depth; // bytes por bloque, tamaño del bloque, es de profundidad
+} TexFmt;
+
+static const TexFmt tex_fmts[] = {
+    {0x01, 7, GL_RGBA32F, 0, GL_RGBA, GL_FLOAT, 16, 1, 1, 0},
+    {0x01, 4, GL_RGBA32UI, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, 16, 1, 1, 0},
+    {0x01, 3, GL_RGBA32I, 0, GL_RGBA_INTEGER, GL_INT, 16, 1, 1, 0},
+    {0x02, 0, GL_RGB32F, 0, GL_RGB, GL_FLOAT, 12, 1, 1, 0},
+    {0x03, 7, GL_RGBA16F, 0, GL_RGBA, GL_HALF_FLOAT, 8, 1, 1, 0},
+    {0x03, 2, GL_RGBA16, 0, GL_RGBA, GL_UNSIGNED_SHORT, 8, 1, 1, 0},
+    {0x03, 1, GL_RGBA16_SNORM, 0, GL_RGBA, GL_SHORT, 8, 1, 1, 0},
+    {0x03, 4, GL_RGBA16UI, 0, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT, 8, 1, 1, 0},
+    {0x03, 3, GL_RGBA16I, 0, GL_RGBA_INTEGER, GL_SHORT, 8, 1, 1, 0},
+    {0x04, 7, GL_RG32F, 0, GL_RG, GL_FLOAT, 8, 1, 1, 0},
+    {0x04, 4, GL_RG32UI, 0, GL_RG_INTEGER, GL_UNSIGNED_INT, 8, 1, 1, 0},
+    {0x04, 3, GL_RG32I, 0, GL_RG_INTEGER, GL_INT, 8, 1, 1, 0},
+    {0x07, 2, GL_RGBA8, GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE, 4, 1, 1, 0},
+    {0x08, 2, GL_RGBA8, GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE, 4, 1, 1, 0},
+    {0x08, 1, GL_RGBA8_SNORM, 0, GL_RGBA, GL_BYTE, 4, 1, 1, 0},
+    {0x08, 4, GL_RGBA8UI, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, 4, 1, 1, 0},
+    {0x08, 3, GL_RGBA8I, 0, GL_RGBA_INTEGER, GL_BYTE, 4, 1, 1, 0},
+    {0x09, 2, GL_RGB10_A2, 0, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, 4, 1, 1, 0},
+    {0x09, 4, GL_RGB10_A2UI, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT_2_10_10_10_REV, 4, 1, 1, 0},
+    {0x0C, 7, GL_RG16F, 0, GL_RG, GL_HALF_FLOAT, 4, 1, 1, 0},
+    {0x0C, 2, GL_RG16, 0, GL_RG, GL_UNSIGNED_SHORT, 4, 1, 1, 0},
+    {0x0C, 1, GL_RG16_SNORM, 0, GL_RG, GL_SHORT, 4, 1, 1, 0},
+    {0x0C, 4, GL_RG16UI, 0, GL_RG_INTEGER, GL_UNSIGNED_SHORT, 4, 1, 1, 0},
+    {0x0C, 3, GL_RG16I, 0, GL_RG_INTEGER, GL_SHORT, 4, 1, 1, 0},
+    {0x0F, 7, GL_R32F, 0, GL_RED, GL_FLOAT, 4, 1, 1, 0},
+    {0x0F, 4, GL_R32UI, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, 4, 1, 1, 0},
+    {0x0F, 3, GL_R32I, 0, GL_RED_INTEGER, GL_INT, 4, 1, 1, 0},
+    {0x12, 0, GL_RGBA4, 0, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4_REV, 2, 1, 1, 0},
+    {0x14, 0, GL_RGB5_A1, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, 2, 1, 1, 0},
+    {0x15, 0, GL_RGB565, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5_REV, 2, 1, 1, 0},
+    {0x18, 2, GL_RG8, 0, GL_RG, GL_UNSIGNED_BYTE, 2, 1, 1, 0},
+    {0x18, 1, GL_RG8_SNORM, 0, GL_RG, GL_BYTE, 2, 1, 1, 0},
+    {0x18, 4, GL_RG8UI, 0, GL_RG_INTEGER, GL_UNSIGNED_BYTE, 2, 1, 1, 0},
+    {0x18, 3, GL_RG8I, 0, GL_RG_INTEGER, GL_BYTE, 2, 1, 1, 0},
+    {0x1B, 7, GL_R16F, 0, GL_RED, GL_HALF_FLOAT, 2, 1, 1, 0},
+    {0x1B, 2, GL_R16, 0, GL_RED, GL_UNSIGNED_SHORT, 2, 1, 1, 0},
+    {0x1B, 1, GL_R16_SNORM, 0, GL_RED, GL_SHORT, 2, 1, 1, 0},
+    {0x1B, 4, GL_R16UI, 0, GL_RED_INTEGER, GL_UNSIGNED_SHORT, 2, 1, 1, 0},
+    {0x1B, 3, GL_R16I, 0, GL_RED_INTEGER, GL_SHORT, 2, 1, 1, 0},
+    {0x1D, 2, GL_R8, 0, GL_RED, GL_UNSIGNED_BYTE, 1, 1, 1, 0},
+    {0x1D, 1, GL_R8_SNORM, 0, GL_RED, GL_BYTE, 1, 1, 1, 0},
+    {0x1D, 4, GL_R8UI, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 1, 1, 1, 0},
+    {0x1D, 3, GL_R8I, 0, GL_RED_INTEGER, GL_BYTE, 1, 1, 1, 0},
+    {0x20, 0, GL_RGB9_E5, 0, GL_RGB, GL_UNSIGNED_INT_5_9_9_9_REV, 4, 1, 1, 0},
+    {0x21, 0, GL_R11F_G11F_B10F, 0, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, 4, 1, 1, 0},
+    {0x24, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT, 0, 0, 8, 4, 4, 0},
+    {0x25, 0, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT, 0, 0, 16, 4, 4, 0},
+    {0x26, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT, 0, 0, 16, 4, 4, 0},
+    {0x27, 1, GL_COMPRESSED_SIGNED_RED_RGTC1, 0, 0, 0, 8, 4, 4, 0},
+    {0x27, 0, GL_COMPRESSED_RED_RGTC1, 0, 0, 0, 8, 4, 4, 0},
+    {0x28, 1, GL_COMPRESSED_SIGNED_RG_RGTC2, 0, 0, 0, 16, 4, 4, 0},
+    {0x28, 0, GL_COMPRESSED_RG_RGTC2, 0, 0, 0, 16, 4, 4, 0},
+    {0x17, 0, GL_COMPRESSED_RGBA_BPTC_UNORM, GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM, 0, 0, 16, 4, 4, 0},
+    {0x10, 0, GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT, 0, 0, 0, 16, 4, 4, 0},
+    {0x11, 0, GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT, 0, 0, 0, 16, 4, 4, 0},
+    {0x29, 0, GL_DEPTH24_STENCIL8, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 1, 1, 1},
+    {0x2F, 0, GL_DEPTH_COMPONENT32F, 0, GL_DEPTH_COMPONENT, GL_FLOAT, 4, 1, 1, 1},
+    {0x30, 0, GL_DEPTH32F_STENCIL8, 0, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 8, 1, 1, 1},
+    {0x3A, 0, GL_DEPTH_COMPONENT16, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 2, 1, 1, 1},
+};
+
+static const TexFmt *tex_fmt(uint32_t fmt, uint32_t comp) {
+    for (size_t i = 0; i < sizeof tex_fmts / sizeof *tex_fmts; i++)
+        if (tex_fmts[i].fmt == fmt && (tex_fmts[i].comp == 0 || tex_fmts[i].comp == comp)) return &tex_fmts[i];
+    for (size_t i = 0; i < sizeof tex_fmts / sizeof *tex_fmts; i++) // el tipo no coincide: el primero del formato
+        if (tex_fmts[i].fmt == fmt) return &tex_fmts[i];
+    return NULL;
+}
+
+// Lo que importa de un TIC.
+typedef struct {
+    uint64_t addr;
+    uint32_t fmt, comp, swz[4], srgb, version, type;
+    uint32_t w, h, d, levels, pitch, bhl, bdl;
+} Tic;
+
+static void tic_leer(const uint32_t *w, Tic *t) {
+    t->fmt = w[0] & 0x7F;
+    t->comp = w[0] >> 7 & 7;
+    for (int i = 0; i < 4; i++) t->swz[i] = w[0] >> (19 + i * 3) & 7;
+    t->addr = (uint64_t)(w[2] & 0xFFFF) << 32 | w[1];
+    t->version = w[2] >> 21 & 7;
+    t->pitch = (w[3] & 0xFFFF) << 5;
+    t->bhl = w[3] >> 3 & 7;
+    t->bdl = w[3] >> 6 & 7;
+    t->levels = (w[3] >> 28 & 15) + 1;
+    t->w = (w[4] & 0xFFFF) + 1;
+    t->srgb = w[4] >> 22 & 1;
+    t->type = w[4] >> 23 & 15;
+    t->h = (w[5] & 0xFFFF) + 1;
+    t->d = (w[5] >> 16 & 0x3FFF) + 1;
+    if (t->version < 3) t->levels = 1;
+}
+
+// Bloques "block linear" con profundidad: el alto (y la profundidad) del bloque se achica en los
+// niveles chicos, como hace el hardware (la regla de yuzu, AdjustTileSize).
+static uint32_t ajustar(uint32_t shift, uint32_t unidad, uint32_t dim) {
+    if (shift == 0) return 0;
+    uint32_t x = unidad << (shift - 1);
+    if (x >= dim)
+        while (--shift) {
+            x >>= 1;
+            if (x < dim) break;
+        }
+    return shift;
+}
+
+static uint64_t bl3(uint32_t xb, uint32_t y, uint32_t z, uint32_t wgobs, uint32_t rows, uint32_t bhl, uint32_t bdl) {
+    uint32_t gh = 1u << bhl, gd = 1u << bdl;
+    uint32_t bpc = (rows + 8 * gh - 1) / (8 * gh); // bloques por columna
+    uint64_t block = ((uint64_t)(z / gd) * bpc + y / (8 * gh)) * wgobs + xb / 64;
+    uint64_t gob = (z % gd) * gh + (y / 8) % gh;
+    uint32_t gx = xb % 64, gy = y % 8;
+    return block * 512 * gh * gd + gob * 512 + (gx / 32) * 256 + (gy / 2) * 64 + ((gx % 32) / 16) * 32 + (gy % 2) * 16 + gx % 16;
+}
+
+typedef struct {
+    uint32_t tic[8];
+    uint64_t addr;
+    GLenum target;
+    GLuint tex;
+    uint64_t hash, bytes;
+    uint32_t visto; // envío en que se comprobó la memoria por última vez
+} Tex;
+
+static Tex *texs;
+static int ntexs, cap_texs;
+static GLuint samplers_obj[256];
+static uint32_t samplers_tsc[256][8];
+static int nsamplers;
+
+static uint64_t hash_mem(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+// Tamaño en bytes de la textura completa (todas las capas y niveles) en la memoria del juego.
+static uint64_t tex_layout(const Tic *t, const TexFmt *f, uint32_t layers, uint64_t *level_off, uint64_t *layer_size) {
+    if (t->version < 3) { // lineal con pitch
+        *layer_size = (uint64_t)t->pitch * ((t->h + f->bh - 1) / f->bh);
+        level_off[0] = 0;
+        return *layer_size * layers;
+    }
+    uint64_t off = 0;
+    uint32_t d3 = t->type == 2 ? t->d : 1;
+    for (uint32_t l = 0; l < t->levels; l++) {
+        uint32_t w = t->w >> l ? t->w >> l : 1, h = t->h >> l ? t->h >> l : 1, d = d3 >> l ? d3 >> l : 1;
+        uint32_t bw = (w + f->bw - 1) / f->bw, rows = (h + f->bh - 1) / f->bh;
+        uint32_t bhl = ajustar(t->bhl, 8, rows), bdl = ajustar(t->bdl, 1, d);
+        uint32_t gh = 1u << bhl, gd = 1u << bdl, wgobs = (bw * f->bpb + 63) / 64;
+        level_off[l] = off;
+        off += (uint64_t)wgobs * 512 * ((rows + 8 * gh - 1) / (8 * gh)) * gh * ((d + gd - 1) / gd) * gd;
+    }
+    if (layers > 1) { // las capas van alineadas al bloque del nivel 0
+        uint32_t rows = (t->h + f->bh - 1) / f->bh;
+        uint32_t shift = 9 + ajustar(t->bhl, 8, rows) + ajustar(t->bdl, 1, d3);
+        off = (off + (1ull << shift) - 1) >> shift << shift;
+    }
+    *layer_size = off;
+    return off * layers;
+}
+
+static void tex_subir(Tex *x, const Tic *t, const TexFmt *f, const uint8_t *mem, uint32_t layers) {
+    uint64_t level_off[16], layer_size;
+    tex_layout(t, f, layers, level_off, &layer_size);
+    uint32_t d3 = t->type == 2 ? t->d : 1;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    for (uint32_t l = 0; l < t->levels; l++) {
+        uint32_t w = t->w >> l ? t->w >> l : 1, h = t->h >> l ? t->h >> l : 1, d = d3 >> l ? d3 >> l : 1;
+        uint32_t bw = (w + f->bw - 1) / f->bw, rows = (h + f->bh - 1) / f->bh, row = bw * f->bpb;
+        uint32_t bhl = ajustar(t->bhl, 8, rows), bdl = ajustar(t->bdl, 1, d);
+        uint32_t wgobs = (row + 63) / 64;
+        uint32_t nz = t->type == 2 ? d : layers;
+        size_t n = (size_t)row * rows * nz;
+        uint8_t *lin = tmp_buf(n);
+        for (uint32_t z = 0; z < nz; z++) {
+            const uint8_t *base = mem + (t->type == 2 ? level_off[l] : layer_size * z + level_off[l]);
+            uint32_t zz = t->type == 2 ? z : 0;
+            for (uint32_t y = 0; y < rows; y++) {
+                uint8_t *dst = lin + ((size_t)z * rows + y) * row;
+                if (t->version < 3) memcpy(dst, base + (uint64_t)y * t->pitch, row);
+                else
+                    for (uint32_t xb = 0; xb < row; xb += 16) {
+                        uint32_t k = row - xb < 16 ? row - xb : 16;
+                        memcpy(dst + xb, base + bl3(xb, y, zz, wgobs, rows, bhl, bdl), k);
+                    }
+            }
+        }
+        int comprimido = f->format == 0;
+        GLenum fmt = f->format;
+        switch (x->target) {
+        case GL_TEXTURE_2D:
+            if (comprimido) glCompressedTextureSubImage2D(x->tex, l, 0, 0, w, h, f->internal, (GLsizei)((size_t)row * rows), lin);
+            else glTextureSubImage2D(x->tex, l, 0, 0, w, h, fmt, f->type, lin);
+            break;
+        default: // 3D, arreglos y cubos: z es la profundidad, la capa o la cara
+            if (comprimido) glCompressedTextureSubImage3D(x->tex, l, 0, 0, 0, w, h, nz, f->internal, (GLsizei)n, lin);
+            else glTextureSubImage3D(x->tex, l, 0, 0, 0, w, h, nz, fmt, f->type, lin);
+        }
+    }
+}
+
+static GLuint textura(const uint32_t *tic_words, int shader_type) {
+    Tic t;
+    tic_leer(tic_words, &t);
+    // Una textura que es un render target se lee directo de la GPU.
+    for (int i = 0; i < nrts; i++)
+        if (rts[i].addr == t.addr && (shader_type & 15) == NX_TEX_2D) {
+            if (rts[i].stale) rt_cargar(&rts[i]);
+            return rts[i].tex;
+        }
+    GLenum target;
+    switch (shader_type & 15) {
+    case NX_TEX_3D: target = GL_TEXTURE_3D; break;
+    case NX_TEX_CUBE: target = GL_TEXTURE_CUBE_MAP; break;
+    case NX_TEX_2D_ARRAY: target = GL_TEXTURE_2D_ARRAY; break;
+    case NX_TEX_CUBE_ARRAY: target = GL_TEXTURE_CUBE_MAP_ARRAY; break;
+    default: target = GL_TEXTURE_2D;
+    }
+    const TexFmt *f = tex_fmt(t.fmt, t.comp);
+    if (!f) {
+        static uint32_t avisado[32];
+        for (int i = 0; i < 32; i++)
+            if (avisado[i] == t.fmt + 1) break;
+            else if (!avisado[i]) {
+                avisado[i] = t.fmt + 1;
+                fprintf(stderr, "[RED] GPU: textura con formato 0x%x (componente %u)\n", t.fmt, t.comp);
+                break;
+            }
+        return 0;
+    }
+    uint32_t layers = target == GL_TEXTURE_CUBE_MAP ? 6 : target == GL_TEXTURE_2D_ARRAY ? (t.type == 5 || t.type == 4 ? t.d : 1)
+                    : target == GL_TEXTURE_CUBE_MAP_ARRAY ? t.d * 6 : 1;
+    if (t.type == 3 && target == GL_TEXTURE_CUBE_MAP) layers = 6;
+    uint64_t level_off[16], layer_size;
+    uint64_t bytes = tex_layout(&t, f, target == GL_TEXTURE_3D ? 1 : layers, level_off, &layer_size);
+    uint64_t avail;
+    const uint8_t *mem = nx_gpu_ptr_n(t.addr, &avail);
+    if (!mem || avail < bytes) return 0;
+    Tex *x = NULL;
+    for (int i = 0; i < ntexs; i++)
+        if (texs[i].target == target && !memcmp(texs[i].tic, tic_words, 32)) {
+            x = &texs[i];
+            break;
+        }
+    if (x && x->visto == envio) return x->tex;
+    uint64_t h = hash_mem(mem, bytes);
+    if (x) {
+        x->visto = envio;
+        if (x->hash == h) return x->tex;
+        x->hash = h;
+        tex_subir(x, &t, f, mem, layers);
+        return x->tex;
+    }
+    if (ntexs == cap_texs) texs = realloc(texs, sizeof *texs * (cap_texs = cap_texs * 2 + 64));
+    x = &texs[ntexs++];
+    memset(x, 0, sizeof *x);
+    memcpy(x->tic, tic_words, 32);
+    x->target = target, x->hash = h, x->bytes = bytes, x->visto = envio, x->addr = t.addr;
+    glCreateTextures(target, 1, &x->tex);
+    GLenum internal = t.srgb && f->srgb ? f->srgb : f->internal;
+    if (target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP) glTextureStorage2D(x->tex, t.levels, internal, t.w, t.h);
+    else glTextureStorage3D(x->tex, t.levels, internal, t.w, t.h, target == GL_TEXTURE_3D ? t.d : layers);
+    glTextureParameteri(x->tex, GL_TEXTURE_MAX_LEVEL, t.levels - 1);
+    if (!f->depth) { // el swizzle del descriptor: 0 cero, 2-5 R/G/B/A, 6-7 uno
+        GLint sw[4];
+        for (int i = 0; i < 4; i++) {
+            uint32_t s = t.swz[i];
+            sw[i] = s == 2 ? GL_RED : s == 3 ? GL_GREEN : s == 4 ? GL_BLUE : s == 5 ? GL_ALPHA : s >= 6 ? GL_ONE : GL_ZERO;
+        }
+        glTextureParameteriv(x->tex, GL_TEXTURE_SWIZZLE_RGBA, sw);
+    }
+    tex_subir(x, &t, f, mem, layers);
+    if (traza)
+        fprintf(stderr, "[nxgl] textura 0x%llx: formato 0x%x/%u %ux%ux%u, %u niveles, tipo %u, versión %u, bloque %u/%u, swizzle %u%u%u%u\n",
+                (unsigned long long)t.addr, t.fmt, t.comp, t.w, t.h, t.d, t.levels, t.type, t.version, t.bhl, t.bdl, t.swz[0],
+                t.swz[1], t.swz[2], t.swz[3]);
+    return x->tex;
+}
+
+static GLuint sampler(const uint32_t *tsc) {
+    for (int i = 0; i < nsamplers; i++)
+        if (!memcmp(samplers_tsc[i], tsc, 32)) return samplers_obj[i];
+    if (nsamplers == 256) {
+        glDeleteSamplers(1, &samplers_obj[0]);
+        nsamplers = 0;
+    }
+    GLuint s;
+    glCreateSamplers(1, &s);
+    static const GLenum wrap[] = {GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_BORDER,
+                                  GL_CLAMP_TO_EDGE, GL_MIRROR_CLAMP_TO_EDGE, GL_MIRROR_CLAMP_TO_EDGE, GL_MIRROR_CLAMP_TO_EDGE};
+    glSamplerParameteri(s, GL_TEXTURE_WRAP_S, wrap[tsc[0] & 7]);
+    glSamplerParameteri(s, GL_TEXTURE_WRAP_T, wrap[tsc[0] >> 3 & 7]);
+    glSamplerParameteri(s, GL_TEXTURE_WRAP_R, wrap[tsc[0] >> 6 & 7]);
+    if (tsc[0] >> 9 & 1) {
+        glSamplerParameteri(s, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glSamplerParameteri(s, GL_TEXTURE_COMPARE_FUNC, GL_NEVER + (tsc[0] >> 10 & 7));
+    }
+    uint32_t mag = tsc[1] & 3, min = tsc[1] >> 4 & 3, mip = tsc[1] >> 6 & 3;
+    glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, mag == 2 ? GL_LINEAR : GL_NEAREST);
+    GLenum mf = min == 2 ? (mip == 3 ? GL_LINEAR_MIPMAP_LINEAR : mip == 2 ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR)
+                         : (mip == 3 ? GL_NEAREST_MIPMAP_LINEAR : mip == 2 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
+    glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, mf);
+    int32_t bias = (int32_t)(tsc[1] << 7) >> 19; // 13 bits con signo, 8 de fracción
+    glSamplerParameterf(s, GL_TEXTURE_LOD_BIAS, bias / 256.0f);
+    glSamplerParameterf(s, GL_TEXTURE_MIN_LOD, (tsc[2] & 0xFFF) / 256.0f);
+    glSamplerParameterf(s, GL_TEXTURE_MAX_LOD, (tsc[2] >> 12 & 0xFFF) / 256.0f);
+    static const float aniso[] = {1, 2, 4, 6, 8, 10, 12, 16};
+    glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY, aniso[tsc[0] >> 20 & 7]);
+    float border[4];
+    memcpy(border, &tsc[4], 16);
+    glSamplerParameterfv(s, GL_TEXTURE_BORDER_COLOR, border);
+    memcpy(samplers_tsc[nsamplers], tsc, 32);
+    samplers_obj[nsamplers++] = s;
+    return s;
+}
+
+static void texturas(const NxDraw *d, int stage, const NxShaderInfo *info, int base) {
+    const uint32_t *R = d->regs;
+    int slot = R[0x982] & 7;
+    uint64_t cb = d->cb_addr[stage][slot];
+    uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], tsc_pool = (uint64_t)R[0x557] << 32 | R[0x558];
+    for (int i = 0; i < info->ntex; i++) {
+        uint64_t avail;
+        const uint32_t *hp = cb ? nx_gpu_ptr_n(cb + info->tex[i].handle * 4u, &avail) : NULL;
+        GLuint tex = 0, smp = 0;
+        if (hp && avail >= 4) {
+            uint32_t h = *hp, tic = h & 0xFFFFF, tsc = R[0x48D] & 1 ? tic : h >> 20;
+            const uint32_t *tw = nx_gpu_ptr_n(tic_pool + tic * 32ull, &avail);
+            if (tw && avail >= 32) tex = textura(tw, info->tex[i].type);
+            const uint32_t *sw = nx_gpu_ptr_n(tsc_pool + tsc * 32ull, &avail);
+            if (sw && avail >= 32) smp = sampler(sw);
+        }
+        glBindTextureUnit(base + i, tex);
+        glBindSampler(base + i, smp);
+    }
+}
+
+void nx_gl_cpu_write(uint64_t gpu, uint64_t size) {
+    if (estado <= 0) return;
+    for (int i = 0; i < ntexs; i++) // las texturas de esa memoria se vuelven a mirar
+        if (texs[i].addr < gpu + size && gpu < texs[i].addr + texs[i].bytes) texs[i].visto = 0;
+    for (int i = 0; i < nrts; i++)
+        if (rts[i].addr < gpu + size && gpu < rts[i].addr + rt_bytes(&rts[i])) {
+            if (rts[i].dirty) {
+                tomar();
+                rt_escribir(&rts[i]);
+            }
+            rts[i].stale = 1;
+        }
 }
 
 // ---------- estado ----------
@@ -470,7 +842,9 @@ static void claves(const uint32_t *R, NxShaderKey *kv) {
     }
 }
 
-static int vertices(const uint32_t *R, const NxShaderInfo *vi, uint32_t first, uint32_t count, int indexed) {
+static int vertices(const uint32_t *R, const NxShaderInfo *vi, const NxDraw *d) {
+    uint32_t first = d->first, count = d->count;
+    int indexed = d->indexed;
     uint32_t streams = 0;
     for (int i = 0; i < 16; i++) { // OpenGL da 16 atributos
         if (!(vi->inputs >> i & 1)) {
@@ -516,7 +890,12 @@ static int vertices(const uint32_t *R, const NxShaderInfo *vi, uint32_t first, u
         const uint8_t *p = nx_gpu_ptr_n(start, &avail);
         if (!p) return 0;
         uint64_t size = limit >= start ? limit - start + 1 : 0;
-        if (!indexed && stride) { // solo los vértices del draw
+        int por_instancia = R[0x620 + s] & 1;
+        if (por_instancia && stride) { // hasta la última instancia del draw
+            uint32_t div = R[0x703 + s * 4] ? R[0x703 + s * 4] : 1;
+            uint64_t need = ((uint64_t)R[0x50E] + d->instance + d->ninstances + div - 1) / div * stride;
+            if (need < size) size = need;
+        } else if (!indexed && stride) { // solo los vértices del draw
             uint64_t need = (uint64_t)(first + count) * stride;
             if (need < size) size = need;
         }
@@ -554,8 +933,8 @@ int nx_gl_draw(const NxDraw *d) {
     uint64_t region = (uint64_t)R[0x582] << 32 | R[0x583];
     NxShaderKey kv = {0}, kf = {0};
     claves(R, &kv);
-    kv.cb_binding = 0;
-    kf.cb_binding = 18;
+    kv.cb_binding = 0, kv.tex_binding = 0;
+    kf.cb_binding = 18, kf.tex_binding = 32;
     Shader *vs = NULL, *fs = NULL;
     for (int i = 0; i < 6; i++) {
         uint32_t cfg = R[0x800 + i * 0x10];
@@ -598,9 +977,11 @@ int nx_gl_draw(const NxDraw *d) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
 
     estado_raster(R);
-    if (!vertices(R, &vs->info, d->first, d->count, d->indexed)) return 1;
+    if (!vertices(R, &vs->info, d)) return 1;
+    if (vs->info.uses_instance) glProgramUniform1ui(vs->prog, 0, d->instance);
     constbufs(d, 0, &vs->info, 0);
-    if (fs) constbufs(d, 4, &fs->info, 18);
+    texturas(d, 0, &vs->info, 0);
+    if (fs) constbufs(d, 4, &fs->info, 18), texturas(d, 4, &fs->info, 32);
 
     GLenum mode = d->topology <= 6 || (d->topology >= 10 && d->topology <= 13) ? d->topology : GL_TRIANGLES;
     if (d->topology == 7 || d->topology == 8 || d->topology == 9) {
@@ -616,12 +997,13 @@ int nx_gl_draw(const NxDraw *d) {
         if (!p || avail < (uint64_t)d->count * sz) return 1;
         GLintptr o = subir(ibo_ring, &ibo_off, p, (size_t)d->count * sz, 4);
         glDrawElementsInstancedBaseVertexBaseInstance(
-            mode, d->count, fmt == 0 ? GL_UNSIGNED_BYTE : fmt == 1 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (void *)o, 1,
+            mode, d->count, fmt == 0 ? GL_UNSIGNED_BYTE : fmt == 1 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (void *)o, d->ninstances,
             (GLint)R[0x50D], R[0x50E] + d->instance);
     } else {
-        glDrawArraysInstancedBaseInstance(mode, d->first, d->count, 1, R[0x50E] + d->instance);
+        glDrawArraysInstancedBaseInstance(mode, d->first, d->count, d->ninstances, R[0x50E] + d->instance);
     }
     if (traza)
-        fprintf(stderr, "[nxgl] draw %u: %u vértices desde %u%s\n", mode, d->count, d->first, d->indexed ? " (índices)" : "");
+        fprintf(stderr, "[nxgl] draw %u: %u vértices desde %u, %u instancias desde %u%s\n", mode, d->count, d->first,
+                d->ninstances, d->instance, d->indexed ? " (índices)" : "");
     return 1;
 }

@@ -10,7 +10,10 @@ LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema)
 # Ejemplos oficiales de libnx con pantalla: se compara la huella del cuadro 10 (sin ventana).
 LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
 # deko3d por la GPU: el color de limpieza y el triángulo con sus colores interpolados.
-LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic)
+LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic deko_console)
+PIXELES_deko_basic := 0 0 32,75,122 1270 10 32,75,122 640 360 127,64,64 640 20 248,3,4 100 700 7,231,17 1180 700 7,16,232
+# deko_console: texto con una textura de fuente (arreglo 2D subido con el motor de copia), 3600 instancias.
+PIXELES_deko_console := 0 0 0,0,0 231 21 191,191,191 56 98 0,127,0 133 357 255,0,0 357 357 64,0,0 168 385 255,255,0 133 406 0,0,255
 # Shaders de prueba: GLSL → uam (el compilador de deko3d) → código Maxwell → nxshader → GLSL, y la
 # imagen tiene que ser la misma que la del GLSL original en la GPU de esta máquina.
 UAM := $(DEVKITPRO)/tools/bin/uam
@@ -134,12 +137,9 @@ test: all
 			echo "OK: los $(words $(SHADERS)) shaders de prueba traducidos dibujan lo mismo que su GLSL original"; \
 		else echo "MAL: algún shader traducido dibuja otra cosa"; ok=0; fi; \
 	fi; \
-	for p in $(LIBNX_GPU); do \
-		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/$$p.ppm NX_CAPTURA_CUADRO=5 timeout 60 $(B)/libnx_$$p >/dev/null; \
-		if python3 tools/pixel.py $(B)/$$p.ppm 0 0 32,75,122 1270 10 32,75,122 640 360 127,64,64 640 20 248,3,4 \
-			100 700 7,231,17 1180 700 7,16,232; then \
-			echo "OK: $$p (deko3d, GPU) dibujó el triángulo"; else echo "MAL: $$p dibujó otra cosa"; ok=0; fi; \
-	done; \
+	$(foreach p,$(LIBNX_GPU),NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/$(p).ppm NX_CAPTURA_CUADRO=5 timeout 60 $(B)/libnx_$(p) >/dev/null; \
+		if python3 tools/pixel.py $(B)/$(p).ppm $(PIXELES_$(p)); then \
+			echo "OK: $(p) (deko3d, GPU) dibujó lo esperado"; else echo "MAL: $(p) dibujó otra cosa"; ok=0; fi;) \
 	for p in $(LIBNX_MANDOS); do \
 		NX_SIN_VENTANA=1 NX_PULSAR="$(PULSAR)" timeout 60 $(B)/libnx_$$p > $(B)/$$p.salida.txt; \
 		if diff -u guest/esperado/$$p.txt $(B)/$$p.salida.txt; then echo "OK: $$p (libnx, mandos) vio los botones esperados"; \

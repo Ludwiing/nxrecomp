@@ -145,6 +145,8 @@ typedef struct {
     uint32_t cb_size[5][18];
     uint32_t instance;       // índice de instancia del draw en curso
     int indexed;
+    NxDraw pend;             // draw pendiente: las instancias seguidas del mismo draw se juntan
+    int pending;
 } Engine3D;
 
 static Engine3D e3d;
@@ -332,6 +334,14 @@ static void report_semaphore(uint32_t v) {
 }
 
 static int traza_gpu = -1; // NX_TRAZA_GPU: cada método del motor 3D
+
+// Los drivers dibujan N instancias como N pares VertexBeginGl(InstanceNext)/VertexEndGl sin nada en
+// medio; se juntan en un draw instanciado, que sale cuando llega cualquier otro método.
+static void draw_flush(void) {
+    if (!e3d.pending) return;
+    e3d.pending = 0;
+    nx_gl_draw(&e3d.pend);
+}
 static void method_3d(uint32_t m, uint32_t v) {
     m &= 0xFFF;
     if (m >= 0xE00) { // llamada a macro: la par empieza, la impar agrega parámetros
@@ -345,6 +355,7 @@ static void method_3d(uint32_t m, uint32_t v) {
         return;
     }
     if (traza_gpu) fprintf(stderr, "[gpu] 3d %03x = %08x\n", m, v);
+    if (e3d.pending && m != 0x585 && m != 0x586 && m != 0x35D && m != 0x35E && m != 0x5F7 && m != 0x5F8) draw_flush();
     e3d.regs[m] = v;
     switch (m) {
     case 0x046: e3d.mme_code[e3d.mme_ptr++ & 0x1FFF] = v; break;       // MmeInstructionRamLoad
@@ -352,7 +363,7 @@ static void method_3d(uint32_t m, uint32_t v) {
     case 0x048: e3d.mme_start[e3d.mme_start_ptr++ & 0x7F] = v; break;   // MmeStartAddressRamLoad
     case 0x047: e3d.mme_start_ptr = v; break;                           // MmeStartAddressRamPointer
     case 0x0B2: // SyncptAction: lo dibujado tiene que estar en memoria antes de avisar
-        if (v >> 20 & 1) nx_gl_flush(), nx_syncpt_incr(v & 0xFFF);
+        if (v >> 20 & 1) draw_flush(), nx_gl_flush(), nx_syncpt_incr(v & 0xFFF);
         break;
     case 0x586: // VertexBeginGl: primitiva; InstanceNext suma una instancia, si no (y no sigue) vuelve a 0
         if (v >> 26 & 1) e3d.instance++;
@@ -363,14 +374,22 @@ static void method_3d(uint32_t m, uint32_t v) {
     case 0x585: { // VertexEndGl: dibujar
         uint32_t *R = e3d.regs;
         NxDraw d = {R, (const uint64_t (*)[18])e3d.cb_addr, (const uint32_t (*)[18])e3d.cb_size, R[0x586] & 0xFFFF,
-                    e3d.indexed ? R[0x5F7] : R[0x35D], e3d.indexed ? R[0x5F8] : R[0x35E], e3d.instance, e3d.indexed};
-        nx_gl_draw(&d);
+                    e3d.indexed ? R[0x5F7] : R[0x35D], e3d.indexed ? R[0x5F8] : R[0x35E], e3d.instance, 1, e3d.indexed};
+        NxDraw *p = &e3d.pend;
+        if (e3d.pending && p->topology == d.topology && p->first == d.first && p->count == d.count && p->indexed == d.indexed &&
+            p->instance + p->ninstances == d.instance) {
+            p->ninstances++;
+        } else {
+            draw_flush();
+            e3d.pend = d;
+            e3d.pending = 1;
+        }
         break;
     }
     case 0x8C4: e3d.regs[0xD00] = 1; break; // FirmwareCall4: el firmware (falcon) toca registros
                                             // que no nos importan y avisa en MmeFirmwareArgs[0]
     case 0x674: clear_buffers(v); break;                                // ClearBuffers
-    case 0x6C3: nx_gl_flush(), report_semaphore(v); break;              // SetReportSemaphore
+    case 0x6C3: draw_flush(), nx_gl_flush(), report_semaphore(v); break; // SetReportSemaphore
     case 0x06C: // LaunchDma (carga en línea): destino y largo
         e3d.i2m_dst = iova(e3d.regs, 0x62);
         e3d.i2m_len = e3d.regs[0x60] * (e3d.regs[0x61] ? e3d.regs[0x61] : 1);
@@ -405,7 +424,7 @@ static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
     regs[m] = v;
     if (m == 0x07) { // Semaphore
         uint32_t op = v & 31;
-        if (op == 2) nx_gl_flush();
+        if (op == 2) draw_flush(), nx_gl_flush();
         uint8_t *p = nx_gpu_ptr(iova(regs, 0x04));
         if (op == 2 && p) { // Release
             if (v >> 24 & 1) memcpy(p, &regs[0x06], 4);
@@ -416,12 +435,71 @@ static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
             }
         }
     } else if (m == 0x1D && (v & 1)) { // Syncpoint: incrementar (esperar no hace falta: todo es en orden)
+        draw_flush();
         nx_gl_flush();
         nx_syncpt_incr(v >> 8 & 0xFF);
     }
 }
 
 static uint32_t puller_regs[0x40];
+
+// ---------- motor de copia (DMA, 0xB0B5) ----------
+static uint32_t dma[0x200];
+
+// Dirección de un byte de una superficie del motor de copia (lineal con pitch o "block linear").
+static uint64_t dma_addr(int bl, uint64_t base, uint32_t pitch, uint32_t blk, uint32_t w_bytes, uint32_t h, uint32_t z,
+                         uint32_t xb, uint32_t y) {
+    if (!bl) return base + (uint64_t)y * pitch + xb;
+    uint32_t bhl = blk >> 4 & 15, bdl = blk >> 8 & 15, gh = 1u << bhl, gd = 1u << bdl;
+    uint32_t wgobs = (w_bytes + 63) / 64, bpc = (h + 8 * gh - 1) / (8 * gh);
+    uint64_t block = ((uint64_t)(z / gd) * bpc + y / (8 * gh)) * wgobs + xb / 64;
+    uint64_t gob = (z % gd) * gh + (y / 8) % gh;
+    uint32_t gx = xb % 64, gy = y % 8;
+    return base + block * 512 * gh * gd + gob * 512 + (gx / 32) * 256 + (gy / 2) * 64 + ((gx % 32) / 16) * 32 +
+           (gy % 2) * 16 + gx % 16;
+}
+
+static void dma_launch(uint32_t v) {
+    uint32_t *R = dma;
+    int src_bl = !(v >> 7 & 1), dst_bl = !(v >> 8 & 1), multi = v >> 9 & 1, remap = v >> 10 & 1;
+    uint64_t src = (uint64_t)R[0x100] << 32 | R[0x101], dst = (uint64_t)R[0x102] << 32 | R[0x103];
+    uint32_t len = R[0x106], lines = multi ? R[0x107] : 1;
+    uint32_t rc = R[0x1C2], csz = remap ? (rc >> 16 & 3) + 1 : 1;
+    uint32_t sbpp = remap ? csz * ((rc >> 20 & 3) + 1) : 1, dbpp = remap ? csz * ((rc >> 24 & 3) + 1) : 1;
+    // Origen y tamaño de las superficies "block linear" vienen en elementos (bytes sin remap).
+    uint32_t sx0 = R[0x1CF] & 0xFFFF, sy0 = R[0x1CF] >> 16, dx0 = R[0x1C8] & 0xFFFF, dy0 = R[0x1C8] >> 16;
+    uint32_t sw = R[0x1CB] * sbpp, sh = R[0x1CC], sz = R[0x1CE], dw = R[0x1C4] * dbpp, dh = R[0x1C5], dz = R[0x1C7];
+    if (!src_bl) sx0 = sy0 = 0;
+    if (!dst_bl) dx0 = dy0 = 0;
+    // Lo que la GPU tenga pendiente en esa memoria va antes; lo copiado invalida sus copias.
+    uint64_t sspan = src_bl ? (uint64_t)((sw + 63) / 64) * 64 * (sh + 256) * (sz + 1) : (uint64_t)R[0x104] * lines + len * sbpp;
+    uint64_t dspan = dst_bl ? (uint64_t)((dw + 63) / 64) * 64 * (dh + 256) * (dz + 1) : (uint64_t)R[0x105] * lines + len * dbpp;
+    nx_gl_cpu_write(src, sspan);
+    nx_gl_cpu_write(dst, dspan);
+    for (uint32_t y = 0; y < lines; y++) {
+        if (!remap && !src_bl && !dst_bl) { // fila contigua
+            uint8_t *s = nx_gpu_ptr(src + (uint64_t)y * R[0x104]), *d = nx_gpu_ptr(dst + (uint64_t)y * R[0x105]);
+            if (s && d) memmove(d, s, len);
+            continue;
+        }
+        for (uint32_t x = 0; x < len; x++) {
+            uint64_t sa = dma_addr(src_bl, src, R[0x104], R[0x1CA], sw, sh, sz, (sx0 + x) * sbpp, sy0 + y);
+            uint64_t da = dma_addr(dst_bl, dst, R[0x105], R[0x1C3], dw, dh, dz, (dx0 + x) * dbpp, dy0 + y);
+            uint8_t *s = nx_gpu_ptr(sa), *d = nx_gpu_ptr(da);
+            if (!d) continue;
+            if (!remap) {
+                if (s) *d = *s;
+                continue;
+            }
+            for (uint32_t c = 0; c * csz < dbpp; c++) {
+                uint32_t sel = rc >> (c * 4) & 7;
+                if (sel == 6) continue; // no escribir
+                if (sel >= 4) memcpy(d + c * csz, &R[0x1C0 + (sel - 4)], csz);
+                else if (s && sel * csz < sbpp) memcpy(d + c * csz, s + sel * csz, csz);
+            }
+        }
+    }
+}
 
 static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
     if (m == 0) { // SetObject: qué clase atiende este subcanal
@@ -433,7 +511,12 @@ static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
         return;
     }
     uint32_t cls = subch_class[subch];
+    if (cls != CLASS_3D) draw_flush(); // otro motor: el draw pendiente del 3D va antes
     if (cls == CLASS_3D) method_3d(m, v);
+    else if (cls == CLASS_DMA) {
+        if (m < 0x200) dma[m] = v;
+        if (m == 0x0C0) dma_launch(v);
+    }
     else if (cls == CLASS_I2M) { // la carga en línea usa los mismos métodos 0x60-0x6D
         if (m >= 0x60 && m <= 0x6D) method_3d(m, v);
     }
@@ -481,6 +564,7 @@ void nx_gpu_submit(const uint64_t *entries, uint32_t n) {
         uint32_t words = (uint32_t)(e >> 42 & 0x1FFFFF);
         if (words) run_pushbuffer(gpu, words);
     }
+    draw_flush();
     nx_gl_release();
     pthread_mutex_unlock(&gpu_lock);
 }
