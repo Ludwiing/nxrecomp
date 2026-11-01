@@ -25,6 +25,8 @@ typedef struct {
     uint32_t shared_bytes, local_bytes; // cómputo: memoria compartida y local (las gráficas la leen de su cabecera)
     uint8_t alpha_func;   // fragmento: alpha test (OpenGL core no lo tiene): 0 apagado, 1-8 Never..Always
     uint32_t alpha_ref;   // valor de referencia (bits de un float)
+    uint8_t prev_ok;      // fragmento: prev_outputs vale (atributos que escribe la etapa anterior al
+    uint32_t prev_outputs; // rasterizador); lo que no escribe se lee como (0, 0, 0, 1), como en el hardware
 } NxShaderKey;
 
 #define NX_MAX_SSBO 16

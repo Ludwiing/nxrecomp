@@ -6,6 +6,8 @@
 // azul con alpha test (mitad izquierda descartada) y un rectángulo blanco con XOR de rojo (cian).
 // Fila de abajo (y 400-500): un cuadro por cada comprobación de la CPU, verde si pasó y rojo si no:
 // muestras contadas, marca de tiempo, variable.
+// Tercera fila (y 560-660): un rectángulo con el rasterizador apagado (no se ve) y uno cuyo shader de
+// fragmentos lee un atributo que nadie escribió (amarillo claro: 1, 1, 0.5).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +31,7 @@ static DkMemBlock g_framebufferMemBlock, g_codeMemBlock, g_cmdbufMemBlock, g_dat
 static DkImage g_framebuffers[FB_NUM];
 static DkSwapchain g_swapchain;
 static uint32_t g_codeMemOffset;
-static DkShader g_vsh, g_fsh;
+static DkShader g_vsh, g_fsh, g_falta;
 static DkCmdBuf g_cmdbuf;
 static DkCmdList g_cmdsBindFramebuffer[FB_NUM], g_cmdsRender;
 static DkQueue g_queue;
@@ -99,6 +101,7 @@ static void graphicsInitialize(void) {
     g_codeMemBlock = dkMemBlockCreate(&mm);
     loadShader(&g_vsh, "romfs:/shaders/rect_vsh.dksh");
     loadShader(&g_fsh, "romfs:/shaders/rect_fsh.dksh");
+    loadShader(&g_falta, "romfs:/shaders/falta_fsh.dksh");
 
     dkMemBlockMakerDefaults(&mm, g_device, CMDMEMSIZE);
     mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
@@ -184,7 +187,7 @@ static void graphicsInitialize(void) {
     int ok_var = dkVariableRead(&g_var) == 42;
     fprintf(stderr, "muestras %llu, marcas %llu %llu (CPU %llu), variable %u\n", (unsigned long long)muestras,
            (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)ahora, dkVariableRead(&g_var));
-    dkCmdBufClear(g_cmdbuf);
+    // (Sin dkCmdBufClear: reusaría la memoria de la lista común, que se sigue llamando en cada cuadro.)
 
     // Lo que se dibuja en cada cuadro
     dkCmdBufCallList(g_cmdbuf, comun);
@@ -213,6 +216,16 @@ static void graphicsInitialize(void) {
         rect(50 + k * 150, 400, 150 + k * 150, 500, oks[k] ? 0 : 1, oks[k] ? 1 : 0, 0, 1);
         dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     }
+    rs.rasterizerEnable = 0;
+    dkCmdBufBindRasterizerState(g_cmdbuf, &rs);
+    rect(50, 560, 250, 660, 1, 1, 1, 1);
+    dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
+    rs.rasterizerEnable = 1;
+    dkCmdBufBindRasterizerState(g_cmdbuf, &rs);
+    DkShader const *falta[] = {&g_vsh, &g_falta};
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, falta, 2);
+    rect(300, 560, 500, 660, 1, 1, 1, 1);
+    dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     g_cmdsRender = dkCmdBufFinishList(g_cmdbuf);
 }
 

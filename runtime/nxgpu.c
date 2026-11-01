@@ -399,10 +399,8 @@ static void reducir(uint32_t *p, uint32_t valor, uint32_t op, int con_signo) {
 // Renderizado condicional (SetRenderEnableA/B/C, 0x554-0x556): los draws y las limpiezas solo
 // ocurren si se cumple la condición sobre lo que dejó un reporte en memoria (C: 0 nunca, 1 siempre,
 // 2 si el valor de 64 bits no es 0, 3 si los valores en +0 y +16 son iguales, 4 si son distintos).
-static int render_cond_escrito; // hasta que el driver lo escribe, se dibuja siempre
 static int render_enabled(void) {
     uint32_t *R = e3d.regs, modo = R[0x556] & 7;
-    if (!render_cond_escrito) return 1;
     if (modo == 1 || modo > 4) return 1;
     if (modo == 0) return 0;
     uint64_t avail, a, b;
@@ -492,7 +490,6 @@ static void method_3d(uint32_t m, uint32_t v) {
         }
         break;
     }
-    case 0x556: render_cond_escrito = 1; break;
     case 0x8C4: e3d.regs[0xD00] = 1; break; // FirmwareCall4: el firmware (falcon) toca registros
                                             // que no nos importan y avisa en MmeFirmwareArgs[0]
     case 0x674: if (render_enabled()) clear_buffers(v); break;          // ClearBuffers
@@ -783,12 +780,18 @@ static void run_pushbuffer(uint64_t gpu, uint32_t words) {
 void nx_gpu_submit(const uint64_t *entries, uint32_t n) {
     pthread_mutex_lock(&gpu_lock);
     static int iniciada;
-    if (!iniciada++) traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
+    if (!iniciada++) {
+        traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
+        // Registros que en el hardware no arrancan en 0 y que un driver puede no escribir nunca.
+        e3d.regs[0x0DF] = 1; // RasterEnable
+        e3d.regs[0x556] = 1; // SetRenderEnableC: siempre
+    }
     nx_gl_invalidate_all();
     for (uint32_t k = 0; k < n; k++) {
         uint64_t e = entries[k];
         uint64_t gpu = e & 0xFFFFFFFFFCull;
         uint32_t words = (uint32_t)(e >> 42 & 0x1FFFFF);
+        if (traza_gpu) fprintf(stderr, "[gpu] entrada 0x%llx, %u palabras (pendientes %u)\n", (unsigned long long)gpu, words, pbs.count);
         if (words) run_pushbuffer(gpu, words);
     }
     draw_flush();

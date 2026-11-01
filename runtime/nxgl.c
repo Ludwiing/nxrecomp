@@ -421,7 +421,7 @@ typedef struct {
     NxShaderInfo info;
 } Shader;
 
-static Shader *shaders;
+static Shader **shaders; // cada uno asignado aparte: los draws guardan punteros mientras crece la lista
 static int nshaders, cap_shaders;
 
 static Shader *shader(uint64_t addr, int stage, const NxShaderKey *key) {
@@ -429,14 +429,13 @@ static Shader *shader(uint64_t addr, int stage, const NxShaderKey *key) {
     const uint8_t *code = nx_gpu_ptr_n(addr, &avail);
     if (!code) return NULL;
     for (int i = 0; i < nshaders; i++) {
-        Shader *s = &shaders[i];
+        Shader *s = shaders[i];
         if (s->addr == addr && s->stage == stage && !memcmp(&s->key, key, sizeof *key) && s->size <= avail &&
             !memcmp(s->code, code, s->size))
             return s->prog ? s : NULL;
     }
     if (nshaders == cap_shaders) shaders = realloc(shaders, sizeof *shaders * (cap_shaders = cap_shaders * 2 + 16));
-    Shader *s = &shaders[nshaders++];
-    memset(s, 0, sizeof *s);
+    Shader *s = shaders[nshaders++] = calloc(1, sizeof *s);
     s->addr = addr, s->stage = stage, s->key = *key;
     char *glsl = nx_shader_glsl(code, avail, stage, key, &s->info);
     s->size = s->info.code_size;
@@ -890,6 +889,7 @@ static float f32(uint32_t v);
 int nx_gl_clear(const uint32_t *R, uint32_t v) {
     if (!iniciar()) return 0;
     tomar();
+    glDisable(GL_RASTERIZER_DISCARD); // en OpenGL también anularía las limpiezas; en la GPU no
     modo_msaa = R[0x574] & 15;
     if (traza) fprintf(stderr, "[nxgl] limpieza 0x%x: profundidad %g, color %g %g %g %g\n", v, f32(R[0x364]), f32(R[0x360]),
                        f32(R[0x361]), f32(R[0x362]), f32(R[0x363]));
@@ -1438,6 +1438,10 @@ int nx_gl_draw(const NxDraw *d) {
         k.img_binding = e == 4 ? 0 : e == 0 ? 4 : 6; // OpenGL da 8 unidades de imagen en total
         k.tess_mode = (uint16_t)R[0x0C8];
         k.gs_input = topo == 0 ? 0 : topo <= 3 ? 1 : topo == 10 || topo == 11 ? 2 : topo == 12 || topo == 13 ? 4 : 3;
+        if (e == 4) { // lo que la última etapa antes del rasterizador no escribe se lee como (0, 0, 0, 1)
+            Shader *prev = st[3] ? st[3] : st[2] ? st[2] : st[0];
+            if (prev) k.prev_ok = 1, k.prev_outputs = prev->info.outputs;
+        }
         if (e == 4 && (R[0x4BB] & 1)) { // alpha test: va dentro del shader
             uint32_t f = R[0x4C5];
             k.alpha_func = (uint8_t)(f >= 0x200 && f <= 0x207 ? f - 0x1FF : f >= 1 && f <= 8 ? f : 8);
@@ -1473,6 +1477,9 @@ int nx_gl_draw(const NxDraw *d) {
         if (!r) continue;
         if (r->stale) rt_cargar(r);
         glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, r->tex, 0);
+        // Un render target que el shader de fragmentos no escribe queda intacto (OpenGL lo dejaría
+        // indefinido y además lo mezclaría).
+        if (st[4] && !(st[4]->info.omap >> (i * 4) & 15)) continue;
         bufs[i] = GL_COLOR_ATTACHMENT0 + i;
         r->dirty = 1;
         any = 1;
@@ -1489,7 +1496,13 @@ int nx_gl_draw(const NxDraw *d) {
             any = 1;
         }
     }
-    if (!any) return 1;
+    if (!any) { // sin render targets: pasadas que solo escriben storage buffers o imágenes
+        uint32_t w = R[0x3FD] >> 16, h = R[0x3FE] >> 16;
+        glNamedFramebufferParameteri(fbo, GL_FRAMEBUFFER_DEFAULT_WIDTH, w ? (GLint)w : 1280);
+        glNamedFramebufferParameteri(fbo, GL_FRAMEBUFFER_DEFAULT_HEIGHT, h ? (GLint)h : 720);
+    }
+    if (R[0x0DF] & 1) glDisable(GL_RASTERIZER_DISCARD); // RasterEnable: apagado, solo corren los vértices
+    else glEnable(GL_RASTERIZER_DISCARD);
     glNamedFramebufferDrawBuffers(fbo, 8, bufs);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
 

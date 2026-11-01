@@ -22,9 +22,10 @@ Se marca [x] lo hecho.
 5. [ ] Caché de texturas que resuelve el solapamiento render target / textura por formato, nivel y
    capa; `glTextureBarrier` al leer un render target enlazado.
 6. [ ] Handles de textura y sampler separados; texturas de buffer (descriptor tipo 6).
-7. [ ] Estado fijo que va dentro del shader: alpha test, early-Z, salidas que el shader no escribe,
-   posición invariante, varyings no escritos = (0,0,0,1), alpha-to-coverage. Draws sin render
-   target (solo storage buffers) y rasterizer discard.
+7. [~] Estado fijo que va dentro del shader: [x] alpha test, [x] posición invariante, [x] atributos
+   que la etapa anterior no escribe = (0,0,0,1), [x] render targets que el shader no escribe quedan
+   intactos, [x] draws sin render target, [x] rasterizador apagado. Falta: early-Z forzado,
+   alpha-to-coverage.
 8. [ ] Render targets en capas (gl_Layer), limpieza por capa.
 9. [ ] Transform feedback.
 10. [ ] Raster y samplers: ([x] logic op, [x] alpha test), blend avanzado, depth clamp, viewport swizzle, cubos sin

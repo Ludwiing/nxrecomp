@@ -270,6 +270,8 @@ static char *attr_load(T *t, int a, int out, const char *vtx, int patch) {
             t->out_comps[i] |= 1u << ((a >> 2) & 3);
             return U(t, S(t, "out_attr%d%s.%c", i, st == NX_SH_TESS_CTRL ? idx : "", c));
         }
+        if (st == NX_SH_FRAGMENT && t->key->prev_ok && !(t->key->prev_outputs >> i & 1))
+            return (char *)(c == 'w' ? "0x3f800000u" : "0u");
         t->info->inputs |= 1u << i;
         if (st == NX_SH_VERTEX && t->key->attr_int[i]) return S(t, "uint(in_attr%d.%c)", i, c);
         return U(t, S(t, "in_attr%d%s.%c", i, idx, c));
@@ -2138,7 +2140,9 @@ static void header(T *t, Sb *h) {
                        st != NX_SH_VERTEX ? "vec4" : t->key->attr_int[i] == 1 ? "ivec4" : t->key->attr_int[i] == 2 ? "uvec4" : "vec4", i, arr);
         int nclip = 32 - __builtin_clz(t->clip_mask | 1);
         const char *oarr = st == NX_SH_TESS_CTRL ? "[]" : "";
-        sb_add(h, "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;%s } %s;\n",
+        // La posición es invariante: un prepaso de profundidad y el dibujo de después tienen que dar
+        // exactamente la misma z aunque sus shaders sean distintos (como hace Ryujinx).
+        sb_add(h, "out gl_PerVertex { invariant vec4 gl_Position; float gl_PointSize;%s } %s;\n",
                t->clip_mask ? S(t, " float gl_ClipDistance[%d];", nclip) : "", st == NX_SH_TESS_CTRL ? "gl_out[]" : "");
         for (int i = 0; i < 32; i++)
             if (t->info->outputs >> i & 1) sb_add(h, "layout(location = %d) out vec4 out_attr%d%s;\n", i, i, oarr);
