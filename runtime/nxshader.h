@@ -25,6 +25,8 @@ typedef struct {
     uint32_t shared_bytes, local_bytes; // cómputo: memoria compartida y local (las gráficas la leen de su cabecera)
     uint8_t alpha_func;   // fragmento: alpha test (OpenGL core no lo tiene): 0 apagado, 1-8 Never..Always
     uint32_t alpha_ref;   // valor de referencia (bits de un float)
+    uint16_t tex_buf[8];  // texturas cuyo descriptor es de buffer (handle + 1; 0 = libre): un TLD 1D sobre
+                          // ellas es un texelFetch de un samplerBuffer
     uint8_t prev_ok;      // fragmento: prev_outputs vale (atributos que escribe la etapa anterior al
     uint32_t prev_outputs; // rasterizador); lo que no escribe se lee como (0, 0, 0, 1), como en el hardware
 } NxShaderKey;
@@ -54,7 +56,10 @@ typedef struct {
         uint16_t handle;
         uint8_t type, entera; // entera: 1 con signo, 2 sin signo (de la clave)
         uint8_t slot;     // constbuf del handle: 0xFF = el de las texturas (SetBindlessTexture); otro =
-    } tex[NX_MAX_TEX];    // handle "bindless" rastreado hasta su constbuf
+                          // handle "bindless" rastreado hasta su constbuf
+        uint8_t slot2;    // handle separado: el shader une con OR la palabra de la textura y la del
+        uint16_t handle2; // sampler, que vienen de dos lugares (handle2 = 0xFFFF si no hay)
+    } tex[NX_MAX_TEX];
     int nssbo;            // memoria global: cada base distinta (leída de un constbuf) es un storage buffer
     struct {
         uint8_t slot, written;

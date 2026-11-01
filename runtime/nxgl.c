@@ -830,40 +830,99 @@ static int img_fmt_actual(const NxShaderKey *k, int handle) {
     return NX_IMG_RGBA8; // lo que el traductor supone sin clave
 }
 
+// El handle de la textura i del shader: su palabra en el constbuf (el de texturas o, si es bindless,
+// el suyo), unida con OR a la palabra del sampler cuando vienen por separado.
+static int leer_handle(const uint64_t *cbs, int slot_tex, const NxShaderInfo *info, int i, uint32_t *h) {
+    uint64_t avail, cb = cbs[info->tex[i].slot != 0xFF ? info->tex[i].slot & 31 : slot_tex];
+    const uint32_t *p = cb ? nx_gpu_ptr_n(cb + info->tex[i].handle * 4u, &avail) : NULL;
+    if (!p || avail < 4) return 0;
+    *h = *p;
+    if (info->tex[i].handle2 != 0xFFFF) {
+        uint64_t cb2 = cbs[info->tex[i].slot2 & 31];
+        const uint32_t *p2 = cb2 ? nx_gpu_ptr_n(cb2 + info->tex[i].handle2 * 4u, &avail) : NULL;
+        if (p2 && avail >= 4) *h |= *p2;
+    }
+    return 1;
+}
+
 static int texturas_enteras(const uint32_t *R, const uint64_t *cbs, const NxShaderInfo *info, NxShaderKey *k) {
-    int n = 0, slot = R[0x982] & 7;
+    int n = 0, nb = 0, slot = R[0x982] & 7;
     uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], avail;
     for (int i = 0; i < info->ntex && n < 8; i++) {
-        uint64_t cbi = cbs[info->tex[i].slot != 0xFF ? info->tex[i].slot & 31 : slot];
-        const uint32_t *hp = cbi ? nx_gpu_ptr_n(cbi + info->tex[i].handle * 4u, &avail) : NULL;
-        if (!hp || avail < 4) continue;
-        const uint32_t *tw = nx_gpu_ptr_n(tic_pool + (*hp & 0xFFFFF) * 32ull, &avail);
+        uint32_t h;
+        if (!leer_handle(cbs, slot, info, i, &h)) continue;
+        const uint32_t *tw = nx_gpu_ptr_n(tic_pool + (h & 0xFFFFF) * 32ull, &avail);
         if (!tw || avail < 32) continue;
         const TexFmt *f = tex_fmt(tw[0] & 0x7F, tw[0] >> 7 & 7);
         int kind = !f ? 0 : f->format == GL_RGBA_INTEGER || f->format == GL_RG_INTEGER || f->format == GL_RED_INTEGER
                                 ? (f->type == GL_INT || f->type == GL_SHORT || f->type == GL_BYTE ? 1 : 2) : 0;
         if (kind) k->tex_int_handle[n] = info->tex[i].handle, k->tex_int_kind[n++] = (uint8_t)kind;
+        if ((tw[4] >> 23 & 15) == 6) // descriptor de buffer: el shader lo lee como samplerBuffer
+            for (int j = 0; j < 8; j++)
+                if (!k->tex_buf[j] || k->tex_buf[j] == info->tex[i].handle + 1) {
+                    if (!k->tex_buf[j]) nb++;
+                    k->tex_buf[j] = (uint16_t)(info->tex[i].handle + 1);
+                    break;
+                }
     }
-    return n;
+    return n + nb;
+}
+
+// Textura de buffer (descriptor tipo 6): un arreglo lineal de texels de ancho de 32 bits. Se sube a
+// un buffer de OpenGL la primera vez que se usa en cada envío.
+static GLuint textura_buffer(const uint32_t *w) {
+    static struct {
+        uint64_t addr;
+        uint32_t bytes, envio;
+        GLenum internal;
+        GLuint buf, tex;
+    } cache[64];
+    static int n;
+    uint64_t addr = (uint64_t)(w[2] & 0xFFFF) << 32 | w[1], avail;
+    uint32_t ancho = ((w[4] & 0xFFFF) | (w[3] << 16)) + 1;
+    const TexFmt *f = tex_fmt(w[0] & 0x7F, w[0] >> 7 & 7);
+    if (!f || f->bw != 1 || f->astc || f->depth) return 0;
+    uint64_t bytes = (uint64_t)ancho * f->bpb;
+    const uint8_t *mem = nx_gpu_ptr_n(addr, &avail);
+    if (!mem) return 0;
+    if (bytes > avail) bytes = avail;
+    int i;
+    for (i = 0; i < n; i++)
+        if (cache[i].addr == addr && cache[i].internal == f->internal && cache[i].bytes >= bytes) break;
+    if (i == n) {
+        i = n < 64 ? n++ : (int)(addr >> 8) % 64;
+        if (cache[i].tex) glDeleteTextures(1, &cache[i].tex), glDeleteBuffers(1, &cache[i].buf);
+        cache[i].addr = addr, cache[i].bytes = (uint32_t)bytes, cache[i].internal = f->internal, cache[i].envio = 0;
+        glCreateBuffers(1, &cache[i].buf);
+        glNamedBufferData(cache[i].buf, (GLsizeiptr)bytes, NULL, GL_DYNAMIC_DRAW);
+        glCreateTextures(GL_TEXTURE_BUFFER, 1, &cache[i].tex);
+        glTextureBuffer(cache[i].tex, f->internal, cache[i].buf);
+    }
+    if (cache[i].envio != envio) {
+        glNamedBufferSubData(cache[i].buf, 0, (GLsizeiptr)bytes, mem);
+        cache[i].envio = envio;
+    }
+    return cache[i].tex;
 }
 
 static void texturas(const uint32_t *R, const uint64_t *cbs, int stage, const NxShaderInfo *info, int base) {
     int slot = R[0x982] & 7;
-    uint64_t cb = cbs[slot];
     uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], tsc_pool = (uint64_t)R[0x557] << 32 | R[0x558];
     for (int i = 0; i < info->ntex; i++) {
-        uint64_t avail, cbi = info->tex[i].slot != 0xFF ? cbs[info->tex[i].slot & 31] : cb; // bindless: su constbuf
-        const uint32_t *hp = cbi ? nx_gpu_ptr_n(cbi + info->tex[i].handle * 4u, &avail) : NULL;
+        uint64_t avail;
+        uint32_t h = 0;
+        int hay = leer_handle(cbs, slot, info, i, &h);
         GLuint tex = 0, smp = 0;
-        if (hp && avail >= 4) {
-            uint32_t h = *hp, tic = h & 0xFFFFF, tsc = R[0x48D] & 1 ? tic : h >> 20;
+        if (hay) {
+            uint32_t tic = h & 0xFFFFF, tsc = R[0x48D] & 1 ? tic : h >> 20;
             const uint32_t *tw = nx_gpu_ptr_n(tic_pool + tic * 32ull, &avail);
-            if (tw && avail >= 32) tex = textura(tw, info->tex[i].type);
+            if (tw && avail >= 32)
+                tex = info->tex[i].type == NX_TEX_BUFFER ? textura_buffer(tw) : textura(tw, info->tex[i].type);
             const uint32_t *sw = nx_gpu_ptr_n(tsc_pool + tsc * 32ull, &avail);
             if (sw && avail >= 32) smp = sampler(sw);
         }
         if (traza) fprintf(stderr, "[nxgl] textura %d de la etapa %d: handle 0x%x → tex %u, sampler %u\n", i, stage,
-                           hp ? *hp : 0, tex, smp);
+                           h, tex, smp);
         glBindTextureUnit(base + i, tex);
         glBindSampler(base + i, smp);
     }

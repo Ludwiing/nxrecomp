@@ -52,6 +52,7 @@ typedef struct {
     uint8_t *visited, *leader;
     int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared, uses_subgroup, tex_int;
     int64_t tld4_handle;
+    int tex_slot2, tex_handle2; // segunda palabra de un handle separado (textura | sampler), o -1
     int tex_slot; // constbuf del handle de la textura en curso (0xFF: el de SetBindlessTexture)
     uint8_t reg_used[256];
     uint32_t in_flat, in_linear; // atributos de entrada del fragmento por modo de interpolación
@@ -963,6 +964,12 @@ static const char *const tex_glsl[] = {"sampler2D", "sampler3D", "samplerCube", 
 static const char *const tex_glsl_shadow[] = {"sampler2DShadow", "sampler3D", "samplerCubeShadow", "sampler2DArrayShadow",
                                               "samplerCubeArrayShadow", "sampler2DMS", "samplerBuffer"};
 
+static int tex_buffer(T *t, int64_t handle) {
+    for (int i = 0; i < 8; i++)
+        if (t->key->tex_buf[i] == handle + 1) return 1;
+    return 0;
+}
+
 static int tex_entera(T *t, int64_t handle) {
     for (int i = 0; i < 8; i++)
         if (t->key->tex_int_kind[i] && t->key->tex_int_handle[i] == handle) return t->key->tex_int_kind[i];
@@ -972,10 +979,12 @@ static int tex_entera(T *t, int64_t handle) {
 static char *tex_sampler(T *t, int64_t handle, int type) {
     NxShaderInfo *in = t->info;
     t->tex_int = (type & NX_TEX_SHADOW) ? 0 : tex_entera(t, handle);
-    int slot = t->tex_slot;
-    t->tex_slot = 0xFF;
+    int slot = t->tex_slot, slot2 = t->tex_handle2 >= 0 ? t->tex_slot2 : 0, h2 = t->tex_handle2 >= 0 ? t->tex_handle2 : 0xFFFF;
+    t->tex_slot = 0xFF, t->tex_handle2 = -1;
     for (int i = 0; i < in->ntex; i++)
-        if (in->tex[i].handle == handle && in->tex[i].type == type && in->tex[i].slot == slot) return S(t, "tex%d", i);
+        if (in->tex[i].handle == handle && in->tex[i].type == type && in->tex[i].slot == slot &&
+            in->tex[i].handle2 == h2 && in->tex[i].slot2 == slot2)
+            return S(t, "tex%d", i);
     if (in->ntex == NX_MAX_TEX) {
         red(t, "demasiadas texturas");
         return S(t, "tex0");
@@ -984,6 +993,8 @@ static char *tex_sampler(T *t, int64_t handle, int type) {
     in->tex[in->ntex].type = (uint8_t)type;
     in->tex[in->ntex].entera = (uint8_t)t->tex_int;
     in->tex[in->ntex].slot = (uint8_t)slot;
+    in->tex[in->ntex].slot2 = (uint8_t)slot2;
+    in->tex[in->ntex].handle2 = (uint16_t)h2;
     return S(t, "tex%d", in->ntex++);
 }
 
@@ -1069,6 +1080,30 @@ static char *tex_sample(T *t, const char *smp, int type, char **c, int nc, const
 static int rastrear(T *t, uint32_t idx, int reg, int prof, int *slot, int *off);
 static int64_t bindless(T *t, int reg) {
     int slot, off;
+    // ¿El handle es el OR de dos palabras de constbuf (textura y sampler por separado)?
+    if (reg < 255) {
+        uint32_t lim = t->idx > 400 ? t->idx - 400 : 1;
+        for (uint32_t i = t->idx; i-- > lim;) {
+            if (i % 4 == 0 || !t->visited[i]) continue;
+            uint64_t o;
+            int op = decode(t, i, &o);
+            int64_t d = mx_get(op, MXF_Dest, o);
+            if (d == MX_NO || d != reg) continue;
+            int s2, o2;
+            if ((op == MXOP_LopC || op == MXOP_Lop3C) && rastrear(t, i, (int)mx_get(op, MXF_SrcA, o), 1, &slot, &off) &&
+                !(off & 3)) {
+                t->tex_slot = slot, t->tex_slot2 = (int)mx_get(op, MXF_CbufSlot, o);
+                t->tex_handle2 = (int)mx_get(op, MXF_CbufOffset, o);
+                return off / 4;
+            }
+            if ((op == MXOP_LopR || op == MXOP_Lop3R) && rastrear(t, i, (int)mx_get(op, MXF_SrcA, o), 1, &slot, &off) &&
+                rastrear(t, i, (int)mx_get(op, MXF_SrcB, o), 1, &s2, &o2) && !(off & 3) && !(o2 & 3)) {
+                t->tex_slot = slot, t->tex_slot2 = s2, t->tex_handle2 = o2 / 4;
+                return off / 4;
+            }
+            break;
+        }
+    }
     if (reg >= 255 || !rastrear(t, t->idx, reg, 0, &slot, &off) || (off & 3)) {
         red(t, "textura bindless sin origen conocido");
         return -1;
@@ -1174,10 +1209,15 @@ static void emit_tlds(T *t) {
     case 12: c[0] = nextA(t, &s), c[1] = nextA(t, &s), lod = nextB(t, &s), off = nextB(t, &s); break;
     default: red(t, "TLDS con destino desconocido"); return;
     }
-    char *smp = tex_sampler(t, G(TidB), type);
-    char *ic = tex_icoords(t, c, nc, layer);
-    if (off) ic = S(t, "(%s + ivec2(bitfieldExtract(int(%s), 0, 4), bitfieldExtract(int(%s), 4, 4)))", ic, off, off);
-    char *v = S(t, "texelFetch(%s, %s, int(%s))", smp, ic, lod);
+    char *v;
+    if (nc == 1 && tex_buffer(t, G(TidB))) {
+        v = S(t, "texelFetch(%s, int(%s))", tex_sampler(t, G(TidB), NX_TEX_BUFFER), c[0]);
+    } else {
+        char *smp = tex_sampler(t, G(TidB), type);
+        char *ic = tex_icoords(t, c, nc, layer);
+        if (off) ic = S(t, "(%s + ivec2(bitfieldExtract(int(%s), 0, 4), bitfieldExtract(int(%s), 4, 4)))", ic, off, off);
+        v = S(t, "texelFetch(%s, %s, int(%s))", smp, ic, lod);
+    }
     int dest_of[4], seq[4], k = 0;
     texs_dests(t, dest_of);
     for (int i = 0; i < 4; i++) seq[i] = 255;
@@ -1202,6 +1242,12 @@ static void emit_tld(T *t) {
     char *off = G(Toff) == 1 ? nextB(t, &s) : NULL;
     char *ms = type == NX_TEX_2D_MS ? nextB(t, &s) : NULL;
     t->tex_slot = slot;
+    if (nc == 1 && !array && tex_buffer(t, handle)) { // textura de buffer (el descriptor lo dice)
+        int dest_of[4];
+        for (int k = 0; k < 4; k++) dest_of[k] = (int)d + k < 255 ? (int)d + k : 255;
+        tex_write(t, S(t, "texelFetch(%s, int(%s))", tex_sampler(t, handle, NX_TEX_BUFFER), c[0]), (int)G(WMask), dest_of);
+        return;
+    }
     char *smp = tex_sampler(t, handle, type);
     char *ic = tex_icoords(t, c, nc, layer);
     if (off && nc >= 2) ic = S(t, "(%s + ivec%d(bitfieldExtract(int(%s), 0, 4), bitfieldExtract(int(%s), 4, 4)%s))", ic,
@@ -2211,7 +2257,7 @@ char *nx_shader_glsl(const uint8_t *code, size_t avail, int stage, const NxShade
     if (t->ninsn > 0x40000) t->ninsn = 0x40000;
     t->visited = calloc(t->ninsn + 2, 1);
     t->leader = calloc(t->ninsn + 2, 1);
-    t->tex_slot = 0xFF;
+    t->tex_slot = 0xFF, t->tex_handle2 = -1;
     t->local_words = (int)(((t->sph[1] & 0xFFFFFF) + (t->sph[2] & 0xFFFFFF)) / 4);
     if (stage == NX_SH_COMPUTE) t->local_words = (int)(key->local_bytes / 4);
     if (t->local_words < 1) t->local_words = 1;

@@ -87,6 +87,7 @@ static char *translate(Prog *p, int binding, NxShaderInfo *info) {
     key.tex_binding = 8;
     key.tex_int_handle[0] = 425, key.tex_int_kind[0] = 2; // las texturas 5 y 6 del comparador son enteras
     key.tex_int_handle[1] = 426, key.tex_int_kind[1] = 1;
+    key.tex_buf[0] = 427 + 1; // la 7 es una textura de buffer
     return nx_shader_glsl(p->code, p->size, p->stage, &key, info);
 }
 
@@ -145,8 +146,8 @@ static void render(GLuint prog, float *out) {
     glDeleteVertexArrays(1, &vao);
 }
 
-// Texturas de prueba en las unidades 0-4 (las del GLSL original); la traducción usa 8 en adelante.
-static GLuint texturas[7];
+// Texturas de prueba en las unidades 0-7 (las del GLSL original); la traducción usa 8 en adelante.
+static GLuint texturas[8];
 
 static void crear_texturas(void) {
     static float d[16 * 16 * 16 * 4 * 6];
@@ -183,7 +184,13 @@ static void crear_texturas(void) {
     glTextureStorage2D(texturas[6], 1, GL_RGBA16I, 16, 16);
     for (int i = 0; i < 16 * 16 * 4; i++) e[i] = (uint32_t)((int)(e[i] & 0xFFFF) - 32768);
     glTextureSubImage2D(texturas[6], 0, 0, 0, 16, 16, GL_RGBA_INTEGER, GL_INT, e);
-    for (int i = 0; i < 7; i++) glBindTextureUnit(i, texturas[i]);
+    // 7: de buffer, 64 texels RGBA32F.
+    GLuint buf;
+    glCreateBuffers(1, &buf);
+    glNamedBufferData(buf, 64 * 16, d + 31, GL_STATIC_DRAW);
+    glCreateTextures(GL_TEXTURE_BUFFER, 1, &texturas[7]);
+    glTextureBuffer(texturas[7], GL_RGBA32F, buf);
+    for (int i = 0; i < 8; i++) glBindTextureUnit(i, texturas[i]);
 }
 
 static int iguales(float a, float b) {
@@ -204,7 +211,7 @@ static int comparar(const char *orig, const char *dksh) {
     if (!texturas[0]) crear_texturas();
     for (int i = 0; i < info.ntex; i++) { // el handle de deko3d para el binding b del fragmento es 420 + b
         int b = info.tex[i].slot != 0xFF ? 0 : info.tex[i].handle - 420; // bindless: siempre la textura 0
-        if (b >= 0 && b < 7) glBindTextureUnit(8 + i, texturas[b]);
+        if (b >= 0 && b < 8) glBindTextureUnit(8 + i, texturas[b]);
     }
     GLuint v = compile(GL_VERTEX_SHADER, vs_comun), a = compile(GL_FRAGMENT_SHADER, src), b = compile(GL_FRAGMENT_SHADER, tr);
     if (!v || !a || !b) {

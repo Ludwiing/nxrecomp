@@ -21,7 +21,8 @@ Se marca [x] lo hecho.
    ticks de la GPU (ns × 384 / 625). Renderizado condicional (RenderEnable).
 5. [ ] Caché de texturas que resuelve el solapamiento render target / textura por formato, nivel y
    capa; `glTextureBarrier` al leer un render target enlazado.
-6. [ ] Handles de textura y sampler separados; texturas de buffer (descriptor tipo 6).
+6. [x] Handles de textura y sampler separados (OR de dos palabras de constbuf, LopR/LopC/Lop3);
+   texturas de buffer (descriptor tipo 6 → samplerBuffer, sin filtro y con ancho de 32 bits).
 7. [~] Estado fijo que va dentro del shader: [x] alpha test, [x] posición invariante, [x] atributos
    que la etapa anterior no escribe = (0,0,0,1), [x] render targets que el shader no escribe quedan
    intactos, [x] draws sin render target, [x] rasterizador apagado. Falta: early-Z forzado,
