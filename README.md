@@ -98,7 +98,8 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
     - Las instancias que los drivers dibujan una por una se juntan en un draw instanciado.
     - También: profundidad y stencil sincronizados con la memoria, limpiezas en la GPU, cuadriláteros, MSAA (se dibuja a resolución lógica y cada píxel se replica en sus muestras), motor 2D (blits con escala), shadow RAM de las macros, teselación, geometría, polígonos en alambre y offset, y shaders de cómputo con memoria global (cada base de dirección leída de un constbuf es un storage buffer, como en Ryujinx), compartida y atómicos.
     - ASTC: las GPU de PC no lo leen y casi todos los juegos lo usan, así que `runtime/nxastc.c` lo descomprime en la CPU al subir la textura (los 14 tamaños de bloque, lineal y sRGB; los modos HDR dan el color de error del perfil LDR, como Mesa). `tests/astc_test.c` lo compara con el decodificador del llvmpipe de Mesa sobre 560 mil bloques aleatorios, y `guest/libnx/deko_astc` sube cuatro texturas ASTC con el motor de copia y las dibuja texel a texel: la captura tiene que coincidir con Mesa.
-    - Falta: texturas enteras, half floats, motores 2D, de cómputo y de copia, profundidad sincronizada con la memoria, geometría y teselación, y un backend Vulkan.
+    - Más instrucciones: media precisión (HADD2, HMUL2, HFMA2, HSET2, HSETP2; uam no las genera, así que `tests/half_test.py` las ensambla con `tools/mxasm.py` y compara con numpy), doble precisión, derivadas (SHFL y FSWZADD sobre subgrupos: los hilos de un quad de Maxwell van al revés que en las GPU de PC), TXD y TMML.
+    - Falta: texturas enteras, motores 2D, de cómputo y de copia, profundidad sincronizada con la memoria, geometría y teselación, y un backend Vulkan.
 
   Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.
 

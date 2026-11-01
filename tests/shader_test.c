@@ -132,6 +132,7 @@ static void render(GLuint prog, float *out) {
     glCreateVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glViewport(0, 0, TAM, TAM);
+    if (getenv("ORIGEN_ARRIBA")) glClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
     float zero[4] = {0};
     glClearBufferfv(GL_COLOR, 0, zero);
     glUseProgram(prog);
@@ -219,12 +220,29 @@ static int comparar(const char *orig, const char *dksh) {
         glBindBufferBase(GL_UNIFORM_BUFFER, k, buf);
         glBindBufferBase(GL_UNIFORM_BUFFER, 18 + 2 + k, buf);
     }
+    if (fs.cb1_size) { // constantes del propio shader (c1 de deko3d)
+        GLuint buf;
+        glCreateBuffers(1, &buf);
+        static uint8_t big[65536];
+        memset(big, 0, sizeof big);
+        memcpy(big, fs.cb1, fs.cb1_size < sizeof big ? fs.cb1_size : sizeof big);
+        // uam (nouveau) multiplica dFdy por c[1][0], la "dirección Y", que deko3d deja en cero; con
+        // 1.0 la derivada vertical se compara con la de OpenGL (lo que se prueba es SHFL/FSWZADD).
+        int cero = 1;
+        for (uint32_t i = 0; i < fs.cb1_size; i++) cero &= fs.cb1[i] == 0;
+        if (cero) {
+            float uno = 1.0f;
+            memcpy(big, &uno, 4);
+        }
+        glNamedBufferData(buf, 65536, big, GL_STATIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 18 + 1, buf);
+    }
     static float ra[TAM * TAM * 4], rb[TAM * TAM * 4];
     render(pa, ra);
     render(pb, rb);
     int malos = 0;
     for (int i = 0; i < TAM * TAM * 4; i++)
-        if (!iguales(ra[i], rb[i]) && malos++ < 8)
+        if (!iguales(ra[i], rb[i]) && malos++ < (getenv("NX_MALOS") ? atoi(getenv("NX_MALOS")) : 8))
             fprintf(stderr, "%s: píxel (%d,%d).%c: original %.9g, traducido %.9g\n", orig, i / 4 % TAM, i / 4 / TAM,
                     "xyzw"[i % 4], ra[i], rb[i]);
     if (malos) {
@@ -312,8 +330,30 @@ static int comparar_comp(const char *orig, const char *dksh) {
     return malos != 0 || info.errors;
 }
 
+// Ejecuta un shader de fragmento (sin entradas) y escribe los 4 valores del píxel (0,0) en hex.
+static int ejecutar(const char *dksh) {
+    Prog fs;
+    if (!load_dksh(dksh, &fs)) return 2;
+    NxShaderInfo info;
+    char *tr = translate(&fs, 18, &info);
+    GLuint v = compile(GL_VERTEX_SHADER, vs_comun), b = compile(GL_FRAGMENT_SHADER, tr);
+    if (!v || !b) {
+        fprintf(stderr, "%s", tr);
+        return 1;
+    }
+    GLuint pb = link2(v, b);
+    static float r[TAM * TAM * 4];
+    render(pb, r);
+    uint32_t u[4];
+    memcpy(u, r, 16);
+    printf("%08x %08x %08x %08x\n", u[0], u[1], u[2], u[3]);
+    if (getenv("NX_VER_GLSL")) fprintf(stderr, "%s", tr);
+    return info.errors != 0;
+}
+
 int main(int argc, char **argv) {
     egl_init();
+    if (argc == 3 && !strcmp(argv[1], "--ejecutar")) return ejecutar(argv[2]);
     if (argc >= 4 && !strcmp(argv[1], "--comparar-comp")) {
         int bad = 0;
         for (int i = 2; i + 1 < argc; i += 2) bad += comparar_comp(argv[i], argv[i + 1]) != 0;

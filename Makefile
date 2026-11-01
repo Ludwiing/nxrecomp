@@ -169,6 +169,11 @@ test: all
 		if [ $$r = 0 ]; then echo "OK: deko_astc dibuja sus texturas ASTC como las decodifica Mesa"; \
 		elif [ $$r != 77 ]; then echo "MAL: deko_astc dibujó otras texturas"; ok=0; fi; \
 	fi; \
+	if [ -n "$(SHADERS)" ] && python3 -c "import numpy" 2>/dev/null; then \
+		if python3 tests/half_test.py $(B)/shader_test $(B)/shaders/basico.dksh >$(B)/half.txt 2>&1; then \
+			echo "OK: $$(tail -1 $(B)/half.txt) (ensamblados a mano, contra numpy)"; \
+		else cat $(B)/half.txt; echo "MAL: media precisión"; ok=0; fi; \
+	fi; \
 	if [ -n "$(SHADERS_COMP)" ]; then \
 		if $(B)/shader_test --comparar-comp $(foreach s,$(SHADERS_COMP),tests/shaders/$(s).comp $(B)/shaders/$(s).dksh); then \
 			echo "OK: los $(words $(SHADERS_COMP)) shaders de cómputo traducidos escriben lo mismo que su GLSL original"; \

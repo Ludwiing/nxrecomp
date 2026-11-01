@@ -50,7 +50,7 @@ typedef struct {
     NxShaderInfo *info;
     uint32_t sph[20];
     uint8_t *visited, *leader;
-    int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared;
+    int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared, uses_subgroup;
     uint8_t reg_used[256];
     uint32_t in_flat, in_linear; // atributos de entrada del fragmento por modo de interpolación
     uint32_t out_comps[32];
@@ -857,15 +857,17 @@ static void emit_f2i(T *t) {
                         : S(t, "(isnan(%s) ? 0u : (%s >= 4294967296.0 ? 0xffffffffu : uint(max(%s, 0.0))))", f, f, f);
     WR(t, G(Dest), v);
 }
+static char *dreg(T *t, int64_t r);
+static char *dsrc_b(T *t);
+static void dwr(T *t, int64_t d, const char *v);
+
 static void emit_f2f(T *t) {
     int64_t dst = G(DstFmt), src = G(SrcFmt), rm = G(RoundMode);
     char *f;
     if (src == 2) f = F(t, B(t, 1));
     else if (src == 1) f = S(t, "unpackHalf2x16(%s).%c", B(t, 0), G(Sh) == 1 ? 'y' : 'x');
-    else {
-        red(t, "F2F desde double");
-        return;
-    }
+    else f = dsrc_b(t); // double
+    if (dst == 3 && src != 3) f = S(t, "double(%s)", f);
     f = absneg(t, f, G(AbsB), G(NegB));
     switch (rm) {
     case 4: f = S(t, "roundEven(%s)", f); break;
@@ -874,9 +876,9 @@ static void emit_f2f(T *t) {
     case 7: f = S(t, "trunc(%s)", f); break;
     }
     f = sat(t, f, G(Sat));
-    if (dst == 2) WR(t, G(Dest), U(t, f));
-    else if (dst == 1) WR(t, G(Dest), S(t, "packHalf2x16(vec2(%s, 0.0))", f));
-    else red(t, "F2F a double");
+    if (dst == 2) WR(t, G(Dest), U(t, src == 3 ? S(t, "float(%s)", f) : f));
+    else if (dst == 1) WR(t, G(Dest), S(t, "packHalf2x16(vec2(%s, 0.0))", src == 3 ? S(t, "float(%s)", f) : f));
+    else dwr(t, G(Dest), f);
 }
 static void emit_i2i(T *t) {
     int64_t src = G(ISrcFmt), dst = G(IDstFmt), bs = G(ByteSel);
@@ -1462,6 +1464,228 @@ static void emit_atom_cas(T *t, int shared) {
     L(t, "}");
 }
 
+
+// ---------- media precisión (dos half en un registro) ----------
+
+// Operando de dos componentes (vec2) según el swizzle: F16 los dos half, F32 el registro como float
+// en los dos, H0H0 / H1H1 uno de los half repetido.
+static char *half_src(T *t, int64_t sw, const char *u, int64_t neg, int64_t abs_) {
+    char *v;
+    switch (sw) {
+    case 1: v = S(t, "vec2(uintBitsToFloat(%s))", u); break;
+    case 2: v = S(t, "unpackHalf2x16(%s).xx", u); break;
+    case 3: v = S(t, "unpackHalf2x16(%s).yy", u); break;
+    default: v = S(t, "unpackHalf2x16(%s)", u);
+    }
+    if (abs_ == 1) v = S(t, "abs(%s)", v);
+    if (neg == 1) v = S(t, "(-%s)", v);
+    return v;
+}
+static char *half_imm(T *t, uint32_t h0, uint32_t h1) { // inmediatos de 10 bits: los bits altos de cada half
+    return S(t, "unpackHalf2x16(%uu)", (h0 << 6 & 0xFFFF) | (h1 << 6 & 0xFFFF) << 16);
+}
+// Empaqueta el resultado (vec2 en `r`) según OFmt: F16, F32 (solo x), o mezclado con el destino.
+static char *half_out(T *t, int64_t ofmt, const char *r, int64_t d) {
+    switch (ofmt) {
+    case 1: return S(t, "floatBitsToUint(%s.x)", r);
+    case 2: return S(t, "packHalf2x16(vec2(%s.x, unpackHalf2x16(%s).y))", r, R(t, d));
+    case 3: return S(t, "packHalf2x16(vec2(unpackHalf2x16(%s).x, %s.y))", R(t, d), r);
+    default: return S(t, "packHalf2x16(%s)", r);
+    }
+}
+
+static void emit_half_arith(T *t) {
+    int op = t->op, mul = op >= MXOP_Hmul232i && op <= MXOP_Hmul2R, fma = op >= MXOP_Hfma232i && op <= MXOP_Hfma2Rc;
+    int64_t d = G(Dest), ofmt = HAS(OFmt) ? G(OFmt) : 0;
+    char *a, *b, *c = NULL;
+    int v = t->var;
+    if (fma) {
+        a = half_src(t, G(ASwizzle), R(t, G(SrcA)), 0, 0);
+        if (v == V_R) b = half_src(t, G(BSwizzle), R(t, G(SrcB)), G(NegA), 0), c = half_src(t, G(CSwizzle), R(t, G(SrcC)), G(NegC), 0);
+        else if (v == V_I) b = half_imm(t, (uint32_t)G(BimmH0), (uint32_t)G(BimmH1)), c = half_src(t, G(CSwizzle), R(t, G(SrcC)), G(NegC), 0);
+        else if (v == V_C) b = half_src(t, 1, cbuf(t, G(CbufSlot), G(CbufOffset) * 4), G(NegA), 0), c = half_src(t, G(CSwizzle), R(t, G(SrcC)), G(NegC), 0);
+        else if (v == V_RC) b = half_src(t, G(CSwizzle), R(t, G(SrcC)), G(NegA), 0), c = half_src(t, 1, cbuf(t, G(CbufSlot), G(CbufOffset) * 4), G(NegC), 0);
+        else b = S(t, "unpackHalf2x16(0x%08xu)", (uint32_t)G(Imm)), c = half_src(t, 0, R(t, d), G(NegC), 0), ofmt = 0;
+    } else {
+        int sinA = mul && (v == V_R || v == V_C || v == V_32I); // en HMUL2 el NegA va al operando B
+        a = half_src(t, G(ASwizzle), R(t, G(SrcA)), sinA ? 0 : G(NegA), v == V_32I ? 0 : G(AbsA));
+        if (v == V_R) b = half_src(t, G(BSwizzle), R(t, G(SrcB)), mul ? G(NegA) : G(NegB), G(AbsB));
+        else if (v == V_I) b = half_imm(t, (uint32_t)G(BimmH0), (uint32_t)G(BimmH1));
+        else if (v == V_C) b = half_src(t, 1, cbuf(t, G(CbufSlot), G(CbufOffset) * 4), mul ? G(NegA) : G(NegB), G(AbsB));
+        else b = S(t, "unpackHalf2x16(0x%08xu)", (uint32_t)(HAS(Imm32) ? G(Imm32) : G(Imm))), ofmt = 0;
+    }
+    char *r = fma ? S(t, "fma(%s, %s, %s)", a, b, c) : S(t, "(%s %s %s)", a, mul ? "*" : "+", b);
+    if (G(Sat) == 1) r = S(t, "clamp(%s, 0.0, 1.0)", r);
+    L(t, "{ vec2 hr = %s;", r);
+    WR(t, d, half_out(t, ofmt, "hr", d));
+    L(t, "}");
+}
+
+static void emit_half_cmp(T *t, int pred) {
+    int v = t->var;
+    char *a = half_src(t, G(ASwizzle), R(t, G(SrcA)), G(NegA), G(AbsA)), *b;
+    if (v == V_R) b = half_src(t, G(BSwizzle), R(t, G(SrcB)), G(NegB), G(AbsB));
+    else if (v == V_I) b = half_imm(t, (uint32_t)G(BimmH0), (uint32_t)G(BimmH1));
+    else b = half_src(t, 1, cbuf(t, G(CbufSlot), G(CbufOffset) * 4), G(NegB), pred ? G(AbsB) : 0);
+    int64_t cmp = pred ? (HAS(FComp2) ? G(FComp2) : G(FComp)) : G(Cmp);
+    char *p = P(t, G(SrcPred), G(SrcPredInv));
+    L(t, "{ vec2 ha = %s, hb = %s;", a, b);
+    L(t, "bool c0 = %s, c1 = %s;", fcmp(t, cmp, "ha.x", "hb.x"), fcmp(t, cmp, "ha.y", "hb.y"));
+    if (pred) {
+        if (G(HAnd) == 1) L(t, "c0 = c0 && c1; c1 = !c0;");
+        WP(t, G(DestPred), bop(t, G(Bop), "c0", p));
+        WP(t, G(DestPredInv), bop(t, G(Bop), "c1", p));
+    } else {
+        L(t, "c0 = %s; c1 = %s;", bop(t, G(Bop), "c0", p), bop(t, G(Bop), "c1", p));
+        if (G(Bval) == 1) WR(t, G(Dest), "packHalf2x16(vec2(c0 ? 1.0 : 0.0, c1 ? 1.0 : 0.0))");
+        else WR(t, G(Dest), "((c0 ? 0xffffu : 0u) | (c1 ? 0xffff0000u : 0u))");
+    }
+    L(t, "}");
+}
+
+// ---------- doble precisión (pares de registros) ----------
+
+static char *dreg(T *t, int64_t r) { return S(t, "packDouble2x32(uvec2(%s, %s))", R(t, r), R(t, r < 255 ? r + 1 : 255)); }
+static char *dsrc_b(T *t) {
+    switch (t->var) {
+    case V_R: return dreg(t, G(SrcB));
+    case V_I: return S(t, "packDouble2x32(uvec2(0u, 0x%08xu))", (uint32_t)G(Imm20) << 12);
+    case V_C: return S(t, "packDouble2x32(uvec2(%s, %s))", cbuf(t, G(CbufSlot), G(CbufOffset) * 4), cbuf(t, G(CbufSlot), G(CbufOffset) * 4 + 4));
+    case V_RC: return dreg(t, G(SrcC));
+    }
+    return (char *)"0.0lf";
+}
+static char *dabsneg(T *t, const char *v, int64_t abs_, int64_t neg) {
+    if (abs_ == 1) v = S(t, "abs(%s)", v);
+    if (neg == 1) v = S(t, "(-%s)", v);
+    return (char *)v;
+}
+static void dwr(T *t, int64_t d, const char *v) {
+    L(t, "{ uvec2 dv = unpackDouble2x32(%s);", v);
+    WR(t, d, "dv.x");
+    if (d < 254) WR(t, d + 1, "dv.y");
+    L(t, "}");
+}
+
+static void emit_double(T *t) {
+    int op = t->op;
+    char *a = dreg(t, G(SrcA));
+    if (op >= MXOP_DaddC && op <= MXOP_DaddR) {
+        dwr(t, G(Dest), S(t, "(%s + %s)", dabsneg(t, a, G(AbsA), G(NegA)), dabsneg(t, dsrc_b(t), G(AbsB), G(NegB))));
+    } else if (op >= MXOP_DmulC && op <= MXOP_DmulR) {
+        dwr(t, G(Dest), S(t, "(%s * %s)", dabsneg(t, a, 0, G(NegA)), dsrc_b(t)));
+    } else if (op >= MXOP_DfmaC && op <= MXOP_DfmaRc) {
+        char *b = dsrc_b(t), *c = t->var == V_RC ? S(t, "packDouble2x32(uvec2(%s, %s))", cbuf(t, G(CbufSlot), G(CbufOffset) * 4),
+                                                    cbuf(t, G(CbufSlot), G(CbufOffset) * 4 + 4))
+                                                 : dreg(t, G(SrcC));
+        dwr(t, G(Dest), S(t, "fma(%s, %s, %s)", dabsneg(t, a, 0, G(NegA)), b, dabsneg(t, c, 0, G(NegC))));
+    } else if (op >= MXOP_DmnmxC && op <= MXOP_DmnmxR) {
+        char *x = dabsneg(t, a, G(AbsA), G(NegA)), *y = dabsneg(t, dsrc_b(t), G(AbsB), G(NegB));
+        dwr(t, G(Dest), S(t, "(%s ? min(%s, %s) : max(%s, %s))", P(t, G(SrcPred), G(SrcPredInv)), x, y, x, y));
+    } else { // DSET / DSETP
+        char *x = dabsneg(t, a, G(AbsA), G(NegA)), *y = dabsneg(t, dsrc_b(t), G(AbsB), G(NegB));
+        L(t, "{ double da = %s, db = %s; bool c = %s;", x, y, fcmp(t, G(FComp), "da", "db"));
+        char *p = P(t, G(SrcPred), G(SrcPredInv));
+        if (op >= MXOP_DsetpC && op <= MXOP_DsetpR) {
+            WP(t, G(DestPred), bop(t, G(Bop), "c", p));
+            WP(t, G(DestPredInv), bop(t, G(Bop), "!c", p));
+        } else {
+            WR(t, G(Dest), S(t, "(%s ? %s : 0u)", bop(t, G(Bop), "c", p), G(BVal) == 1 ? "0x3f800000u" : "0xffffffffu"));
+        }
+        L(t, "}");
+    }
+}
+
+// ---------- hilos del warp: SHFL y FSWZADD (derivadas) ----------
+// Cada invocación del GLSL es un hilo; los subgrupos de NVIDIA son warps de 32 hilos con los quads
+// en grupos de 4, como en la GPU de la Switch.
+
+// Hilos del quad: Maxwell los numera al revés que las GPU de PC en x y en y (comprobado con las
+// derivadas que genera uam contra dFdx/dFdy de OpenGL): su número es el del subgrupo con los dos
+// bits bajos invertidos.
+#define XSH 3u
+#define XSW 3u
+static void emit_shfl(T *t) {
+    t->uses_subgroup = 1;
+    char *b = G(BFixShfl) == 1 ? S(t, "%uu", (uint32_t)G(SrcBImm)) : R(t, G(SrcB));
+    char *c = G(CFixShfl) == 1 ? S(t, "%uu", (uint32_t)G(SrcCImm)) : R(t, G(SrcC));
+    L(t, "{ uint lane = gl_SubgroupInvocationID ^ %uu, b = %s, c = %s, seg = (c >> 8) & 31u;", XSH, b, c);
+    L(t, "uint lo = lane & seg, hi = lo | (c & 31u & ~seg); uint j; bool ok;");
+    switch (G(ShflMode)) {
+    case 0: L(t, "j = lo | (b & ~seg); ok = j <= hi;"); break;
+    case 1: L(t, "j = lane - b; ok = int(j) >= int(hi);"); break;
+    case 2: L(t, "j = lane + b; ok = j <= hi;"); break;
+    default: L(t, "j = lane ^ b; ok = j <= hi;");
+    }
+    L(t, "uint v = subgroupShuffle(%s, (ok ? j : lane) ^ %uu);", R(t, G(SrcA)), XSH);
+    WR(t, G(Dest), "v");
+    WP(t, G(DestPred), "ok");
+    L(t, "}");
+}
+
+static void emit_fswzadd(T *t) {
+    t->uses_subgroup = 1;
+    L(t, "{ int m = (%d >> (int((gl_SubgroupInvocationID ^ %uu) & 3u) * 2)) & 3;", (int)G(PnWord), XSW);
+    L(t, "const float lx[4] = float[4](1.0, -1.0, 1.0, 0.0), ly[4] = float[4](1.0, 1.0, -1.0, 1.0);");
+    WR(t, G(Dest), U(t, S(t, "(%s * lx[m] + %s * ly[m])", F(t, R(t, G(SrcA))), F(t, R(t, G(SrcB))))));
+    L(t, "}");
+}
+
+// TXD: textura con derivadas explícitas (dPdx, dPdy en los registros B).
+static void emit_txd(T *t) {
+    if (t->op != MXOP_Txd) {
+        red(t, "TXD sin handle constante");
+        return;
+    }
+    int64_t d = G(Dest);
+    if (d == 255) return;
+    int nc, array, type = tex_type_dim(G(Dim), &nc, &array);
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *c[3];
+    for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
+    char *packed = nextA(t, &s);
+    char *layer = array ? S(t, "(%s & 0xffffu)", packed) : NULL;
+    char *g[6];
+    for (int i = 0; i < 2 * nc; i++) g[i] = F(t, nextB(t, &s));
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *coords = tex_coords(t, type, c, nc, layer, NULL);
+    char *dx, *dy;
+    // Las derivadas van intercaladas: dPdx.x, dPdy.x, dPdx.y, dPdy.y...
+    if (nc == 1) dx = S(t, "vec2(%s, 0.0)", g[0]), dy = S(t, "vec2(%s, 0.0)", g[1]);
+    else if (nc == 2) dx = S(t, "vec2(%s, %s)", g[0], g[2]), dy = S(t, "vec2(%s, %s)", g[1], g[3]);
+    else dx = S(t, "vec3(%s, %s, %s)", g[0], g[2], g[4]), dy = S(t, "vec3(%s, %s, %s)", g[1], g[3], g[5]);
+    int dest_of[4];
+    for (int k = 0; k < 4; k++) dest_of[k] = (int)d + k < 255 ? (int)d + k : 255;
+    tex_write(t, S(t, "textureGrad(%s, %s, %s, %s)", smp, coords, dx, dy), (int)G(WMask), dest_of);
+}
+
+// TMML: nivel de mipmap que se usaría, en punto fijo 8.8 (y al revés que GLSL: x es el calculado).
+static void emit_tmml(T *t) {
+    if (t->op != MXOP_Tmml) {
+        red(t, "TMML sin handle constante");
+        return;
+    }
+    int64_t d = G(Dest), mask = G(WMask);
+    if (d == 255) return;
+    int nc, array, type = tex_type_dim(G(Dim), &nc, &array);
+    Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    char *layer = array ? nextA(t, &s) : NULL;
+    (void)layer;
+    char *c[3];
+    for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
+    char *smp = tex_sampler(t, G(TidB), type);
+    char *coords = tex_coords(t, type, c, nc, NULL, NULL);
+    if (array && nc == 2) coords = S(t, "vec2(%s, %s)", F(t, c[0]), F(t, c[1]));
+    L(t, "{ vec2 lod = textureQueryLod(%s, %s);", smp, coords);
+    int k = 0;
+    for (int comp = 0; comp < 4; comp++)
+        if (mask >> comp & 1) {
+            if (d + k < 255) WR(t, d + k, comp < 2 ? S(t, "uint(int(lod.%c * 256.0))", comp == 0 ? 'y' : 'x') : "0u");
+            k++;
+        }
+    L(t, "}");
+}
+
 static void emit_insn(T *t) {
     switch (t->op) {
     case MXOP_Ald: emit_ald(t); break;
@@ -1528,6 +1752,22 @@ static void emit_insn(T *t) {
         break;
     }
     case MXOP_Tex: case MXOP_TexB: emit_tex(t); break;
+    case MXOP_Txd: case MXOP_TxdB: emit_txd(t); break;
+    case MXOP_Tmml: case MXOP_TmmlB: emit_tmml(t); break;
+    case MXOP_Shfl: emit_shfl(t); break;
+    case MXOP_Fswzadd: emit_fswzadd(t); break;
+    case MXOP_Hadd232i: case MXOP_Hadd2C: case MXOP_Hadd2I: case MXOP_Hadd2R:
+    case MXOP_Hmul232i: case MXOP_Hmul2C: case MXOP_Hmul2I: case MXOP_Hmul2R:
+    case MXOP_Hfma232i: case MXOP_Hfma2C: case MXOP_Hfma2I: case MXOP_Hfma2R: case MXOP_Hfma2Rc:
+        emit_half_arith(t);
+        break;
+    case MXOP_Hset2C: case MXOP_Hset2I: case MXOP_Hset2R: emit_half_cmp(t, 0); break;
+    case MXOP_Hsetp2C: case MXOP_Hsetp2I: case MXOP_Hsetp2R: emit_half_cmp(t, 1); break;
+    case MXOP_DaddC: case MXOP_DaddI: case MXOP_DaddR: case MXOP_DmulC: case MXOP_DmulI: case MXOP_DmulR:
+    case MXOP_DfmaC: case MXOP_DfmaI: case MXOP_DfmaR: case MXOP_DfmaRc: case MXOP_DmnmxC: case MXOP_DmnmxI: case MXOP_DmnmxR:
+    case MXOP_DsetC: case MXOP_DsetI: case MXOP_DsetR: case MXOP_DsetpC: case MXOP_DsetpI: case MXOP_DsetpR:
+        emit_double(t);
+        break;
     case MXOP_Texs: case MXOP_TexsF16: emit_texs(t); break;
     case MXOP_Tlds: case MXOP_TldsF16: emit_tlds(t); break;
     case MXOP_Tld: case MXOP_TldB: emit_tld(t); break;
@@ -1597,6 +1837,7 @@ static void emit_insn(T *t) {
 static void header(T *t, Sb *h) {
     t->arena_n = 0;
     sb_add(h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n");
+    if (t->uses_subgroup) sb_add(h, "#extension GL_KHR_shader_subgroup_basic : enable\n#extension GL_KHR_shader_subgroup_shuffle : enable\n");
     if (t->stage == NX_SH_VERTEX || por_vertice(t->stage)) {
         int st = t->stage;
         if (st == NX_SH_TESS_CTRL) sb_add(h, "layout(vertices = %u) out;\n", t->sph[2] >> 24 ? t->sph[2] >> 24 : 3);
