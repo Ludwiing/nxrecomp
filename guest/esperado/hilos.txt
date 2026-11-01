@@ -1,0 +1,16 @@
+Kernel de Horizon en el host: hilos, mutex, condiciones, eventos y memoria.
+heap de 32 MiB: resultado 0x0, suma de prueba 522240
+QueryMemory(código): tipo 0x3, permisos 5
+QueryMemory(heap): tipo 0x5, permisos 3, empieza en el heap: sí, tamaño 32 MiB: sí
+GetInfo(región del heap) coincide con SetHeapSize: sí
+4 hilos × 100000 con mutex: 400000
+4 hilos × 100000 atómicos (LDXR/STXR): 400000
+productor y 3 consumidores: 5000 valores, suma 12502500
+ping-pong con WaitForAddress: ABABABABABABABABABAB
+evento antes de la señal: esperando
+evento después de la señal: visto
+espera con plazo de 1 ms: 0xea01
+condición con plazo: 0xea01, y el mutex vuelve: sí
+pila mapeada con MapMemory: 0x0, recursión de 2000 niveles
+UnmapMemory: 0x0
+Fin.

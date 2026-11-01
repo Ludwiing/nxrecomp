@@ -404,21 +404,29 @@ def loadstore(i, x):
         if o2 == 1 and o1 == 0:  # LDAR / STLR
             i.lines = [f"{{ uint64_t a = {base}; __atomic_thread_fence(__ATOMIC_SEQ_CST); {mem_op(size, l, rt)} }}"]
         elif o2 == 0 and o1 == 0:  # LDXR / LDAXR / STXR / STLXR
+            # Monitor exclusivo con varios hilos: LDXR recuerda la dirección y el valor leído,
+            # y STXR guarda solo si la memoria sigue con ese valor (compare-and-swap atómico).
+            w = 8 << size
             if l:
-                i.lines = [f"{{ uint64_t a = {base}; c->excl_addr = a; {mem_op(size, 1, rt)} }}"]
+                i.lines = [f"{{ uint64_t a = {base}; uint64_t v = ld{w}(a); c->excl_addr = a; c->excl_val = v; "
+                           f"{setr(rt, 'v')} }}"]
             else:
-                i.lines = [f"{{ uint64_t a = {base}; if (c->excl_addr == a) {{ {mem_op(size, 0, rt)} "
-                           f"{setr(rs, '0', 32)} }} else {{ {setr(rs, '1', 32)} }} c->excl_addr = ~0ull; }}"]
+                i.lines = [f"{{ uint64_t a = {base}; int ok = c->excl_addr == a && nx_cas{w}(a, c->excl_val, {R(rt)}); "
+                           f"c->excl_addr = ~0ull; {setr(rs, '!ok', 32)} }}"]
         elif o2 == 0 and o1 == 1 and size >= 2:  # LDXP / STXP
             s = size
             n = 1 << s
             if l:
-                i.lines = [f"{{ uint64_t a = {base}; c->excl_addr = a; uint64_t v1 = {LD[s]}(a), v2 = {LD[s]}(a + {n}); "
-                           f"{setr(rt, 'v1')} {setr(rt2, 'v2')} }}"]
+                i.lines = [f"{{ uint64_t a = {base}; uint64_t v1 = {LD[s]}(a), v2 = {LD[s]}(a + {n}); c->excl_addr = a; "
+                           f"c->excl_val = v1; c->excl_val2 = v2; {setr(rt, 'v1')} {setr(rt2, 'v2')} }}"]
+            elif s == 3:
+                i.lines = [f"{{ uint64_t a = {base}; int ok = c->excl_addr == a && "
+                           f"nx_cas128(a, c->excl_val, c->excl_val2, {R(rt)}, {R(rt2)}); c->excl_addr = ~0ull; "
+                           f"{setr(rs, '!ok', 32)} }}"]
             else:
-                i.lines = [f"{{ uint64_t a = {base}; if (c->excl_addr == a) {{ {STF[s]}(a, {R(rt)}); "
-                           f"{STF[s]}(a + {n}, {R(rt2)}); {setr(rs, '0', 32)} }} else {{ {setr(rs, '1', 32)} }} "
-                           f"c->excl_addr = ~0ull; }}"]
+                i.lines = [f"{{ uint64_t a = {base}; int ok = c->excl_addr == a && "
+                           f"nx_cas64(a, (uint32_t)c->excl_val | c->excl_val2 << 32, (uint32_t){R(rt)} | (uint64_t){R(rt2)} << 32); "
+                           f"c->excl_addr = ~0ull; {setr(rs, '!ok', 32)} }}"]
         else:
             raise Unsupported("CAS (atómicos LSE)")
         return

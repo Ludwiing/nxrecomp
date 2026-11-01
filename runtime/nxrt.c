@@ -1,5 +1,5 @@
 // Runtime de nxrecomp: carga la imagen del módulo en su dirección de la Switch,
-// responde las llamadas al kernel (SVC) de Horizon y lo que el código no puede hacer solo.
+// lo que el código traducido no puede hacer solo: registros de sistema, trampas, el reloj.
 #define _GNU_SOURCE
 #include "nxrt.h"
 
@@ -21,32 +21,15 @@ void nx_map_fixed(uint64_t addr, uint64_t size, const char *what) {
     }
 }
 
-static uint64_t ticks(void) {
+uint64_t nx_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * TICK_HZ + (uint64_t)ts.tv_nsec * TICK_HZ / 1000000000ull;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-void nx_svc(Ctx *c, uint32_t imm) {
-    switch (imm) {
-    case 0x07: // ExitProcess
-        exit(0);
-    case 0x1E: // GetSystemTick
-        c->x[0] = ticks();
-        return;
-    case 0x26: // Break
-        fprintf(stderr, "[nxrt] svcBreak(0x%llx, 0x%llx, 0x%llx)\n", (unsigned long long)c->x[0],
-                (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
-        exit(1);
-    case 0x27: // OutputDebugString(ptr, len)
-        fwrite((const void *)(uintptr_t)c->x[0], 1, c->x[1], stdout);
-        fflush(stdout);
-        c->x[0] = 0;
-        return;
-    default:
-        fprintf(stderr, "[RED] svc 0x%x no implementado\n", imm);
-        exit(1);
-    }
+uint64_t nx_ticks(void) {
+    uint64_t ns = nx_now_ns();
+    return ns / 1000000000ull * TICK_HZ + ns % 1000000000ull * TICK_HZ / 1000000000ull;
 }
 
 uint64_t nx_mrs(Ctx *c, int reg) {
@@ -55,7 +38,7 @@ uint64_t nx_mrs(Ctx *c, int reg) {
     case NX_TPIDRRO_EL0: return c->tpidrro;
     case NX_CNTFRQ_EL0: return TICK_HZ;
     case NX_CNTPCT_EL0:
-    case NX_CNTVCT_EL0: return ticks();
+    case NX_CNTVCT_EL0: return nx_ticks();
     case NX_DCZID_EL0: return 4; // DC ZVA borra bloques de 64 bytes
     case NX_NZCV: return (uint64_t)c->n << 31 | (uint64_t)c->z << 30 | (uint64_t)c->c << 29 | (uint64_t)c->v << 28;
     case NX_FPCR: return c->fpcr;

@@ -1,0 +1,16 @@
+IPC de Horizon: sm:, set y fsp-srv con mensajes CMIF.
+ConnectToNamedPort("sm:"): 0x0
+sm RegisterClient: 0x0
+GetService("set"): 0x0, handle válido: sí
+idioma del sistema: es-419
+idiomas disponibles: 18
+lista (buffer B): ja en-US fr de it es zh-CN ko nl pt ru zh-TW en-GB fr-CA es-419 zh-Hans zh-Hant pt-BR
+fsp-srv convertido en dominio: objeto 1
+SetCurrentProcess: 0x0
+OpenDataStorageByCurrentProcess: 0x0, objeto 2
+tamaño del RomFS: 65536 bytes
+Read(1000, 64): 0x0, primeros bytes 27 58 89, hash 0x8ee2be60
+después de cerrar el objeto 2, pedirle algo falla: sí
+sin dominio, IStorage llega como handle: sí, tamaño 65536
+GetService("nada"): 0xe15
+Fin.

@@ -33,7 +33,8 @@ typedef struct Ctx {
     uint8_t n, z, c, v;
     uint64_t tpidr, tpidrro;
     uint64_t fpcr, fpsr;
-    uint64_t excl_addr; // monitor exclusivo de LDXR/STXR (por ahora de un solo hilo)
+    uint64_t excl_addr;            // monitor exclusivo: dirección y valor que leyó LDXR/LDXP
+    uint64_t excl_val, excl_val2;
 } Ctx;
 
 // Escribir un escalar en un registro V pone en cero el resto del registro.
@@ -75,6 +76,8 @@ enum {
 
 // Lo que implementa nxrt.c
 void nx_map_fixed(uint64_t addr, uint64_t size, const char *what);
+uint64_t nx_now_ns(void);
+uint64_t nx_ticks(void);
 void nx_svc(Ctx *c, uint32_t imm);
 uint64_t nx_mrs(Ctx *c, int reg);
 void nx_msr(Ctx *c, int reg, uint64_t v);
@@ -99,6 +102,22 @@ NX_LD(8)
 NX_LD(16)
 NX_LD(32)
 NX_LD(64)
+// STXR: guarda solo si la memoria todavía tiene el valor que leyó LDXR.
+#define NX_CAS(bits)                                                                            \
+    static inline int nx_cas##bits(uint64_t a, uint64_t expected, uint64_t value) {            \
+        uint##bits##_t e = (uint##bits##_t)expected;                                            \
+        return __atomic_compare_exchange_n((uint##bits##_t *)(uintptr_t)a, &e, (uint##bits##_t)value, 0, \
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                \
+    }
+NX_CAS(8)
+NX_CAS(16)
+NX_CAS(32)
+NX_CAS(64)
+static inline int nx_cas128(uint64_t a, uint64_t lo, uint64_t hi, uint64_t nlo, uint64_t nhi) {
+    unsigned __int128 e = lo | (unsigned __int128)hi << 64, n = nlo | (unsigned __int128)nhi << 64;
+    return __sync_bool_compare_and_swap((unsigned __int128 *)(uintptr_t)a, e, n);
+}
+
 static inline V128 ldq(uint64_t a) {
     V128 v;
     memcpy(&v, (const void *)(uintptr_t)a, 16);

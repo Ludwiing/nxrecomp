@@ -2,6 +2,8 @@
 CLANG ?= clang
 B := build
 PROGS := hola neon vm multi
+# programas que hablan con el kernel o los servicios: su salida se compara con guest/esperado/
+PROGS_ESPERADO := hilos servicios
 
 OPT ?= -O2
 # -ffp-contract=off en las dos versiones: ningún compilador fusiona a*b+c por su cuenta.
@@ -9,14 +11,19 @@ GUEST_CFLAGS := --target=aarch64-none-elf $(OPT) -ffreestanding -fno-builtin -no
 	-fno-pic -fno-stack-protector -ffp-contract=off -fno-math-errno \
 	-fno-asynchronous-unwind-tables -fno-unwind-tables -Wall
 CFLAGS_hola := -mgeneral-regs-only
+CFLAGS_hilos := -mgeneral-regs-only
+CFLAGS_servicios := -mgeneral-regs-only
 CFLAGS_neon := -O3
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img
+
+$(B)/romfs_prueba.img: | $(B)
+	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
 
 $(B)/start.o: guest/start.S | $(B)
 	$(CLANG) $(GUEST_CFLAGS) -c $< -o $@
@@ -34,7 +41,7 @@ $(B)/%_rec/programa.c: $(B)/%.nro $(RECOMP)
 	python3 recomp/nxrecomp.py $< -o $(B)/$*_rec
 
 $(B)/%: $(B)/%_rec/programa.c $(RUNTIME) $(RUNTIME_H)
-	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -o $@
+	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread -o $@
 
 # El mismo programa compilado directo para x86_64: su salida es la referencia.
 $(B)/%_ref: guest/%.c guest/mini.h | $(B)
@@ -72,8 +79,10 @@ $(M):
 	mkdir -p $@
 
 test: all
-	@ok=1; for p in $(PROGS); do \
-		$(B)/$$p > $(B)/$$p.salida.txt; $(B)/$${p}_ref > $(B)/$$p.referencia.txt; \
+	@ok=1; for p in $(PROGS) $(PROGS_ESPERADO); do \
+		NX_ROMFS=$(B)/romfs_prueba.img $(B)/$$p > $(B)/$$p.salida.txt; \
+		if [ -f guest/esperado/$$p.txt ]; then cp guest/esperado/$$p.txt $(B)/$$p.referencia.txt; \
+		else $(B)/$${p}_ref > $(B)/$$p.referencia.txt; fi; \
 		if diff -u $(B)/$$p.referencia.txt $(B)/$$p.salida.txt; then echo "OK: $$p es idéntico a la referencia"; \
 		else ok=0; fi; \
 	done; test $$ok = 1
