@@ -71,12 +71,22 @@ void nx_trap(Ctx *c, uint64_t pc, uint32_t word, const char *why) {
     exit(1);
 }
 
+// Un salto indirecto a una dirección que el recompilador no vio como entrada. No se puede seguir,
+// pero se anota en NX_PISTAS (si está definido): la próxima recompilación la toma como función
+// (nxrecomp.py --pistas) y el juego pasa de ahí. NX2Linux lo hace solo.
 void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to) {
     (void)c;
     fflush(stdout);
     fprintf(stderr, "[RED] salto indirecto a 0x%llx (desde 0x%llx): no es una función recompilada\n",
             (unsigned long long)to, (unsigned long long)from);
-    exit(1);
+    const char *pistas = getenv("NX_PISTAS");
+    FILE *f = pistas && *pistas ? fopen(pistas, "a") : NULL;
+    if (f) {
+        fprintf(f, "0x%llx\n", (unsigned long long)to);
+        fclose(f);
+        fprintf(stderr, "[nxrt] anotado en %s: recompila con --pistas para seguir\n", pistas);
+    }
+    exit(3);
 }
 
 void nx_import_call(Ctx *c, int index) {

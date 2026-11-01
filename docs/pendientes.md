@@ -46,13 +46,14 @@ Se marca [x] lo hecho.
 
 ## CPU y recompilador
 
-1. [ ] Tablas de salto con formas que hoy no se reconocen (base lejos, índice copiado antes, máscaras
-   de IL2CPP, cmp de 64 bits...). Saltos indirectos fallidos a un archivo de pistas para recompilar,
-   en vez de terminar.
-2. [ ] Excepciones de C++ y longjmp; QueryMemory por segmento (Code RX / Code / CodeData) para el
-   desenrollador del SDK.
-3. [ ] Accesos a memoria del juego como atómicos relajados (antes de optimizar registros) y una
-   barrera después de los stores con release.
+1. [~] Saltos indirectos a código no visto: [x] el runtime los anota en NX_PISTAS y
+   `nxrecomp.py --pistas` los agrega como funciones (NX2Linux ofrece recompilar al salir el juego).
+   [ ] Formas de tablas de salto que hoy no se reconocen (base lejos, índice copiado antes, máscaras
+   de IL2CPP, cmp de 64 bits...).
+2. [~] [x] QueryMemory por segmento (Code RX, Code R, CodeData RW). [ ] Excepciones de C++ y longjmp
+   (necesitan continuaciones en los landing pads y en los puntos de retorno: diseño pendiente).
+3. [~] [x] Barrera después de STLR. [ ] Accesos a memoria del juego como atómicos relajados antes de
+   optimizar registros.
 4. [ ] Llamadas de cola garantizadas (musttail) para que la pila del host no crezca.
 5. [ ] Escala: probar con un main de 60–100 MB (memoria de Python, tiempo de clang).
 6. [ ] NRO cargados con nn::ro (ldr:ro), ZBIC, relocaciones TLS.

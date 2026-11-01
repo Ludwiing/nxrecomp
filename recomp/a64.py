@@ -402,7 +402,11 @@ def loadstore(i, x):
         if not l and o2 == 0 and rs in (rt, rt2) or not l and o2 == 0 and rs == rn and rn != 31:
             raise Unsupported("exclusiva UNPREDICTABLE")
         if o2 == 1 and o1 == 0:  # LDAR / STLR
-            i.lines = [f"{{ uint64_t a = {base}; __atomic_thread_fence(__ATOMIC_SEQ_CST); {mem_op(size, l, rt)} }}"]
+            # STLR lleva además una barrera después: x86 deja pasar una carga posterior por delante de
+            # un store, y el ThreadedStreamBuffer de Unity 2018 (store-release y luego una carga del
+            # otro lado) perdía así un aviso y se colgaba (nxnative, FFCC).
+            post = "" if l else " __atomic_thread_fence(__ATOMIC_SEQ_CST);"
+            i.lines = [f"{{ uint64_t a = {base}; __atomic_thread_fence(__ATOMIC_SEQ_CST); {mem_op(size, l, rt)}{post} }}"]
         elif o2 == 0 and o1 == 0:  # LDXR / LDAXR / STXR / STLXR
             # Monitor exclusivo con varios hilos: LDXR recuerda la dirección y el valor leído,
             # y STXR guarda solo si la memoria sigue con ese valor (compare-and-swap atómico).

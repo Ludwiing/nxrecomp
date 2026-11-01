@@ -279,6 +279,16 @@ class Ventana(Adw.ApplicationWindow):
         if rc is None:
             return True
         del self.partidas[juego.id]
+        if motor.pistas_nuevas(juego) > 0: # saltó a código que no estaba recompilado: recompilar y seguir
+            d = Adw.AlertDialog(heading=f"{juego.nombre} necesita recompilarse",
+                                body="El juego llegó a código que la recompilación no había visto. NX2Linux "
+                                     "anotó dónde; al recompilar lo incluye y el juego pasa de ese punto.")
+            d.add_response("despues", "Después")
+            d.add_response("recompilar", "Recompilar ahora")
+            d.set_response_appearance("recompilar", Adw.ResponseAppearance.SUGGESTED)
+            d.connect("response", lambda _d, r: r == "recompilar" and self.construir(juego, desde="recompilar"))
+            d.present(self)
+            return False
         if rc not in (0, -15):
             d = Adw.AlertDialog(heading=f"{juego.nombre} se cerró con un error",
                                 body=f"Código {rc}. Lo último que dijo está en ultima_partida.txt, en la carpeta "

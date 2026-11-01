@@ -54,6 +54,7 @@ typedef struct NxModule {
     const char *name;
     uint64_t base, size, bss;     // la imagen (text + ro + data) va en base; el bss la sigue
     const unsigned char *data;
+    uint64_t ro, rw;              // dónde empiezan el rodata y los datos dentro de la imagen
 } NxModule;
 typedef struct NxSymbol {
     const char *name;

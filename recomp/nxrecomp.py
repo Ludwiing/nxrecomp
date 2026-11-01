@@ -211,6 +211,8 @@ def main():
     ap.add_argument("--base", type=lambda s: int(s, 0), default=0x08000000,
                     help="dirección del primer módulo (por defecto 0x08000000)")
     ap.add_argument("--traza", action="store_true", help="guardar en c->pc la dirección de cada instrucción")
+    ap.add_argument("--pistas", help="archivo con direcciones (una por línea) que también son funciones: las "
+                    "que el runtime anotó en NX_PISTAS al saltar a código sin recompilar")
     ap.add_argument("--progreso", action="store_true", help="líneas \"progreso i/n\" al escribir las funciones (para la app)")
     args = ap.parse_args()
     global TRACE
@@ -222,7 +224,17 @@ def main():
     if prog.npdm:
         print("npdm: " + ", ".join(f"{k} {v}" for k, v in prog.npdm.items()))
     boot = prog.boot()
-    strong, entries = discover(prog, prog.entry_points() | set(boot["inits"]))
+    pistas = set()
+    if args.pistas and os.path.exists(args.pistas):
+        for linea in open(args.pistas):
+            try:
+                a = int(linea.split()[0], 0)
+            except (ValueError, IndexError):
+                continue
+            if prog.in_text(a) and not a & 3:
+                pistas.add(a)
+        print(f"pistas: {len(pistas)} direcciones extra")
+    strong, entries = discover(prog, prog.entry_points() | set(boot["inits"]) | pistas)
 
     os.makedirs(args.output, exist_ok=True)
     for old in os.listdir(args.output):
@@ -275,7 +287,8 @@ def main():
     out.append(f"const uint64_t nx_romfs_size = {len(romfs)};")
     out.append("const NxModule nx_modules[] = {")
     for k, m in enumerate(prog.modules):
-        out.append(f"    {{ {c_string(m.name)}, 0x{m.base:x}ull, 0x{m.img.size:x}ull, 0x{m.img.bss:x}ull, nx_mod{k} }},")
+        out.append(f"    {{ {c_string(m.name)}, 0x{m.base:x}ull, 0x{m.img.size:x}ull, 0x{m.img.bss:x}ull, nx_mod{k}, "
+                   f"0x{m.img.ro[0]:x}ull, 0x{m.img.rw[0]:x}ull }},")
     out.append("};")
     out.append(f"const int nx_nmodules = {len(prog.modules)};")
     syms = sorted((a, n) for n, a in prog.symbols.items() if prog.in_text(a))

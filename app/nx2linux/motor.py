@@ -434,8 +434,12 @@ class Construccion:
             m = re.match(r"progreso (\d+)/(\d+)", linea)
             return int(m.group(1)) / int(m.group(2)) if m else None
 
+        pistas = os.path.join(j.carpeta, "pistas.txt")
         self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "recomp", "nxrecomp.py"),
-                                      os.path.join(j.carpeta, "ExeFS"), "-o", os.path.join(j.carpeta, "c"), "--progreso"], prog)
+                                      os.path.join(j.carpeta, "ExeFS"), "-o", os.path.join(j.carpeta, "c"), "--progreso",
+                                      "--pistas", pistas], prog)
+        j.datos["pistas_usadas"] = _contar_pistas(pistas)
+        j.guardar()
 
     # Paso 3: clang en todos los núcleos.
     def _compilar(self):
@@ -472,6 +476,19 @@ def crear_acceso(j):
                 f"Exec={lanzador} --jugar {j.id}\nIcon={icono}\nCategories=Game;\nTerminal=false\n")
 
 
+def _contar_pistas(ruta):
+    try:
+        with open(ruta) as f:
+            return len({l.strip() for l in f if l.strip()})
+    except OSError:
+        return 0
+
+
+def pistas_nuevas(j):
+    """Cuántas direcciones anotó el juego desde la última recompilación (saltos a código sin recompilar)."""
+    return _contar_pistas(os.path.join(j.carpeta, "pistas.txt")) - j.datos.get("pistas_usadas", 0)
+
+
 # ---------- jugar ----------
 
 def entorno_juego(j):
@@ -481,6 +498,7 @@ def entorno_juego(j):
     env["NX_SDMC"] = os.path.join(j.carpeta, "guardado", "sdmc")
     env["NX_GUARDADO"] = os.path.join(j.carpeta, "guardado")
     env["NX_TITLE_ID"] = j.id
+    env["NX_PISTAS"] = os.path.join(j.carpeta, "pistas.txt")
     env["NX_TITULO"] = j.nombre
     if leer_config().get("usuario"):
         env["NX_USUARIO"] = leer_config()["usuario"]

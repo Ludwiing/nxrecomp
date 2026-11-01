@@ -463,7 +463,16 @@ void nx_memory_init(void) {
     reserve(NX_STACK_BASE, NX_STACK_SIZE, "la región de pilas");
     for (int k = 0; k < nx_nmodules; k++) {
         const NxModule *m = &nx_modules[k];
-        region_add(m->base, (m->size + m->bss + 0xFFF) & ~0xFFFull, 0x03, 0x5); // código estático
+        // Cada segmento aparte, como en la consola: el desenrollador de excepciones del SDK busca el
+        // módulo recorriendo Code RX, Code R y CodeData RW (nn::ro::detail::GetExceptionInfo).
+        uint64_t fin = (m->size + m->bss + 0xFFF) & ~0xFFFull, ro = m->ro & ~0xFFFull, rw = m->rw & ~0xFFFull;
+        if (ro && rw > ro && fin > rw) {
+            region_add(m->base, ro, 0x03, 0x5);
+            region_add(m->base + ro, rw - ro, 0x03, 0x1);
+            region_add(m->base + rw, fin - rw, 0x04, 0x3);
+        } else {
+            region_add(m->base, fin, 0x03, 0x5);
+        }
     }
     region_add(NX_TLS_BASE, NX_TLS_SIZE, 0x0C, 0x3);
 }
