@@ -203,7 +203,7 @@ static int comparar(const char *orig, const char *dksh) {
     char *tr = translate(&fs, 18, &info);
     if (!texturas[0]) crear_texturas();
     for (int i = 0; i < info.ntex; i++) { // el handle de deko3d para el binding b del fragmento es 420 + b
-        int b = info.tex[i].handle - 420;
+        int b = info.tex[i].slot != 0xFF ? 0 : info.tex[i].handle - 420; // bindless: siempre la textura 0
         if (b >= 0 && b < 7) glBindTextureUnit(8 + i, texturas[b]);
     }
     GLuint v = compile(GL_VERTEX_SHADER, vs_comun), a = compile(GL_FRAGMENT_SHADER, src), b = compile(GL_FRAGMENT_SHADER, tr);
@@ -222,6 +222,17 @@ static int comparar(const char *orig, const char *dksh) {
             float f = (float)((int)(x >> 8) % 20000 - 10000) / 997.0f;
             if (i % 8 >= 4) datos[k][i] = x >> 16; else memcpy(&datos[k][i], &f, 4); // mitad floats, mitad enteros
         }
+    if (strstr(src, "GL_ARB_bindless_texture")) { // los uvec2 del bloque 0 son handles de la textura 0
+        static PFNGLGETTEXTUREHANDLEARBPROC get_handle;
+        static PFNGLMAKETEXTUREHANDLERESIDENTARBPROC residente;
+        if (!get_handle) {
+            get_handle = (PFNGLGETTEXTUREHANDLEARBPROC)eglGetProcAddress("glGetTextureHandleARB");
+            residente = (PFNGLMAKETEXTUREHANDLERESIDENTARBPROC)eglGetProcAddress("glMakeTextureHandleResidentARB");
+        }
+        GLuint64 h = get_handle(texturas[0]);
+        residente(h);
+        for (int i = 0; i < 16; i++) memcpy(&datos[0][i * 4], &h, 8);
+    }
     for (int k = 0; k < 4; k++) {
         GLuint buf;
         glCreateBuffers(1, &buf);

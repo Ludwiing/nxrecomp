@@ -49,7 +49,8 @@ typedef struct {
     struct {              // va en la unidad key.tex_binding + i
         uint16_t handle;
         uint8_t type, entera; // entera: 1 con signo, 2 sin signo (de la clave)
-    } tex[NX_MAX_TEX];
+        uint8_t slot;     // constbuf del handle: 0xFF = el de las texturas (SetBindlessTexture); otro =
+    } tex[NX_MAX_TEX];    // handle "bindless" rastreado hasta su constbuf
     int nssbo;            // memoria global: cada base distinta (leída de un constbuf) es un storage buffer
     struct {
         uint8_t slot, written;

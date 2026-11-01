@@ -51,6 +51,8 @@ typedef struct {
     uint32_t sph[20];
     uint8_t *visited, *leader;
     int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared, uses_subgroup, tex_int;
+    int64_t tld4_handle;
+    int tex_slot; // constbuf del handle de la textura en curso (0xFF: el de SetBindlessTexture)
     uint8_t reg_used[256];
     uint32_t in_flat, in_linear; // atributos de entrada del fragmento por modo de interpolación
     uint32_t out_comps[32];
@@ -960,8 +962,10 @@ static int tex_entera(T *t, int64_t handle) {
 static char *tex_sampler(T *t, int64_t handle, int type) {
     NxShaderInfo *in = t->info;
     t->tex_int = (type & NX_TEX_SHADOW) ? 0 : tex_entera(t, handle);
+    int slot = t->tex_slot;
+    t->tex_slot = 0xFF;
     for (int i = 0; i < in->ntex; i++)
-        if (in->tex[i].handle == handle && in->tex[i].type == type) return S(t, "tex%d", i);
+        if (in->tex[i].handle == handle && in->tex[i].type == type && in->tex[i].slot == slot) return S(t, "tex%d", i);
     if (in->ntex == NX_MAX_TEX) {
         red(t, "demasiadas texturas");
         return S(t, "tex0");
@@ -969,6 +973,7 @@ static char *tex_sampler(T *t, int64_t handle, int type) {
     in->tex[in->ntex].handle = (uint16_t)handle;
     in->tex[in->ntex].type = (uint8_t)type;
     in->tex[in->ntex].entera = (uint8_t)t->tex_int;
+    in->tex[in->ntex].slot = (uint8_t)slot;
     return S(t, "tex%d", in->ntex++);
 }
 
@@ -1048,24 +1053,37 @@ static char *tex_sample(T *t, const char *smp, int type, char **c, int nc, const
     return shadow ? S(t, "vec4(%s)", r) : r;
 }
 
-static void emit_tex(T *t) {
-    if (t->op == MXOP_TexB) {
-        red(t, "TEX sin handle constante (bindless)");
-        return;
+// Textura "bindless": el handle viene en un registro. Se rastrea hasta el constbuf del que se cargó
+// y se trata como una textura enlazada en ese constbuf (como hace Ryujinx). Devuelve el handle (en
+// palabras) o -1.
+static int rastrear(T *t, uint32_t idx, int reg, int prof, int *slot, int *off);
+static int64_t bindless(T *t, int reg) {
+    int slot, off;
+    if (reg >= 255 || !rastrear(t, t->idx, reg, 0, &slot, &off) || (off & 3)) {
+        red(t, "textura bindless sin origen conocido");
+        return -1;
     }
-    int64_t dim = G(Dim), lodm = G(Lod), mask = G(WMask), d = G(Dest);
+    t->tex_slot = slot;
+    return off / 4;
+}
+
+static void emit_tex(T *t) {
+    int b = t->op == MXOP_TexB;
+    int64_t dim = G(Dim), lodm = b ? G(Lodb) : G(Lod), mask = G(WMask), d = G(Dest);
     if (d == 255) return;
     int nc, array, type = tex_type_dim(dim, &nc, &array);
     Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    int64_t handle = b ? bindless(t, s.rb++) : G(TidB);
+    if (handle < 0) return;
     char *layer = array ? nextA(t, &s) : NULL;
     char *c[3];
     for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
     int has_lod = lodm > 1;
     char *lodv = has_lod ? nextB(t, &s) : NULL;
-    if (G(Aoffi) == 1) nextB(t, &s), red(t, "TEX con desplazamiento"); // TODO: offsets
+    if ((b ? G(Aoffib) : G(Aoffi)) == 1) nextB(t, &s), red(t, "TEX con desplazamiento"); // TODO: offsets
     char *ref = G(Dc) == 1 ? nextB(t, &s) : NULL;
     if (ref) type |= NX_TEX_SHADOW;
-    char *smp = tex_sampler(t, G(TidB), type);
+    char *smp = tex_sampler(t, handle, type);
     int lm = lodm == 1 ? 1 : lodm == 2 || lodm == 6 ? 2 : lodm == 3 || lodm == 7 ? 3 : 0;
     char *v = tex_sample(t, smp, type & 15, c, nc, layer, ref, lm, lodv);
     int dest_of[4];
@@ -1159,22 +1177,22 @@ static void emit_tlds(T *t) {
 }
 
 static void emit_tld(T *t) {
-    if (t->op != MXOP_Tld) {
-        red(t, "TLD sin handle constante");
-        return;
-    }
     int64_t d = G(Dest);
     if (d == 255) return;
     int nc, array, type = tex_type_dim(G(Dim), &nc, &array);
     if (G(Ms) == 1) type = NX_TEX_2D_MS;
     Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    int64_t handle = t->op == MXOP_TldB ? bindless(t, s.rb++) : G(TidB);
+    if (handle < 0) return;
+    int slot = t->tex_slot;
     char *layer = array ? nextA(t, &s) : NULL;
     char *c[3];
     for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
     char *lod = G(Lod) == 1 ? nextB(t, &s) : (char *)"0u";
     char *off = G(Toff) == 1 ? nextB(t, &s) : NULL;
     char *ms = type == NX_TEX_2D_MS ? nextB(t, &s) : NULL;
-    char *smp = tex_sampler(t, G(TidB), type);
+    t->tex_slot = slot;
+    char *smp = tex_sampler(t, handle, type);
     char *ic = tex_icoords(t, c, nc, layer);
     if (off && nc >= 2) ic = S(t, "(%s + ivec%d(bitfieldExtract(int(%s), 0, 4), bitfieldExtract(int(%s), 4, 4)%s))", ic,
                                layer || nc == 3 ? 3 : 2, off, off, layer || nc == 3 ? ", 0" : "");
@@ -1201,9 +1219,10 @@ static void emit_tld4(T *t, int scalar) {
         if (off) nextB(t, &s), red(t, "TLD4S con desplazamiento");
         if (dc) ref = nextB(t, &s);
     } else {
-        if (t->op != MXOP_Tld4) {
-            red(t, "TLD4 sin handle constante");
-            return;
+        if (t->op == MXOP_Tld4B) {
+            int64_t h = bindless(t, s.rb++);
+            if (h < 0) return;
+            t->tld4_handle = h;
         }
         int array;
         type = tex_type_dim(G(Dim), &nc, &array);
@@ -1214,7 +1233,7 @@ static void emit_tld4(T *t, int scalar) {
         mask = (int)G(WMask);
     }
     if (ref) type |= NX_TEX_SHADOW;
-    char *smp = tex_sampler(t, G(TidB), type);
+    char *smp = tex_sampler(t, t->op == MXOP_Tld4B ? t->tld4_handle : G(TidB), type);
     char *coords = tex_coords(t, type & 15, c, nc, layer, NULL);
     char *v = ref ? S(t, "textureGather(%s, %s, %s)", smp, coords, F(t, ref))
                   : S(t, "textureGather(%s, %s, %d)", smp, coords, (int)(G(TexComp) & 3));
@@ -1232,22 +1251,22 @@ static void emit_tld4(T *t, int scalar) {
 }
 
 static void emit_txq(T *t) {
-    if (t->op != MXOP_Txq) {
-        red(t, "TXQ sin handle constante");
-        return;
+    int64_t d = G(Dest), q = G(TexQuery), mask = G(WMask), handle = G(TidB);
+    int ra = (int)G(SrcA);
+    if (t->op == MXOP_TxqB) { // el handle va primero en A
+        if ((handle = bindless(t, ra++)) < 0) return;
     }
-    int64_t d = G(Dest), q = G(TexQuery), mask = G(WMask);
     if (d == 255) return;
     if (q != 1) {
         red(t, "TXQ de otra consulta");
         return;
     }
     // TXQ no dice el tipo: si el shader ya leyó esa textura se usa ese tipo, si no 2D.
-    int type = NX_TEX_2D;
+    int type = NX_TEX_2D, slot = t->tex_slot;
     for (int i = 0; i < t->info->ntex; i++)
-        if (t->info->tex[i].handle == G(TidB)) type = t->info->tex[i].type;
-    char *smp = tex_sampler(t, G(TidB), type);
-    char *lod = R(t, G(SrcA));
+        if (t->info->tex[i].handle == handle && t->info->tex[i].slot == slot) type = t->info->tex[i].type;
+    char *smp = tex_sampler(t, handle, type);
+    char *lod = R(t, ra);
     const char *sz;
     switch (type & 15) {
     case NX_TEX_3D: case NX_TEX_2D_ARRAY: case NX_TEX_CUBE_ARRAY: sz = S(t, "ivec4(textureSize(%s, int(%s)), 0)", smp, lod); break;
@@ -2180,6 +2199,7 @@ char *nx_shader_glsl(const uint8_t *code, size_t avail, int stage, const NxShade
     if (t->ninsn > 0x40000) t->ninsn = 0x40000;
     t->visited = calloc(t->ninsn + 2, 1);
     t->leader = calloc(t->ninsn + 2, 1);
+    t->tex_slot = 0xFF;
     t->local_words = (int)(((t->sph[1] & 0xFFFFFF) + (t->sph[2] & 0xFFFFFF)) / 4);
     if (stage == NX_SH_COMPUTE) t->local_words = (int)(key->local_bytes / 4);
     if (t->local_words < 1) t->local_words = 1;

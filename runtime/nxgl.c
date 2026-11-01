@@ -775,7 +775,8 @@ static int texturas_enteras(const uint32_t *R, const uint64_t *cbs, const NxShad
     int n = 0, slot = R[0x982] & 7;
     uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], avail;
     for (int i = 0; i < info->ntex && n < 8; i++) {
-        const uint32_t *hp = cbs[slot] ? nx_gpu_ptr_n(cbs[slot] + info->tex[i].handle * 4u, &avail) : NULL;
+        uint64_t cbi = cbs[info->tex[i].slot != 0xFF ? info->tex[i].slot & 31 : slot];
+        const uint32_t *hp = cbi ? nx_gpu_ptr_n(cbi + info->tex[i].handle * 4u, &avail) : NULL;
         if (!hp || avail < 4) continue;
         const uint32_t *tw = nx_gpu_ptr_n(tic_pool + (*hp & 0xFFFFF) * 32ull, &avail);
         if (!tw || avail < 32) continue;
@@ -792,8 +793,8 @@ static void texturas(const uint32_t *R, const uint64_t *cbs, int stage, const Nx
     uint64_t cb = cbs[slot];
     uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], tsc_pool = (uint64_t)R[0x557] << 32 | R[0x558];
     for (int i = 0; i < info->ntex; i++) {
-        uint64_t avail;
-        const uint32_t *hp = cb ? nx_gpu_ptr_n(cb + info->tex[i].handle * 4u, &avail) : NULL;
+        uint64_t avail, cbi = info->tex[i].slot != 0xFF ? cbs[info->tex[i].slot & 31] : cb; // bindless: su constbuf
+        const uint32_t *hp = cbi ? nx_gpu_ptr_n(cbi + info->tex[i].handle * 4u, &avail) : NULL;
         GLuint tex = 0, smp = 0;
         if (hp && avail >= 4) {
             uint32_t h = *hp, tic = h & 0xFFFFF, tsc = R[0x48D] & 1 ? tic : h >> 20;
