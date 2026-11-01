@@ -197,14 +197,40 @@ def _title_del_nombre(nombre):
     return int(m.group(1), 16) if m else None
 
 
+COMPRIMIDOS = {b"7z\xbc\xaf": "7z", b"PK\x03\x04": "zip", b"Rar!": "rar"}
+
+
+def revisar_archivo(archivo):
+    """Un NSP/NSZ empieza con PFS0 y un XCI tiene HEAD en 0x100; un archivo comprimido con otro nombre no sirve."""
+    with open(archivo, "rb") as f:
+        inicio = f.read(4)
+        f.seek(0x100)
+        cabecera = f.read(4)
+    nombre = os.path.basename(archivo)
+    if inicio[:4] in COMPRIMIDOS:
+        raise RuntimeError(f"{nombre} no es un NSP: es un archivo comprimido ({COMPRIMIDOS[inicio[:4]]}) con otra "
+                           "extensión. Descomprímelo primero y elige lo que trae adentro.")
+    if inicio != b"PFS0" and cabecera != b"HEAD":
+        raise RuntimeError(f"{nombre} no parece un NSP, NSZ, XCI ni XCZ (no empieza como uno). ¿Está completo?")
+
+
+def _primera_linea_error(texto):
+    for linea in texto.splitlines():
+        linea = linea.strip()
+        if linea and not linea.startswith("at "):
+            return linea[:400]
+    return texto.strip()[:400]
+
+
 def title_id(archivo, llaves):
+    revisar_archivo(archivo)
     t = _title_del_nombre(os.path.basename(archivo))
     if t is not None:
         return t
     r = subprocess.run([extractor(), llaves, "--title", archivo], capture_output=True, text=True)
     m = re.search(r"title ([0-9a-f]{16})", r.stdout)
     if not m:
-        raise RuntimeError(f"no se reconoce {os.path.basename(archivo)}: " + (r.stderr.strip() or r.stdout.strip())[-300:])
+        raise RuntimeError(f"no se reconoce {os.path.basename(archivo)}: " + _primera_linea_error(r.stderr or r.stdout))
     return int(m.group(1), 16)
 
 
