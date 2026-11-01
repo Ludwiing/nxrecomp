@@ -606,6 +606,10 @@ class App(Adw.Application):
             self.add_action(a)
 
     def do_activate(self):
+        # El ícono propio, también cuando se corre desde el repositorio sin instalar.
+        Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        Gtk.Window.set_default_icon_name("io.github.ludwiing.NX2Linux")
         if not self.ventana:
             self.ventana = Ventana(self)
         self.ventana.present()
@@ -629,7 +633,7 @@ class App(Adw.Application):
 
     def _acerca(self):
         d = Adw.AboutDialog(application_name="NX2Linux", developer_name="Ludwiing",
-                            application_icon="applications-games-symbolic", version="0.1",
+                            application_icon="io.github.ludwiing.NX2Linux", version="0.1",
                             comments="Convierte tus propios juegos de Switch en programas nativos de Linux con "
                                      "nxrecomp: recompilación estática ARM64 → x86-64, sin emulador.",
                             website="https://github.com/Ludwiing/nxrecomp")
