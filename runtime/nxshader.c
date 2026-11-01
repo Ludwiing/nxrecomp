@@ -1664,21 +1664,21 @@ static void emit_fswzadd(T *t) {
 
 // TXD: textura con derivadas explícitas (dPdx, dPdy en los registros B).
 static void emit_txd(T *t) {
-    if (t->op != MXOP_Txd) {
-        red(t, "TXD sin handle constante");
-        return;
-    }
     int64_t d = G(Dest);
     if (d == 255) return;
     int nc, array, type = tex_type_dim(G(Dim), &nc, &array);
     Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    int64_t handle = t->op == MXOP_TxdB ? bindless(t, s.ra++) : G(TidB); // el handle va primero en A
+    if (handle < 0) return;
+    int slot = t->tex_slot;
     char *c[3];
     for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
     char *packed = nextA(t, &s);
     char *layer = array ? S(t, "(%s & 0xffffu)", packed) : NULL;
     char *g[6];
     for (int i = 0; i < 2 * nc; i++) g[i] = F(t, nextB(t, &s));
-    char *smp = tex_sampler(t, G(TidB), type);
+    t->tex_slot = slot;
+    char *smp = tex_sampler(t, handle, type);
     char *coords = tex_coords(t, type, c, nc, layer, NULL);
     char *dx, *dy;
     // Las derivadas van intercaladas: dPdx.x, dPdy.x, dPdx.y, dPdy.y...
@@ -1692,19 +1692,19 @@ static void emit_txd(T *t) {
 
 // TMML: nivel de mipmap que se usaría, en punto fijo 8.8 (y al revés que GLSL: x es el calculado).
 static void emit_tmml(T *t) {
-    if (t->op != MXOP_Tmml) {
-        red(t, "TMML sin handle constante");
-        return;
-    }
     int64_t d = G(Dest), mask = G(WMask);
     if (d == 255) return;
     int nc, array, type = tex_type_dim(G(Dim), &nc, &array);
     Srcs s = {(int)G(SrcA), (int)G(SrcB)};
+    int64_t handle = t->op == MXOP_TmmlB ? bindless(t, s.rb++) : G(TidB);
+    if (handle < 0) return;
+    int slot = t->tex_slot;
     char *layer = array ? nextA(t, &s) : NULL;
     (void)layer;
     char *c[3];
     for (int i = 0; i < nc; i++) c[i] = nextA(t, &s);
-    char *smp = tex_sampler(t, G(TidB), type);
+    t->tex_slot = slot;
+    char *smp = tex_sampler(t, handle, type);
     char *coords = tex_coords(t, type, c, nc, NULL, NULL);
     if (array && nc == 2) coords = S(t, "vec2(%s, %s)", F(t, c[0]), F(t, c[1]));
     L(t, "{ vec2 lod = textureQueryLod(%s, %s);", smp, coords);
