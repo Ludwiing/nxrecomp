@@ -250,6 +250,8 @@ typedef struct {
     GLuint tex;
     int stale, dirty;
     uint32_t sx, sy; // muestras por píxel en x e y: en memoria cada píxel ocupa sx × sy
+    uint32_t capas;  // > 1: arreglo (render en capas con gl_Layer); cada capa empieza `paso` bytes después
+    uint64_t paso;
     struct {         // vistas para leerlo como textura con otro formato compatible, tipo o swizzle
         GLuint tex;
         GLenum internal, target;
@@ -283,10 +285,12 @@ static uint64_t rt_bytes(const Rt *r) {
     return (uint64_t)gobs * 64 * ((h + bh - 1) / bh * bh);
 }
 
-// Memoria del juego <-> imagen lineal (filas de w*bpp bytes).
-static void rt_copia(Rt *r, uint8_t *lin, int a_memoria) {
+static uint64_t rt_total(const Rt *r) { return (uint64_t)(r->capas - 1) * r->paso + rt_bytes(r); }
+
+// Memoria del juego <-> imagen lineal (filas de w*bpp bytes), de la capa `capa`.
+static void rt_copia(Rt *r, uint8_t *lin, int a_memoria, uint32_t capa) {
     uint64_t avail;
-    uint8_t *mem = nx_gpu_ptr_n(r->addr, &avail);
+    uint8_t *mem = nx_gpu_ptr_n(r->addr + capa * r->paso, &avail);
     if (!mem || avail < rt_bytes(r)) {
         fprintf(stderr, "[RED] GPU: el render target en 0x%llx no cabe en su memoria (%llu de %llu bytes)\n",
                 (unsigned long long)r->addr, (unsigned long long)avail, (unsigned long long)rt_bytes(r));
@@ -335,10 +339,13 @@ static void rotar8(uint8_t *lin, size_t n, int izq) {
 static void rt_cargar(Rt *r) {
     if (traza) fprintf(stderr, "[nxgl] cargo el render target 0x%llx\n", (unsigned long long)r->addr);
     uint8_t *lin = tmp_buf((size_t)r->w * r->h * r->f->bpp);
-    rt_copia(r, lin, 0);
-    if (r->f->rot8) rotar8(lin, (size_t)r->w * r->h * 4, 1);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTextureSubImage2D(r->tex, 0, 0, 0, r->w, r->h, r->f->format, r->f->type, lin);
+    for (uint32_t c = 0; c < r->capas; c++) {
+        rt_copia(r, lin, 0, c);
+        if (r->f->rot8) rotar8(lin, (size_t)r->w * r->h * 4, 1);
+        if (r->capas > 1) glTextureSubImage3D(r->tex, 0, 0, 0, (GLint)c, r->w, r->h, 1, r->f->format, r->f->type, lin);
+        else glTextureSubImage2D(r->tex, 0, 0, 0, r->w, r->h, r->f->format, r->f->type, lin);
+    }
     r->stale = 0;
 }
 
@@ -347,22 +354,26 @@ static void rt_escribir(Rt *r) {
     size_t n = (size_t)r->w * r->h * r->f->bpp;
     uint8_t *lin = tmp_buf(n);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glGetTextureImage(r->tex, 0, r->f->format, r->f->type, (GLsizei)n, lin);
-    if (r->f->rot8) rotar8(lin, n, 0);
-    rt_copia(r, lin, 1);
+    for (uint32_t c = 0; c < r->capas; c++) {
+        glGetTextureSubImage(r->tex, 0, 0, 0, (GLint)c, r->w, r->h, 1, r->f->format, r->f->type, (GLsizei)n, lin);
+        if (r->f->rot8) rotar8(lin, n, 0);
+        rt_copia(r, lin, 1, c);
+    }
     r->dirty = 0;
 }
 
 static uint32_t modo_msaa; // MultisampleMode del draw o limpieza en curso
 
-static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32_t tile) {
+// `capas`: las del arreglo (1 si no lo es); `paso`: bytes de una capa a la siguiente.
+static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32_t tile, uint32_t capas, uint64_t paso) {
     uint32_t sx, sy;
     msaa(modo_msaa, &sx, &sy);
     w /= sx, h /= sy; // los registros dan el tamaño en muestras
     if (!w || !h) return NULL;
+    if (capas < 2 || !paso || capas > 2048) capas = 1, paso = 0;
     for (int i = 0; i < nrts; i++)
         if (rts[i].addr == addr && rts[i].w == w && rts[i].h == h && rts[i].fmt == fmt && rts[i].tile == tile && rts[i].sx == sx &&
-            rts[i].sy == sy)
+            rts[i].sy == sy && rts[i].capas == capas && rts[i].paso == paso)
             return &rts[i];
     const Formato *f = formato(fmt);
     if (!f) {
@@ -390,9 +401,10 @@ static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32
         rts[0] = rts[--nrts];
     }
     Rt *r = &rts[nrts++];
-    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, {{0}}};
-    glCreateTextures(GL_TEXTURE_2D, 1, &r->tex);
-    glTextureStorage2D(r->tex, 1, f->internal, w, h);
+    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, capas, paso, {{0}}};
+    glCreateTextures(capas > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, 1, &r->tex);
+    if (capas > 1) glTextureStorage3D(r->tex, 1, f->internal, w, h, capas);
+    else glTextureStorage2D(r->tex, 1, f->internal, w, h);
     glTextureParameteri(r->tex, GL_TEXTURE_MAX_LEVEL, 0); // un solo nivel: completa aunque se lea sin sampler
     glTextureParameteri(r->tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     return r;
@@ -724,7 +736,8 @@ static GLuint rt_vista(Rt *r, const Tic *t, int tipo) {
     for (int i = 0; i < 4; i++) swz |= t->swz[i] << (i * 3);
     int identidad = swz == (2u | 3u << 3 | 4u << 6 | 5u << 9) || r->f->depth;
     GLenum target = tipo == NX_TEX_2D_ARRAY ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
-    if (want == r->f->internal && target == GL_TEXTURE_2D && identidad) return r->tex;
+    GLenum propio = r->capas > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    if (want == r->f->internal && target == propio && identidad) return r->tex;
     if (!f || f->bw != 1 || f->astc || (f->depth != 0) != (r->f->depth != 0) || f->bpb != r->f->bpp) return 0;
     if (r->f->depth && want != r->f->internal) return 0;
     for (int v = 0; v < 4; v++)
@@ -736,7 +749,7 @@ static GLuint rt_vista(Rt *r, const Tic *t, int tipo) {
     GLuint tex;
     glGenTextures(1, &tex); // una vista necesita un nombre sin usar
     glGetError();
-    glTextureView(tex, target, r->tex, want, 0, 1, 0, 1);
+    glTextureView(tex, target, r->tex, want, 0, 1, 0, target == GL_TEXTURE_2D ? 1 : r->capas);
     if (glGetError() != GL_NO_ERROR) {
         glDeleteTextures(1, &tex);
         return 0;
@@ -995,7 +1008,7 @@ void nx_gl_cpu_write(uint64_t gpu, uint64_t size) {
     for (int i = 0; i < ntexs; i++) // las texturas de esa memoria se vuelven a mirar
         if (texs[i].addr < gpu + size && gpu < texs[i].addr + texs[i].bytes) texs[i].visto = 0;
     for (int i = 0; i < nrts; i++)
-        if (rts[i].addr < gpu + size && gpu < rts[i].addr + rt_bytes(&rts[i])) {
+        if (rts[i].addr < gpu + size && gpu < rts[i].addr + rt_total(&rts[i])) {
             if (rts[i].dirty) {
                 tomar();
                 rt_escribir(&rts[i]);
@@ -1023,20 +1036,21 @@ int nx_gl_clear(const uint32_t *R, uint32_t v) {
     if (v & 0x3C) {
         uint32_t b = 0x200 + (v >> 6 & 15) * 0x10;
         uint64_t a = (uint64_t)R[b] << 32 | R[b + 1];
-        if (a) c = rt_buscar(a, R[b + 2], R[b + 3], R[b + 4], R[b + 5]);
+        if (a) c = rt_buscar(a, R[b + 2], R[b + 3], R[b + 4], R[b + 5], R[b + 6] & 0xFFFF, (uint64_t)R[b + 7] * 4);
         if (!c) return 0; // formato desconocido: que lo haga la CPU
     }
     if (v & 3) {
         uint64_t a = (uint64_t)R[0x3F8] << 32 | R[0x3F9];
-        if (a) z = rt_buscar(a, R[0x48A], R[0x48B], R[0x3FA], R[0x3FB] & 0xFFFF);
+        if (a) z = rt_buscar(a, R[0x48A], R[0x48B], R[0x3FA], R[0x3FB] & 0xFFFF, R[0x48C] & 0xFFFF, (uint64_t)R[0x3FC] * 4);
         if (z && !z->f->depth) z = NULL;
         if (!z && !c) return 1;
     }
     Rt *both[2] = {c, z};
+    uint32_t capa = v >> 10 & 0x7FF; // ClearBuffers limpia una sola capa de un arreglo
     for (int i = 0; i < 2; i++) {
         Rt *r = both[i];
         if (!r) continue;
-        int total = x0 == 0 && y0 == 0 && x1 >= r->w && y1 >= r->h && (r != c || (v & 0x3C) == 0x3C);
+        int total = x0 == 0 && y0 == 0 && x1 >= r->w && y1 >= r->h && (r != c || (v & 0x3C) == 0x3C) && r->capas == 1;
         if (r->stale && !total) rt_cargar(r);
         r->stale = 0;
         r->dirty = 1;
@@ -1049,7 +1063,8 @@ int nx_gl_clear(const uint32_t *R, uint32_t v) {
     }
     if (c) {
         glNamedFramebufferTexture(fb, GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
-        glNamedFramebufferTexture(fb, GL_COLOR_ATTACHMENT0, c->tex, 0);
+        if (c->capas > 1) glNamedFramebufferTextureLayer(fb, GL_COLOR_ATTACHMENT0, c->tex, 0, (GLint)(capa < c->capas ? capa : 0));
+        else glNamedFramebufferTexture(fb, GL_COLOR_ATTACHMENT0, c->tex, 0);
         glNamedFramebufferDrawBuffer(fb, GL_COLOR_ATTACHMENT0);
         glColorMaski(0, v >> 2 & 1, v >> 3 & 1, v >> 4 & 1, v >> 5 & 1);
         if (c->f->entero == 1) glClearNamedFramebufferiv(fb, GL_COLOR, 0, (const GLint *)&R[0x360]);
@@ -1064,7 +1079,9 @@ int nx_gl_clear(const uint32_t *R, uint32_t v) {
     if (z && traza) fprintf(stderr, "[nxgl] limpio la profundidad: tex %u en 0x%llx %ux%u fmt 0x%x\n", z->tex, (unsigned long long)z->addr, z->w, z->h, z->fmt);
     if (z) {
         glNamedFramebufferTexture(fb, GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
-        glNamedFramebufferTexture(fb, z->f->depth == 2 ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, z->tex, 0);
+        GLenum att = z->f->depth == 2 ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+        if (z->capas > 1) glNamedFramebufferTextureLayer(fb, att, z->tex, 0, (GLint)(capa < z->capas ? capa : 0));
+        else glNamedFramebufferTexture(fb, att, z->tex, 0);
         glNamedFramebufferDrawBuffer(fb, GL_NONE);
         glDepthMask(GL_TRUE);
         glStencilMask(0xFF);
@@ -1597,7 +1614,7 @@ int nx_gl_draw(const NxDraw *d) {
         uint32_t t = ctl >> (4 + i * 3) & 7, b = 0x200 + t * 0x10;
         uint64_t addr = (uint64_t)R[b] << 32 | R[b + 1];
         if (!addr || !R[b + 4]) continue;
-        Rt *r = rt_buscar(addr, R[b + 2], R[b + 3], R[b + 4], R[b + 5]);
+        Rt *r = rt_buscar(addr, R[b + 2], R[b + 3], R[b + 4], R[b + 5], R[b + 6] & 0xFFFF, (uint64_t)R[b + 7] * 4);
         if (!r) continue;
         if (r->stale) rt_cargar(r);
         glNamedFramebufferTexture(fbo, GL_COLOR_ATTACHMENT0 + i, r->tex, 0);
@@ -1611,7 +1628,7 @@ int nx_gl_draw(const NxDraw *d) {
     glNamedFramebufferTexture(fbo, GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
     if (R[0x54E] & 1) { // superficie de profundidad
         uint64_t za = (uint64_t)R[0x3F8] << 32 | R[0x3F9];
-        Rt *z = za ? rt_buscar(za, R[0x48A], R[0x48B], R[0x3FA], R[0x3FB] & 0xFFFF) : NULL;
+        Rt *z = za ? rt_buscar(za, R[0x48A], R[0x48B], R[0x3FA], R[0x3FB] & 0xFFFF, R[0x48C] & 0xFFFF, (uint64_t)R[0x3FC] * 4) : NULL;
         if (z && traza) fprintf(stderr, "[nxgl] profundidad del draw: tex %u en 0x%llx %ux%u fmt 0x%x\n", z->tex, (unsigned long long)z->addr, z->w, z->h, z->fmt);
         if (z && z->f->depth) {
             if (z->stale) rt_cargar(z);

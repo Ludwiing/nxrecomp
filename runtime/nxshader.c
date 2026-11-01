@@ -2164,6 +2164,8 @@ static void header(T *t, Sb *h) {
     t->arena_n = 0;
     sb_add(h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n");
     if (t->uses_subgroup) sb_add(h, "#extension GL_KHR_shader_subgroup_basic : enable\n#extension GL_KHR_shader_subgroup_shuffle : enable\n");
+    if (t->writes_layer && t->stage != NX_SH_GEOMETRY) // gl_Layer desde vértices o teselación
+        sb_add(h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
     if (t->stage == NX_SH_VERTEX || por_vertice(t->stage)) {
         int st = t->stage;
         if (st == NX_SH_TESS_CTRL) sb_add(h, "layout(vertices = %u) out;\n", t->sph[2] >> 24 ? t->sph[2] >> 24 : 3);

@@ -31,9 +31,9 @@ static DkMemBlock g_framebufferMemBlock, g_codeMemBlock, g_cmdbufMemBlock, g_dat
 static DkImage g_framebuffers[FB_NUM];
 static DkSwapchain g_swapchain;
 static uint32_t g_codeMemOffset;
-static DkShader g_vsh, g_fsh, g_falta, g_tex, g_texarr;
-static DkMemBlock g_imgMem, g_desc;
-static DkImage g_img;
+static DkShader g_vsh, g_fsh, g_falta, g_tex, g_texarr, g_capa_v, g_capa_f, g_texcapa;
+static DkMemBlock g_imgMem, g_desc, g_arrMem;
+static DkImage g_img, g_arr;
 static DkCmdBuf g_cmdbuf;
 static DkCmdList g_cmdsBindFramebuffer[FB_NUM], g_cmdsRender;
 static DkQueue g_queue;
@@ -106,6 +106,9 @@ static void graphicsInitialize(void) {
     loadShader(&g_falta, "romfs:/shaders/falta_fsh.dksh");
     loadShader(&g_tex, "romfs:/shaders/tex_fsh.dksh");
     loadShader(&g_texarr, "romfs:/shaders/texarr_fsh.dksh");
+    loadShader(&g_capa_v, "romfs:/shaders/capa_vsh.dksh");
+    loadShader(&g_capa_f, "romfs:/shaders/capa_fsh.dksh");
+    loadShader(&g_texcapa, "romfs:/shaders/texcapa_fsh.dksh");
 
     // Una imagen aparte de 64x64 donde se dibuja, y dos descriptores para leerla: con el rojo y el
     // azul cambiados de lugar, y como arreglo de una capa.
@@ -124,7 +127,7 @@ static void graphicsInitialize(void) {
     mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
     g_desc = dkMemBlockCreate(&mm);
     DkImageDescriptor *imgDesc = dkMemBlockGetCpuAddr(g_desc);
-    DkSamplerDescriptor *smpDesc = (DkSamplerDescriptor *)(imgDesc + 2);
+    DkSamplerDescriptor *smpDesc = (DkSamplerDescriptor *)(imgDesc + 3);
     DkImageView v;
     dkImageViewDefaults(&v, &g_img);
     v.swizzle[0] = DkImageSwizzle_Blue;
@@ -133,6 +136,23 @@ static void graphicsInitialize(void) {
     dkImageViewDefaults(&v, &g_img);
     v.type = DkImageType_2DArray;
     dkImageDescriptorInitialize(&imgDesc[1], &v, false, false);
+
+    // Un arreglo de 2 capas de 64x64 donde un solo draw dibuja las dos (gl_Layer desde vértices).
+    dkImageLayoutMakerDefaults(&lm, g_device);
+    lm.flags = DkImageFlags_UsageRender;
+    lm.type = DkImageType_2DArray;
+    lm.format = DkImageFormat_RGBA8_Unorm;
+    lm.dimensions[0] = 64;
+    lm.dimensions[1] = 64;
+    lm.dimensions[2] = 2;
+    DkImageLayout arrLayout;
+    dkImageLayoutInitialize(&arrLayout, &lm);
+    dkMemBlockMakerDefaults(&mm, g_device, (dkImageLayoutGetSize(&arrLayout) + DK_MEMBLOCK_ALIGNMENT - 1) & ~(DK_MEMBLOCK_ALIGNMENT - 1));
+    mm.flags = DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
+    g_arrMem = dkMemBlockCreate(&mm);
+    dkImageInitialize(&g_arr, &arrLayout, g_arrMem, 0);
+    dkImageViewDefaults(&v, &g_arr);
+    dkImageDescriptorInitialize(&imgDesc[2], &v, false, false);
     DkSampler smp;
     dkSamplerDefaults(&smp);
     dkSamplerDescriptorInitialize(smpDesc, &smp);
@@ -202,6 +222,19 @@ static void graphicsInitialize(void) {
         dkCmdBufSetViewports(g_cmdbuf, 0, &vp, 1);
         dkCmdBufSetScissors(g_cmdbuf, 0, &sc, 1);
         dkCmdBufClearColorFloat(g_cmdbuf, 0, DkColorMask_RGBA, 0.2f, 0.4f, 0.6f, 1.0f);
+        dkImageViewDefaults(&iv, &g_arr);
+        dkCmdBufBindRenderTarget(g_cmdbuf, &iv, NULL);
+        dkCmdBufClearColorFloat(g_cmdbuf, 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 1.0f);
+        DkShader const *cs[] = {&g_capa_v, &g_capa_f};
+        dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, cs, 2);
+        DkRasterizerState r0;
+        dkRasterizerStateDefaults(&r0);
+        r0.cullMode = DkFace_None;
+        dkCmdBufBindRasterizerState(g_cmdbuf, &r0);
+        DkColorWriteState c0;
+        dkColorWriteStateDefaults(&c0);
+        dkCmdBufBindColorWriteState(g_cmdbuf, &c0);
+        dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 3, 2, 0, 0);
         dkQueueSubmitCommands(g_queue, dkCmdBufFinishList(g_cmdbuf));
     }
 
@@ -274,8 +307,8 @@ static void graphicsInitialize(void) {
     rect(300, 560, 500, 660, 1, 1, 1, 1);
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     // La imagen aparte leída con el swizzle cambiado (0.6, 0.4, 0.2) y como arreglo (0.2, 0.4, 0.6).
-    dkCmdBufBindImageDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc), 2);
-    dkCmdBufBindSamplerDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc) + 2 * sizeof(DkImageDescriptor), 1);
+    dkCmdBufBindImageDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc), 3);
+    dkCmdBufBindSamplerDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc) + 3 * sizeof(DkImageDescriptor), 1);
     DkShader const *ts[] = {&g_vsh, &g_tex};
     dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, ts, 2);
     DkResHandle h0 = dkMakeTextureHandle(0, 0), h1 = dkMakeTextureHandle(1, 0);
@@ -286,6 +319,15 @@ static void graphicsInitialize(void) {
     dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, ta, 2);
     dkCmdBufBindTextures(g_cmdbuf, DkStage_Fragment, 0, &h1, 1);
     rect(800, 560, 1000, 660, 1, 1, 1, 1);
+    dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
+    // Las dos capas del arreglo: naranja y violeta.
+    DkShader const *tc[] = {&g_vsh, &g_texcapa};
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, tc, 2);
+    DkResHandle h2 = dkMakeTextureHandle(2, 0);
+    dkCmdBufBindTextures(g_cmdbuf, DkStage_Fragment, 0, &h2, 1);
+    rect(1050, 560, 1150, 660, 0, 0, 0, 1);
+    dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
+    rect(1150, 560, 1250, 660, 1, 0, 0, 1);
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     g_cmdsRender = dkCmdBufFinishList(g_cmdbuf);
 }

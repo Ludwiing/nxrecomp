@@ -17,8 +17,9 @@ PIXELES_deko_basic := 0 0 32,75,122 1270 10 32,75,122 640 360 127,64,64 640 20 2
 # deko_gpu: draws indirectos, alpha test, logic op XOR y tres cuadros verdes si los contadores de
 # muestras, las marcas de tiempo (614,4 MHz) y los semáforos (acquire, reducción) dieron lo esperado;
 # abajo, un draw con el rasterizador apagado (no se ve), un atributo sin escribir (= 0,0,0,1) y un
-# render target leído como textura con el swizzle cambiado y como arreglo (vistas de OpenGL).
-PIXELES_deko_gpu := 150 520 255,255,255 400 520 255,0,0 650 520 0,255,0 850 520 0,0,0 950 520 0,0,255 1150 520 0,255,255 100 270 0,255,0 250 270 0,255,0 400 270 0,255,0 600 270 0,0,0 150 110 0,0,0 400 110 255,255,128 650 110 153,102,51 900 110 51,102,153
+# render target leído como textura con el swizzle cambiado y como arreglo (vistas de OpenGL), y las dos
+# capas de un arreglo dibujadas en un solo draw con gl_Layer (naranja y violeta).
+PIXELES_deko_gpu := 150 520 255,255,255 400 520 255,0,0 650 520 0,255,0 850 520 0,0,0 950 520 0,0,255 1150 520 0,255,255 100 270 0,255,0 250 270 0,255,0 400 270 0,255,0 600 270 0,0,0 150 110 0,0,0 400 110 255,255,128 650 110 153,102,51 900 110 51,102,153 1100 110 255,153,0 1200 110 153,0,255
 PIXELES_deko_imagen := 100 50 100,50,86 159 159 159,159,0 37 140 37,140,169 300 300 0,0,0
 PIXELES_deko_console := 0 0 0,0,0 231 21 191,191,191 56 98 0,127,0 133 357 255,0,0 357 357 64,0,0 168 385 255,255,0 133 406 0,0,255
 # deko_examples (los 9 ejemplos oficiales de deko3d, elegidos desde su menú con NX_PULSAR). Varios

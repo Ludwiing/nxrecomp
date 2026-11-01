@@ -29,7 +29,8 @@ Se marca [x] lo hecho.
    que la etapa anterior no escribe = (0,0,0,1), [x] render targets que el shader no escribe quedan
    intactos, [x] draws sin render target, [x] rasterizador apagado. Falta: early-Z forzado,
    alpha-to-coverage.
-8. [ ] Render targets en capas (gl_Layer), limpieza por capa.
+8. [x] Render targets en capas (arreglos con gl_Layer desde vértices, teselación o geometría),
+   limpieza por capa (ClearBuffers bits 10-20), profundidad en capas, vistas de arreglos.
 9. [ ] Transform feedback.
 10. [~] Raster y samplers: [x] logic op, [x] alpha test, [x] depth clamp (ViewVolumeClipControl),
     [x] cubos sin costuras, [x] reducción min/max (TSC palabra 1, bits 10-11, confirmado con
