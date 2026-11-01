@@ -24,12 +24,15 @@ static uint32_t common_state(ServiceObject *self, NxRequest *r) {
         nx_out_copy_handle(r, msg_event_h);
         return OK;
     case 1: return R_AM_NO_MESSAGE;           // ReceiveMessage
-    case 5: nx_out8(r, 1); return OK;         // GetOperationMode: 1 = en la base
-    case 6: nx_out32(r, 1); return OK;        // GetPerformanceMode: 1 = rendimiento de base
+    case 5: nx_out8(r, nx_en_base()); return OK;  // GetOperationMode: 0 portátil, 1 en la base
+    case 6: nx_out32(r, nx_en_base()); return OK; // GetPerformanceMode: van juntos
     case 8: nx_out8(r, 0); return OK;         // GetBootMode
     case 9: nx_out8(r, 1); return OK;         // GetCurrentFocusState: con el foco
     case 50: nx_out8(r, 0); return OK;        // IsVrModeEnabled
-    case 60: nx_out32(r, 1920); nx_out32(r, 1080); return OK; // GetDefaultDisplayResolution
+    case 60: // GetDefaultDisplayResolution
+        nx_out32(r, nx_en_base() ? 1920 : 1280);
+        nx_out32(r, nx_en_base() ? 1080 : 720);
+        return OK;
     case 61: { KEvent *e; nx_out_copy_handle(r, nx_event_new(&e)); return OK; }
     case 66: return OK;                       // SetCpuBoostMode
     }

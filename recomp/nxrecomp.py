@@ -211,6 +211,7 @@ def main():
     ap.add_argument("--base", type=lambda s: int(s, 0), default=0x08000000,
                     help="dirección del primer módulo (por defecto 0x08000000)")
     ap.add_argument("--traza", action="store_true", help="guardar en c->pc la dirección de cada instrucción")
+    ap.add_argument("--progreso", action="store_true", help="líneas \"progreso i/n\" al escribir las funciones (para la app)")
     args = ap.parse_args()
     global TRACE
     TRACE = args.traza
@@ -244,7 +245,10 @@ def main():
             nfiles += 1
             buf = []
 
-    for f in sorted(entries):
+    paso = max(1, len(entries) // 200)
+    for k, f in enumerate(sorted(entries)):
+        if args.progreso and k % paso == 0:
+            print(f"progreso {k}/{len(entries)}", flush=True)
         emit_function(prog, f, strong, buf, stats)
         if len(buf) > LINES_PER_FILE:
             flush()

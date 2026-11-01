@@ -16,6 +16,11 @@ ServiceObject *nx_object(const char *name, uint32_t (*fn)(ServiceObject *, NxReq
     return o;
 }
 
+int nx_en_base(void) {
+    const char *m = getenv("NX_MODO");
+    return !(m && (!strcmp(m, "portatil") || !strcmp(m, "portátil") || !strcmp(m, "0")));
+}
+
 uint64_t nx_lang_code(const char *s) {
     uint64_t v = 0;
     memcpy(&v, s, strlen(s) < 8 ? strlen(s) : 8);
@@ -88,7 +93,7 @@ static uint32_t apm_handle(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
     case 0: nx_out_object(r, nx_object("apm ISession", apm_session_handle, NULL)); return 0; // OpenSession
-    case 1: nx_out32(r, 0); return 0;          // GetPerformanceMode: 0 = portátil
+    case 1: nx_out32(r, nx_en_base()); return 0; // GetPerformanceMode: 0 normal (portátil), 1 base
     case 6: nx_out8(r, 0); return 0;           // IsEnabledSustainedPerformanceMode
     }
     return NX_R_UNKNOWN_CMD;

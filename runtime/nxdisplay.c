@@ -121,7 +121,12 @@ void nx_display_run(void) {
     SDL_Renderer *ren = NULL;
     SDL_Texture *tex = NULL;
     int tex_w = 0, tex_h = 0;
-    if (!SDL_CreateWindowAndRenderer("nxrecomp", 1280, 720, SDL_WINDOW_RESIZABLE, &win, &ren)) {
+    // NX_TITULO: el nombre del juego (lo pone NX2Linux); NX_PANTALLA_COMPLETA=1 abre a pantalla
+    // completa. F11 la alterna.
+    const char *titulo = getenv("NX_TITULO");
+    int completa = getenv("NX_PANTALLA_COMPLETA") && *getenv("NX_PANTALLA_COMPLETA") == '1';
+    if (!SDL_CreateWindowAndRenderer(titulo && *titulo ? titulo : "nxrecomp", 1280, 720,
+                                     SDL_WINDOW_RESIZABLE | (completa ? SDL_WINDOW_FULLSCREEN : 0), &win, &ren)) {
         fprintf(stderr, "[nxrt] no pude crear la ventana: %s\n", SDL_GetError());
         for (;;) pause();
     }
@@ -132,6 +137,11 @@ void nx_display_run(void) {
             if (ev.type == SDL_EVENT_QUIT) {
                 fflush(stdout);
                 _exit(0);
+            }
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F11 && !ev.key.repeat) {
+                completa = !completa;
+                SDL_SetWindowFullscreen(win, completa);
+                continue;
             }
             nx_input_event(&ev);
         }

@@ -51,6 +51,8 @@ uint64_t nx_in64(NxRequest *r, uint32_t off);
 ServiceObject *nx_service_sm(void);
 ServiceObject *nx_object(const char *name, uint32_t (*fn)(ServiceObject *, NxRequest *), void *state);
 uint64_t nx_lang_code(const char *s);
+// Modo de la consola (NX_MODO=base|portatil, por defecto base): 1 en la base, 0 portátil.
+int nx_en_base(void);
 
 // Servicios por archivo
 uint32_t nx_am_oe(ServiceObject *self, NxRequest *r);
