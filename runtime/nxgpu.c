@@ -147,6 +147,7 @@ typedef struct {
     int indexed;
     NxDraw pend;             // draw pendiente: las instancias seguidas del mismo draw se juntan
     int pending;
+    uint32_t shadow[REGS];   // "shadow RAM": copia de los registros que MmeShadowRamControl graba o repone
 } Engine3D;
 
 static Engine3D e3d;
@@ -275,6 +276,7 @@ static uint8_t unorm8(float f) { return (uint8_t)lrintf((f < 0 ? 0 : f > 1 ? 1 :
 
 static void clear_buffers(uint32_t v) {
     uint32_t *R = e3d.regs;
+    if (nx_gl_clear(R, v)) return;
     if (!(v & 0x3C)) return; // solo profundidad/stencil: todavía sin superficies de profundidad
     uint32_t t = v >> 6 & 15;
     uint32_t base = 0x200 + t * 0x10;
@@ -353,6 +355,13 @@ static void method_3d(uint32_t m, uint32_t v) {
         }
         if (e3d.nmacro_params < 0x1000) e3d.macro_params[e3d.nmacro_params++] = v;
         return;
+    }
+    // MmeShadowRamControl (0x049): 0 y 1 graban cada escritura en la shadow RAM, 2 no la toca y
+    // 3 (Replay) ignora el valor recibido y repone el grabado.
+    if (m != 0x049) {
+        uint32_t modo = e3d.regs[0x049];
+        if (modo == 0 || modo == 1) e3d.shadow[m] = v;
+        else if (modo == 3) v = e3d.shadow[m];
     }
     if (traza_gpu) fprintf(stderr, "[gpu] 3d %03x = %08x\n", m, v);
     if (e3d.pending && m != 0x585 && m != 0x586 && m != 0x35D && m != 0x35E && m != 0x5F7 && m != 0x5F8) draw_flush();
@@ -442,6 +451,84 @@ static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
 }
 
 static uint32_t puller_regs[0x40];
+static uint32_t comp[REGS]; // registros del motor de cómputo
+
+// ---------- motor 2D (0x902D): blits con escala ----------
+static uint32_t r2d[0x300];
+
+static uint32_t fmt_bpp(uint32_t f) { // bytes por píxel de un formato de superficie de color
+    if (f >= 0xC0 && f <= 0xC5) return 16;
+    if (f >= 0xC6 && f <= 0xCE) return 8;
+    if (f >= 0xCF && f <= 0xE7) return 4;
+    if (f >= 0xE8 && f <= 0xF2) return 2;
+    if (f >= 0xF3 && f <= 0xF7) return 1;
+    return 4;
+}
+static int fmt_bgra(uint32_t f) { return f == 0xCF || f == 0xD0 || f == 0xE6 || f == 0xE7 || f == 0xDF; }
+
+static uint8_t *px2d(int base, int bl, uint32_t x, uint32_t y, uint32_t bpp) {
+    uint32_t *R = r2d;
+    uint64_t addr = (uint64_t)R[base + 8] << 32 | R[base + 9];
+    uint32_t w = R[base + 6], h = R[base + 7];
+    if (x >= w || y >= h) return NULL;
+    uint64_t off;
+    if (!bl) off = (uint64_t)y * R[base + 5] + (uint64_t)x * bpp;
+    else off = nx_bl_offset(x * bpp, y, (w * bpp + 63) / 64, R[base + 2] >> 4 & 7);
+    return nx_gpu_ptr(addr + off);
+}
+
+static void blit2d(void) {
+    uint32_t *R = r2d;
+    // Destino en 0x080-0x089, origen en 0x08C-0x095 con el mismo orden (formato, layout, bloque, ...).
+    uint32_t df = R[0x80], sf = R[0x8C], db = fmt_bpp(df), sb = fmt_bpp(sf);
+    int dbl = !(R[0x81] & 1), sbl = !(R[0x8D] & 1);
+    int64_t dudx = (int64_t)((uint64_t)R[0x231] << 32 | R[0x230]), dvdy = (int64_t)((uint64_t)R[0x233] << 32 | R[0x232]);
+    int64_t sx0 = (int64_t)((uint64_t)R[0x235] << 32 | R[0x234]), sy0 = (int64_t)((uint64_t)R[0x237] << 32 | R[0x236]);
+    uint32_t dx0 = R[0x22C], dy0 = R[0x22D], dw = R[0x22E], dh = R[0x22F];
+    int bilineal = R[0x223] >> 4 & 1, centro = !(R[0x223] & 1);
+    if (R[0xAB] != 3 && R[0xAB] != 0) {
+        static int avisado;
+        if (!avisado++) fprintf(stderr, "[RED] GPU: operación del motor 2D %u (se copia)\n", R[0xAB]);
+    }
+    uint64_t dsp = (uint64_t)R[0x86] * R[0x87] * db + 0x10000, ssp = (uint64_t)R[0x92] * R[0x93] * sb + 0x10000;
+    nx_gl_cpu_write((uint64_t)R[0x94] << 32 | R[0x95], ssp);
+    nx_gl_cpu_write((uint64_t)R[0x88] << 32 | R[0x89], dsp);
+    int swap = fmt_bgra(df) != fmt_bgra(sf) && db == 4 && sb == 4;
+    for (uint32_t y = 0; y < dh; y++)
+        for (uint32_t x = 0; x < dw; x++) {
+            uint8_t *d = px2d(0x80, dbl, dx0 + x, dy0 + y, db);
+            if (!d) continue;
+            // Posición en el origen, en 32.32: la esquina del píxel (más medio paso si el origen es el centro).
+            int64_t u = sx0 + (int64_t)x * dudx + (centro ? dudx / 2 : 0), v = sy0 + (int64_t)y * dvdy + (centro ? dvdy / 2 : 0);
+            uint8_t out[16];
+            if (bilineal && sb == 4 && db == 4) {
+                int64_t uf = u - (1ll << 31), vf = v - (1ll << 31); // centros de texel en +0.5
+                int32_t ui = (int32_t)(uf >> 32), vi = (int32_t)(vf >> 32);
+                uint32_t fu = (uint32_t)(uf >> 24) & 0xFF, fv = (uint32_t)(vf >> 24) & 0xFF;
+                uint8_t *p[4];
+                for (int k = 0; k < 4; k++) {
+                    int32_t xx = ui + (k & 1), yy = vi + (k >> 1);
+                    p[k] = px2d(0x8C, sbl, xx < 0 ? 0 : xx, yy < 0 ? 0 : yy, sb);
+                    if (!p[k]) p[k] = px2d(0x8C, sbl, ui < 0 ? 0 : ui, vi < 0 ? 0 : vi, sb);
+                }
+                if (!p[0]) continue;
+                for (int c = 0; c < 4; c++) {
+                    uint32_t a = p[0][c] * (256 - fu) + (p[1] ? p[1][c] : p[0][c]) * fu;
+                    uint32_t b = (p[2] ? p[2][c] : p[0][c]) * (256 - fu) + (p[3] ? p[3][c] : p[0][c]) * fu;
+                    out[c] = (uint8_t)((a * (256 - fv) + b * fv + 32768) >> 16);
+                }
+            } else {
+                uint8_t *s = px2d(0x8C, sbl, (uint32_t)(u >> 32), (uint32_t)(v >> 32), sb);
+                if (!s) continue;
+                memcpy(out, s, sb < 16 ? sb : 16);
+            }
+            if (swap) {
+                uint8_t tmp = out[0];
+                out[0] = out[2], out[2] = tmp;
+            }
+            memcpy(d, out, db <= sb ? db : sb);
+        }
+}
 
 // ---------- motor de copia (DMA, 0xB0B5) ----------
 static uint32_t dma[0x200];
@@ -513,7 +600,18 @@ static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
     uint32_t cls = subch_class[subch];
     if (cls != CLASS_3D) draw_flush(); // otro motor: el draw pendiente del 3D va antes
     if (cls == CLASS_3D) method_3d(m, v);
-    else if (cls == CLASS_DMA) {
+    else if (cls == CLASS_2D) {
+        if (m < 0x300) r2d[m] = v;
+        if (m == 0x237) blit2d();
+    } else if (cls == CLASS_COMPUTE) {
+        if (m < REGS) comp[m] = v;
+        if (m >= 0x60 && m <= 0x6D) method_3d(m, v); // la carga en línea es la misma que la del 3D
+        else if (m == 0x0AF) { // SendSignalingPcasB: lanzar la QMD que nombró SendPcasA
+            uint64_t avail;
+            const uint32_t *q = nx_gpu_ptr_n((uint64_t)comp[0x0AD] << 8, &avail);
+            if (q && avail >= 256) nx_gl_dispatch(comp, q);
+        }
+    } else if (cls == CLASS_DMA) {
         if (m < 0x200) dma[m] = v;
         if (m == 0x0C0) dma_launch(v);
     }

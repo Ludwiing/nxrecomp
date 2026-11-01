@@ -14,10 +14,25 @@ LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic deko_console)
 PIXELES_deko_basic := 0 0 32,75,122 1270 10 32,75,122 640 360 127,64,64 640 20 248,3,4 100 700 7,231,17 1180 700 7,16,232
 # deko_console: texto con una textura de fuente (arreglo 2D subido con el motor de copia), 3600 instancias.
 PIXELES_deko_console := 0 0 0,0,0 231 21 191,191,191 56 98 0,127,0 133 357 255,0,0 357 357 64,0,0 168 385 255,255,0 133 406 0,0,255
+# deko_examples (los 9 ejemplos oficiales de deko3d, elegidos desde su menú con NX_PULSAR). Varios
+# están animados: se comprueba la fracción de píxeles dibujados y su color medio. Necesita glm
+# (switch-glm, o sus cabeceras en ~/src/glm).
+DEKO_EJEMPLOS := $(if $(and $(wildcard $(DEVKITPRO)/libnx),$(wildcard $(DEVKITPRO)/portlibs/switch/include/glm $(HOME)/src/glm/glm)),1 2 3 4 5 6 7 8 9)
+EJEMPLO_1 := 0.95 1.0 31,92,32 25
+EJEMPLO_2 := 0.45 0.55 84,84,84 20
+EJEMPLO_3 := 0.10 0.35
+EJEMPLO_4 := 0.10 0.35 141,124,109 40
+EJEMPLO_5 := 0.03 0.09
+EJEMPLO_6 := 0.10 0.35
+EJEMPLO_7 := 0.08 0.30 114,97,42 35
+EJEMPLO_8 := 0.08 0.30 115,99,43 35
+EJEMPLO_9 := 0.005 0.05
+
 # Shaders de prueba: GLSL → uam (el compilador de deko3d) → código Maxwell → nxshader → GLSL, y la
 # imagen tiene que ser la misma que la del GLSL original en la GPU de esta máquina.
 UAM := $(DEVKITPRO)/tools/bin/uam
 SHADERS := $(if $(wildcard $(UAM)),$(patsubst tests/shaders/%.frag,%,$(wildcard tests/shaders/*.frag)))
+SHADERS_COMP := $(if $(wildcard $(UAM)),$(patsubst tests/shaders/%.comp,%,$(wildcard tests/shaders/*.comp)))
 # Mandos: un guion aprieta botones en cuadros fijos y se compara lo que el programa vio.
 LIBNX_MANDOS := $(if $(wildcard $(DEVKITPRO)/libnx),mandos)
 PULSAR := 10:a,20:b+x,30:up,40:zl+r,50:minus,60:plus
@@ -44,7 +59,7 @@ RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runt
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(if $(DEKO_EJEMPLOS),$(B)/libnx_deko_examples) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh) $(SHADERS_COMP:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -109,6 +124,15 @@ $(B)/shaders/%.dksh: tests/shaders/%.frag
 	@mkdir -p $(B)/shaders
 	$(UAM) -s frag -o $@ $< 2>/dev/null
 
+$(B)/shaders/%.dksh: tests/shaders/%.comp
+	@mkdir -p $(B)/shaders
+	$(UAM) -s comp -o $@ $< 2>/dev/null
+
+$(B)/libnx_deko_examples: guest/libnx/deko_examples/source/main.cpp $(RECOMP) $(RUNTIME) $(RUNTIME_H) | $(B)
+	DEVKITPRO=$(DEVKITPRO) $(MAKE) -s -C guest/libnx/deko_examples >/dev/null
+	python3 recomp/nxrecomp.py guest/libnx/deko_examples/deko_examples.nro -o $(B)/libnx_deko_examples_rec >/dev/null
+	python3 tools/compilar.py $(B)/libnx_deko_examples_rec -o $@ >/dev/null
+
 $(B)/libnx_%: guest/libnx/%/source/main.c $(RECOMP) $(RUNTIME) $(RUNTIME_H) | $(B)
 	DEVKITPRO=$(DEVKITPRO) $(MAKE) -s -C guest/libnx/$* >/dev/null
 	python3 recomp/nxrecomp.py guest/libnx/$*/$*.nro -o $(B)/libnx_$*_rec >/dev/null
@@ -132,6 +156,14 @@ test: all
 		if [ "$$(sha256sum < $(B)/$$p.ppm | cut -d' ' -f1)" = "$$(cat guest/esperado/$$p.sha256)" ]; then \
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
+	if [ -n "$(SHADERS_COMP)" ]; then \
+		if $(B)/shader_test --comparar-comp $(foreach s,$(SHADERS_COMP),tests/shaders/$(s).comp $(B)/shaders/$(s).dksh); then \
+			echo "OK: los $(words $(SHADERS_COMP)) shaders de cómputo traducidos escriben lo mismo que su GLSL original"; \
+		else echo "MAL: algún shader de cómputo traducido escribe otra cosa"; ok=0; fi; \
+	fi; \
+	$(foreach n,$(DEKO_EJEMPLOS),tools/deko_ejemplo.sh $(n) $(B)/deko_ejemplo$(n).ppm >/dev/null 2>&1; \
+		if python3 tools/imagen.py $(B)/deko_ejemplo$(n).ppm $(EJEMPLO_$(n)); then \
+			echo "OK: deko_examples $(n) dibujó lo esperado"; else echo "MAL: deko_examples $(n) dibujó otra cosa"; ok=0; fi;) \
 	if [ -n "$(SHADERS)" ]; then \
 		if $(B)/shader_test --comparar $(foreach s,$(SHADERS),tests/shaders/$(s).frag $(B)/shaders/$(s).dksh); then \
 			echo "OK: los $(words $(SHADERS)) shaders de prueba traducidos dibujan lo mismo que su GLSL original"; \

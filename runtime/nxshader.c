@@ -50,7 +50,7 @@ typedef struct {
     NxShaderInfo *info;
     uint32_t sph[20];
     uint8_t *visited, *leader;
-    int uses_flow, uses_stack, uses_local, local_words, uses_discard;
+    int uses_flow, uses_stack, uses_local, local_words, uses_discard, uses_shared;
     uint8_t reg_used[256];
     uint32_t in_flat, in_linear; // atributos de entrada del fragmento por modo de interpolación
     uint32_t out_comps[32];
@@ -220,44 +220,78 @@ static void set_zn(T *t, const char *res) {
 
 // ---------- atributos ----------
 
-static char *attr_load(T *t, int a, int out) {
-    if (t->stage == NX_SH_FRAGMENT) {
-        if (a >= 0x70 && a < 0x80) return U(t, S(t, "gl_FragCoord.%c", "xyzw"[(a >> 2) & 3]));
+// Primitiva de entrada de la geometría (NX_GS_*): vértices y nombre en GLSL.
+static int gs_in_vertices(int p) { static const int n[] = {1, 2, 4, 3, 6}; return p >= 0 && p < 5 ? n[p] : 3; }
+static const char *gs_in_name(int p) {
+    static const char *n[] = {"points", "lines", "lines_adjacency", "triangles", "triangles_adjacency"};
+    return p >= 0 && p < 5 ? n[p] : "triangles";
+}
+
+// Etapas cuyas entradas son arreglos de vértices (gl_in[], in_attrN[]).
+static int por_vertice(int st) { return st == NX_SH_TESS_CTRL || st == NX_SH_TESS_EVAL || st == NX_SH_GEOMETRY; }
+
+// Lee el atributo de dirección `a`. `vtx`: índice de vértice (etapas por vértice); `out`: leer una
+// salida (control de teselación); `patch`: atributo por parche (niveles de teselación).
+static char *attr_load(T *t, int a, int out, const char *vtx, int patch) {
+    int st = t->stage;
+    char c = "xyzw"[(a >> 2) & 3];
+    if (patch) {
+        if (a < 0x10) return U(t, S(t, "gl_TessLevelOuter[%d]", a >> 2));
+        if (a < 0x18) return U(t, S(t, "gl_TessLevelInner[%d]", (a - 0x10) >> 2));
+        red(t, S(t, "atributo por parche 0x%x", a));
+        return (char *)"0u";
+    }
+    if (st == NX_SH_FRAGMENT) {
+        if (a >= 0x70 && a < 0x80) return U(t, S(t, "gl_FragCoord.%c", c));
         if (a == 0x3FC) return (char *)"(gl_FrontFacing ? 0xffffffffu : 0u)";
-        if (a == 0x60) return (char *)"uint(gl_PrimitiveID)";
-        if (a == 0x64) return (char *)"uint(gl_Layer)";
         if (a == 0x2E0 || a == 0x2E4) return U(t, S(t, "gl_PointCoord.%c", "xy"[(a >> 2) & 1]));
-    } else {
+    }
+    if (st == NX_SH_VERTEX) {
         if (a == 0x2FC) return (char *)"uint(gl_VertexID)";
         if (a == 0x2F8) { // las instancias de varios draws se juntan en uno: nx_inst0 es la primera
             t->info->uses_instance = 1;
             return (char *)"(uint(gl_InstanceID) + nx_inst0)";
         }
     }
-    if (a >= 0x80 && a < 0x280 && !out) {
-        int i = (a - 0x80) >> 4, c = (a >> 2) & 3;
+    if (st == NX_SH_TESS_EVAL && (a == 0x2F0 || a == 0x2F4)) return U(t, S(t, "gl_TessCoord.%c", "xy"[(a >> 2) & 1]));
+    if (a == 0x60 && st != NX_SH_VERTEX) return (char *)"uint(gl_PrimitiveID)";
+    if (a == 0x64 && st == NX_SH_FRAGMENT) return (char *)"uint(gl_Layer)";
+    const char *idx = por_vertice(st) ? S(t, "[%s]", out && st == NX_SH_TESS_CTRL ? (vtx ? vtx : "gl_InvocationID") : vtx ? vtx : "0") : "";
+    if (a >= 0x70 && a < 0x80) {
+        if (out) return U(t, st == NX_SH_TESS_CTRL ? S(t, "gl_out%s.gl_Position.%c", idx, c) : S(t, "gl_Position.%c", c));
+        if (por_vertice(st)) return U(t, S(t, "gl_in%s.gl_Position.%c", idx, c));
+    }
+    if (a >= 0x80 && a < 0x280) {
+        int i = (a - 0x80) >> 4;
+        if (out) {
+            t->info->outputs |= 1u << i;
+            t->out_comps[i] |= 1u << ((a >> 2) & 3);
+            return U(t, S(t, "out_attr%d%s.%c", i, st == NX_SH_TESS_CTRL ? idx : "", c));
+        }
         t->info->inputs |= 1u << i;
-        if (t->stage == NX_SH_VERTEX && t->key->attr_int[i]) return S(t, "uint(in_attr%d.%c)", i, "xyzw"[c]);
-        return U(t, S(t, "in_attr%d.%c", i, "xyzw"[c]));
+        if (st == NX_SH_VERTEX && t->key->attr_int[i]) return S(t, "uint(in_attr%d.%c)", i, c);
+        return U(t, S(t, "in_attr%d%s.%c", i, idx, c));
     }
-    if (a >= 0x80 && a < 0x280 && out) {
-        int i = (a - 0x80) >> 4, c = (a >> 2) & 3;
-        t->info->outputs |= 1u << i;
-        t->out_comps[i] |= 1u << c;
-        return U(t, S(t, "out_attr%d.%c", i, "xyzw"[c]));
-    }
-    if (a >= 0x70 && a < 0x80 && out) return U(t, S(t, "gl_Position.%c", "xyzw"[(a >> 2) & 3]));
     red(t, S(t, "atributo 0x%x sin leer", a));
     return (char *)"0u";
 }
-static void attr_store(T *t, int a, const char *v) {
+static void attr_store(T *t, int a, const char *v, int patch) {
+    int st = t->stage;
+    const char *inv = st == NX_SH_TESS_CTRL ? "[gl_InvocationID]" : "";
+    if (patch) {
+        if (a < 0x10) L(t, "gl_TessLevelOuter[%d] = uintBitsToFloat(%s);", a >> 2, v);
+        else if (a < 0x18) L(t, "gl_TessLevelInner[%d] = uintBitsToFloat(%s);", (a - 0x10) >> 2, v);
+        else red(t, S(t, "atributo por parche 0x%x sin escribir", a));
+        return;
+    }
     if (a >= 0x70 && a < 0x80) {
-        L(t, "gl_Position.%c = uintBitsToFloat(%s);", "xyzw"[(a >> 2) & 3], v);
+        L(t, "%s.%c = uintBitsToFloat(%s);", st == NX_SH_TESS_CTRL ? "gl_out[gl_InvocationID].gl_Position" : "gl_Position",
+          "xyzw"[(a >> 2) & 3], v);
     } else if (a >= 0x80 && a < 0x280) {
         int i = (a - 0x80) >> 4, c = (a >> 2) & 3;
         t->info->outputs |= 1u << i;
         t->out_comps[i] |= 1u << c;
-        L(t, "out_attr%d.%c = uintBitsToFloat(%s);", i, "xyzw"[c], v);
+        L(t, "out_attr%d%s.%c = uintBitsToFloat(%s);", i, inv, "xyzw"[c], v);
     } else if (a == 0x6C) {
         t->writes_psize = 1;
         L(t, "gl_PointSize = uintBitsToFloat(%s);", v);
@@ -372,20 +406,27 @@ static void jump(T *t, const char *cond, const char *to) {
 // ---------- instrucciones ----------
 
 static void emit_ald(T *t) {
-    if (G(P) == 1 || (G(Imm11) == 0 && G(SrcA) != 255)) {
-        red(t, "ALD indexado");
+    if (G(P) != 1 && G(Imm11) == 0 && G(SrcA) != 255) {
+        red(t, "ALD con dirección en registro");
         return;
     }
-    int n = (int)G(AlSize) + 1, d = (int)G(Dest), a = (int)G(Imm11);
-    for (int k = 0; k < n && d + k < 255; k++) WR(t, d + k, attr_load(t, a + k * 4, G(O) == 1));
+    int n = (int)G(AlSize) + 1, d = (int)G(Dest), a = (int)G(Imm11), patch = G(P) == 1;
+    const char *vtx = NULL;
+    L(t, "{");
+    if (por_vertice(t->stage) && G(SrcB) != 255) L(t, "uint vi = %s;", R(t, G(SrcB))), vtx = "vi";
+    for (int k = 0; k < n; k++)
+        if (d + k < 255) L(t, "uint v%d = %s;", k, attr_load(t, a + k * 4, G(O) == 1, vtx, patch));
+    for (int k = 0; k < n; k++)
+        if (d + k < 255) WR(t, d + k, S(t, "v%d", k));
+    L(t, "}");
 }
 static void emit_ast(T *t) {
-    if (G(P) == 1 || (G(Imm11) == 0 && G(SrcA) != 255)) {
-        red(t, "AST indexado");
+    if (G(P) != 1 && G(Imm11) == 0 && G(SrcA) != 255) {
+        red(t, "AST con dirección en registro");
         return;
     }
     int n = (int)G(AlSize) + 1, s = (int)G(SrcB), a = (int)G(Imm11);
-    for (int k = 0; k < n && s + k < 255; k++) attr_store(t, a + k * 4, R(t, s + k));
+    for (int k = 0; k < n && s + k < 255; k++) attr_store(t, a + k * 4, R(t, s + k), G(P) == 1);
 }
 static void emit_ipa(T *t) {
     if (G(Idx) == 1) {
@@ -393,7 +434,7 @@ static void emit_ipa(T *t) {
         return;
     }
     int a = (int)G(Imm10);
-    char *v = F(t, attr_load(t, a, 0));
+    char *v = F(t, attr_load(t, a, 0, NULL, 0));
     int fixed = !(a >= 0x80 && a < 0x280);
     if (!fixed) {
         int i = (a - 0x80) >> 4;
@@ -857,15 +898,23 @@ static void emit_s2r(T *t) {
     char *v;
     switch (G(SReg)) {
     case 0: v = "0u"; break;                              // LaneId
-    case 17: v = "0u"; break;                             // InvocationId
+    case 17: v = t->stage == NX_SH_TESS_CTRL || t->stage == NX_SH_GEOMETRY ? "uint(gl_InvocationID)" : "0u"; break;
+    case 29: // InvocationInfo: vértices por primitiva en los bits 16-23 (el índice de primitiva queda en 0)
+        v = t->stage == NX_SH_TESS_CTRL || t->stage == NX_SH_TESS_EVAL ? "(uint(gl_PatchVerticesIn) << 16)"
+          : t->stage == NX_SH_GEOMETRY ? S(t, "%du", gs_in_vertices(t->key->gs_input) << 16) : "0u";
+        break;
     case 18: v = "0x3f800000u"; break;                    // YDirection (1.0)
-    case 33: v = "gl_GlobalInvocationID.x"; break;
-    case 34: v = "gl_GlobalInvocationID.y"; break;
-    case 35: v = "gl_GlobalInvocationID.z"; break;
+    case 32: v = "(gl_LocalInvocationID.x | (gl_LocalInvocationID.y << 16) | (gl_LocalInvocationID.z << 26))"; break;
+    case 33: v = "gl_LocalInvocationID.x"; break;
+    case 34: v = "gl_LocalInvocationID.y"; break;
+    case 35: v = "gl_LocalInvocationID.z"; break;
+    case 37: v = "gl_WorkGroupID.x"; break;
+    case 38: v = "gl_WorkGroupID.y"; break;
+    case 39: v = "gl_WorkGroupID.z"; break;
     case 80: v = "0xffffffffu"; break;                    // EqMask etc. (un solo hilo)
     default: red(t, S(t, "S2R de SR%d", (int)G(SReg))); return;
     }
-    if (t->stage != NX_SH_COMPUTE && G(SReg) >= 33 && G(SReg) <= 35) v = "0u";
+    if (t->stage != NX_SH_COMPUTE && G(SReg) >= 32 && G(SReg) <= 39) v = "0u";
     WR(t, G(Dest), v);
 }
 static void emit_local(T *t, int store) {
@@ -1201,6 +1250,218 @@ static void emit_txq(T *t) {
     L(t, "}");
 }
 
+
+// ---------- memoria global, compartida y atómicos ----------
+//
+// La GPU accede a la memoria global con direcciones de 64 bits. Como hace Ryujinx, se busca de dónde
+// sale la base de la dirección: casi siempre es un descriptor de storage buffer que el driver dejó
+// en un constbuf (c[slot][offset]). Cada base distinta es un SSBO; el índice se calcula restando esa
+// base, leída del mismo constbuf en el shader.
+
+static int no_escribe(int op) {
+    switch (op) {
+    case MXOP_Stg: case MXOP_Sts: case MXOP_Stl: case MXOP_St: case MXOP_Red: case MXOP_Ast: case MXOP_Exit: case MXOP_Bra:
+    case MXOP_Sync: case MXOP_Brk: case MXOP_Kil: case MXOP_Ssy: case MXOP_Pbk: case MXOP_Nop: return 1;
+    }
+    return 0;
+}
+
+static int rastrear(T *t, uint32_t idx, int reg, int prof, int *slot, int *off) {
+    if (reg >= 255 || prof > 6) return 0;
+    uint32_t lim = idx > 400 ? idx - 400 : 1;
+    for (uint32_t i = idx; i-- > lim;) {
+        if (i % 4 == 0 || !t->visited[i]) continue;
+        uint64_t o;
+        int op = decode(t, i, &o);
+        if (no_escribe(op)) continue;
+        int64_t d = mx_get(op, MXF_Dest, o);
+        if (d == MX_NO) continue;
+        int64_t sz = mx_get(op, MXF_LsSize, o);
+        int ancho = op == MXOP_Ldc && sz == 5 ? 2 : 1;
+        if (!(reg >= d && reg < d + ancho)) continue;
+        switch (op) {
+        case MXOP_MovC:
+            *slot = (int)mx_get(op, MXF_CbufSlot, o), *off = (int)mx_get(op, MXF_CbufOffset, o) * 4;
+            return 1;
+        case MXOP_Ldc:
+            if (mx_get(op, MXF_SrcA, o) != 255) return 0;
+            *slot = (int)mx_get(op, MXF_CbufSlot, o), *off = (int)(int16_t)mx_get(op, MXF_CbufOffset, o) + (reg - (int)d) * 4;
+            return 1;
+        case MXOP_IaddC: case MXOP_Iadd3C: case MXOP_IscaddC: case MXOP_LopC:
+            *slot = (int)mx_get(op, MXF_CbufSlot, o), *off = (int)mx_get(op, MXF_CbufOffset, o) * 4;
+            return 1;
+        case MXOP_MovR:
+            return rastrear(t, i, (int)mx_get(op, MXF_SrcA, o), prof + 1, slot, off);
+        case MXOP_IaddR: case MXOP_Iadd3R: case MXOP_IscaddR: case MXOP_IaddI: case MXOP_Iadd32i: case MXOP_Iadd3I:
+        case MXOP_IscaddI: case MXOP_Iscadd32i: case MXOP_XmadR: case MXOP_XmadI: case MXOP_LopR: case MXOP_Lop3R:
+            if (rastrear(t, i, (int)mx_get(op, MXF_SrcA, o), prof + 1, slot, off)) return 1;
+            if (mx_get(op, MXF_SrcB, o) != MX_NO && rastrear(t, i, (int)mx_get(op, MXF_SrcB, o), prof + 1, slot, off)) return 1;
+            if (mx_get(op, MXF_SrcC, o) != MX_NO && rastrear(t, i, (int)mx_get(op, MXF_SrcC, o), prof + 1, slot, off)) return 1;
+            return 0;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// Prepara `a` (dirección), `i` (índice de palabra) y devuelve el nombre del arreglo del SSBO.
+static char *global_addr(T *t, int64_t ra, int64_t imm, int e, int write) {
+    int slot, off;
+    if (!rastrear(t, t->idx, (int)ra, 0, &slot, &off)) {
+        red(t, "acceso a memoria global sin base conocida");
+        return NULL;
+    }
+    NxShaderInfo *in = t->info;
+    int k;
+    for (k = 0; k < in->nssbo; k++)
+        if (in->ssbo[k].slot == slot && in->ssbo[k].offset == off) break;
+    if (k == in->nssbo) {
+        if (k == NX_MAX_SSBO) {
+            red(t, "demasiados storage buffers");
+            return NULL;
+        }
+        in->ssbo[k].slot = (uint8_t)slot, in->ssbo[k].offset = (uint16_t)off, in->nssbo++;
+    }
+    if (write) in->ssbo[k].written = 1;
+    t->info->cbufs |= 1u << slot;
+    char *lo = R(t, ra), *hi = e ? R(t, ra + 1) : (char *)"0u";
+    L(t, "uint64_t a = ((uint64_t(%s) << 32) | uint64_t(%s)) + uint64_t(%d);", hi, lo, (int)imm);
+    L(t, "uint64_t b = uint64_t(cb%d[%d].%c) | (uint64_t(cb%d[%d].%c) << 32);", slot, off >> 4, "xyzw"[(off >> 2) & 3], slot,
+      (off + 4) >> 4, "xyzw"[((off + 4) >> 2) & 3]);
+    L(t, "uint i = uint((a - b) >> 2);");
+    return S(t, "sb%d", k);
+}
+
+static void emit_ldst_global(T *t, int store) {
+    int64_t sz = G(LsSize), d = G(Dest);
+    int64_t imm = (int32_t)((uint32_t)G(Imm24) << 8) >> 8;
+    int nw = sz == 5 ? 2 : sz >= 6 ? 4 : 1;
+    L(t, "{");
+    char *sb = global_addr(t, G(SrcA), imm, G(E) == 1, store);
+    if (!sb) {
+        L(t, "}");
+        return;
+    }
+    if (sz < 4) { // 8 o 16 bits
+        int bits = sz < 2 ? 8 : 16;
+        if (store) {
+            L(t, "if (i < %s.length()) { uint sh = uint(a & 3u) * 8u; %s[i] = bitfieldInsert(%s[i], %s, int(sh), %d); }", sb, sb, sb,
+              R(t, d), bits);
+        } else {
+            L(t, "uint w = i < %s.length() ? %s[i] : 0u; int sh = int(a & 3u) * 8;", sb, sb);
+            WR(t, d, sz & 1 ? S(t, "uint(bitfieldExtract(int(w), sh, %d))", bits) : S(t, "bitfieldExtract(w, sh, %d)", bits));
+        }
+    } else if (store) {
+        for (int k = 0; k < nw; k++) L(t, "if (i + %du < %s.length()) %s[i + %du] = %s;", k, sb, sb, k, R(t, d + k));
+    } else {
+        for (int k = 0; k < nw; k++) L(t, "uint v%d = i + %du < %s.length() ? %s[i + %du] : 0u;", k, k, sb, sb, k);
+        for (int k = 0; k < nw; k++) WR(t, d + k, S(t, "v%d", k));
+    }
+    L(t, "}");
+}
+
+static void emit_ldst_shared(T *t, int store) {
+    int64_t sz = G(LsSize), d = G(Dest);
+    int64_t imm = (int32_t)((uint32_t)G(Imm24) << 8) >> 8;
+    int nw = sz == 5 ? 2 : sz >= 6 ? 4 : 1;
+    t->uses_shared = 1;
+    L(t, "{ uint a = %s + %du; uint i = a >> 2;", R(t, G(SrcA)), (int)imm);
+    if (sz < 4) {
+        int bits = sz < 2 ? 8 : 16;
+        if (store) L(t, "if (i < SMEM) smem[i] = bitfieldInsert(smem[i], %s, int((a & 3u) * 8u), %d);", R(t, d), bits);
+        else {
+            L(t, "uint w = i < SMEM ? smem[i] : 0u; int sh = int((a & 3u) * 8u);");
+            WR(t, d, sz & 1 ? S(t, "uint(bitfieldExtract(int(w), sh, %d))", bits) : S(t, "bitfieldExtract(w, sh, %d)", bits));
+        }
+    } else if (store) {
+        for (int k = 0; k < nw; k++) L(t, "if (i + %du < SMEM) smem[i + %du] = %s;", k, k, R(t, d + k));
+    } else {
+        for (int k = 0; k < nw; k++) L(t, "uint v%d = i + %du < SMEM ? smem[i + %du] : 0u;", k, k, k);
+        for (int k = 0; k < nw; k++) WR(t, d + k, S(t, "v%d", k));
+    }
+    L(t, "}");
+}
+
+// Operación atómica sobre `ref` (un uint de memoria) con el valor `v`; deja el valor viejo en `old`.
+static void atomico(T *t, const char *ref, int op, int sgn, int flt, const char *v) {
+    if (flt && op == 0) { // suma de floats: CAS en bucle
+        L(t, "uint old = %s; for (;;) { uint nv = floatBitsToUint(uintBitsToFloat(old) + uintBitsToFloat(%s)); uint got = atomicCompSwap(%s, old, nv); if (got == old) break; old = got; }", ref, v, ref);
+        return;
+    }
+    switch (op) {
+    case 0: L(t, "uint old = atomicAdd(%s, %s);", ref, v); return;
+    case 5: L(t, "uint old = atomicAnd(%s, %s);", ref, v); return;
+    case 6: L(t, "uint old = atomicOr(%s, %s);", ref, v); return;
+    case 7: L(t, "uint old = atomicXor(%s, %s);", ref, v); return;
+    case 8: L(t, "uint old = atomicExchange(%s, %s);", ref, v); return;
+    case 10: L(t, "uint old = atomicAdd(%s, %s);", ref, v); return;
+    case 1: case 2:
+        if (!sgn) {
+            L(t, "uint old = atomic%s(%s, %s);", op == 1 ? "Min" : "Max", ref, v);
+            return;
+        }
+        L(t, "uint old = %s; for (;;) { uint nv = uint(%s(int(old), int(%s))); uint got = atomicCompSwap(%s, old, nv); if (got == old) break; old = got; }",
+          ref, op == 1 ? "min" : "max", v, ref);
+        return;
+    case 3: case 4: // INC / DEC con tope
+        L(t, "uint old = %s; for (;;) { uint nv = %s; uint got = atomicCompSwap(%s, old, nv); if (got == old) break; old = got; }", ref,
+          op == 3 ? S(t, "old >= %s ? 0u : old + 1u", v) : S(t, "(old == 0u || old > %s) ? %s : old - 1u", v, v), ref);
+        return;
+    }
+    red(t, "operación atómica");
+    L(t, "uint old = 0u;");
+}
+
+static void emit_atom_global(T *t, int red_) {
+    int64_t op = red_ ? G(RedOp) : G(Op), size = red_ ? G(RedSize) : G(Size);
+    if (size == 2 || size == 5 || size == 4) {
+        red(t, "atómico de 64 bits o de media precisión");
+        return;
+    }
+    int64_t imm = (int32_t)((uint32_t)G(Imm20) << 12) >> 12;
+    L(t, "{");
+    char *sb = global_addr(t, G(SrcA), imm, G(E) == 1, 1);
+    if (!sb) {
+        L(t, "}");
+        return;
+    }
+    atomico(t, S(t, "%s[min(i, uint(%s.length()) - 1u)]", sb, sb), (int)op, size == 1, size == 3, R(t, G(SrcB)));
+    if (!red_) WR(t, G(Dest), "old");
+    L(t, "}");
+}
+
+static void emit_atom_shared(T *t) {
+    t->uses_shared = 1;
+    int64_t imm = G(Imm22);
+    L(t, "{ uint i = min((%s + %du) >> 2, SMEM - 1u);", R(t, G(SrcA)), (int)(imm == MX_NO ? 0 : imm * 4));
+    atomico(t, "smem[i]", (int)G(AtomOp), G(AtomsSize) == 1, 0, R(t, G(SrcB)));
+    WR(t, G(Dest), "old");
+    L(t, "}");
+}
+
+static void emit_atom_cas(T *t, int shared) {
+    // CAS: compara con B y escribe B+1 (registros consecutivos).
+    int64_t b = G(SrcB);
+    L(t, "{");
+    char *ref;
+    if (shared) {
+        t->uses_shared = 1;
+        L(t, "uint i = min(%s >> 2, SMEM - 1u);", R(t, G(SrcA)));
+        ref = "smem[i]";
+    } else {
+        char *sb = global_addr(t, G(SrcA), 0, G(E) == 1, 1);
+        if (!sb) {
+            L(t, "}");
+            return;
+        }
+        ref = S(t, "%s[min(i, uint(%s.length()) - 1u)]", sb, sb);
+    }
+    L(t, "uint old = atomicCompSwap(%s, %s, %s);", ref, R(t, b), R(t, b + 1));
+    WR(t, G(Dest), "old");
+    L(t, "}");
+}
+
 static void emit_insn(T *t) {
     switch (t->op) {
     case MXOP_Ald: emit_ald(t); break;
@@ -1250,6 +1511,22 @@ static void emit_insn(T *t) {
     case MXOP_I2iR: case MXOP_I2iI: case MXOP_I2iC: emit_i2i(t); break;
     case MXOP_S2r: emit_s2r(t); break;
     case MXOP_Ldl: emit_local(t, 0); break;
+    case MXOP_Ldg: emit_ldst_global(t, 0); break;
+    case MXOP_Stg: emit_ldst_global(t, 1); break;
+    case MXOP_Lds: emit_ldst_shared(t, 0); break;
+    case MXOP_Sts: emit_ldst_shared(t, 1); break;
+    case MXOP_Atom: emit_atom_global(t, 0); break;
+    case MXOP_Red: emit_atom_global(t, 1); break;
+    case MXOP_Atoms: emit_atom_shared(t); break;
+    case MXOP_AtomCas: emit_atom_cas(t, 0); break;
+    case MXOP_AtomsCas: emit_atom_cas(t, 1); break;
+    case MXOP_OutR: case MXOP_OutI: case MXOP_OutC: { // geometría: emitir el vértice y/o cortar la tira
+        int64_t ty = G(OutType);
+        if (ty & 1) L(t, "EmitVertex();");
+        if (ty & 2) L(t, "EndPrimitive();");
+        WR(t, G(Dest), "0u");
+        break;
+    }
     case MXOP_Tex: case MXOP_TexB: emit_tex(t); break;
     case MXOP_Texs: case MXOP_TexsF16: emit_texs(t); break;
     case MXOP_Tlds: case MXOP_TldsF16: emit_tlds(t); break;
@@ -1264,7 +1541,11 @@ static void emit_insn(T *t) {
         WP(t, G(VpDest), G(VoteMode) == 2 ? "true" : p);
         break;
     }
-    case MXOP_Nop: case MXOP_Depbar: case MXOP_Membar: case MXOP_Bar: break;
+    case MXOP_Nop: case MXOP_Depbar: case MXOP_Cctl: case MXOP_Cctll: break;
+    case MXOP_Membar: L(t, "memoryBarrier();"); break;
+    case MXOP_Bar:
+        if (t->stage == NX_SH_COMPUTE) L(t, "memoryBarrierShared(); barrier();");
+        break;
     case MXOP_Kil:
         t->uses_discard = 1;
         if (unconditional(t)) L(t, "discard;");
@@ -1312,16 +1593,32 @@ static void emit_insn(T *t) {
 static void header(T *t, Sb *h) {
     t->arena_n = 0;
     sb_add(h, "#version 460\n#extension GL_ARB_gpu_shader_int64 : enable\n");
-    if (t->stage == NX_SH_VERTEX) {
+    if (t->stage == NX_SH_VERTEX || por_vertice(t->stage)) {
+        int st = t->stage;
+        if (st == NX_SH_TESS_CTRL) sb_add(h, "layout(vertices = %u) out;\n", t->sph[2] >> 24 ? t->sph[2] >> 24 : 3);
+        if (st == NX_SH_TESS_EVAL) {
+            uint32_t m = t->key->tess_mode;
+            static const char *prim[] = {"isolines", "triangles", "quads", "triangles"};
+            static const char *esp[] = {"equal_spacing", "fractional_odd_spacing", "fractional_even_spacing", "equal_spacing"};
+            sb_add(h, "layout(%s, %s, %s) in;\n", prim[m & 3], esp[m >> 4 & 3], (m >> 8 & 3) == 1 && (m & 3) != 0 ? "cw" : "ccw");
+        }
+        if (st == NX_SH_GEOMETRY) {
+            uint32_t topo = t->sph[3] >> 24 & 15, maxv = t->sph[4] & 0xFFF;
+            sb_add(h, "layout(%s) in;\nlayout(%s, max_vertices = %u) out;\n", gs_in_name(t->key->gs_input),
+                   topo == 1 ? "points" : topo == 6 ? "line_strip" : "triangle_strip", maxv ? maxv : 1);
+        }
+        const char *arr = por_vertice(st) ? "[]" : "";
+        if (por_vertice(st)) sb_add(h, "in gl_PerVertex { vec4 gl_Position; float gl_PointSize; } gl_in[];\n");
         for (int i = 0; i < 32; i++)
             if (t->info->inputs >> i & 1)
-                sb_add(h, "layout(location = %d) in %s in_attr%d;\n", i,
-                       t->key->attr_int[i] == 1 ? "ivec4" : t->key->attr_int[i] == 2 ? "uvec4" : "vec4", i);
+                sb_add(h, "layout(location = %d) in %s in_attr%d%s;\n", i,
+                       st != NX_SH_VERTEX ? "vec4" : t->key->attr_int[i] == 1 ? "ivec4" : t->key->attr_int[i] == 2 ? "uvec4" : "vec4", i, arr);
         int nclip = 32 - __builtin_clz(t->clip_mask | 1);
-        sb_add(h, "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;%s };\n",
-               t->clip_mask ? S(t, " float gl_ClipDistance[%d];", nclip) : "");
+        const char *oarr = st == NX_SH_TESS_CTRL ? "[]" : "";
+        sb_add(h, "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;%s } %s;\n",
+               t->clip_mask ? S(t, " float gl_ClipDistance[%d];", nclip) : "", st == NX_SH_TESS_CTRL ? "gl_out[]" : "");
         for (int i = 0; i < 32; i++)
-            if (t->info->outputs >> i & 1) sb_add(h, "layout(location = %d) out vec4 out_attr%d;\n", i, i);
+            if (t->info->outputs >> i & 1) sb_add(h, "layout(location = %d) out vec4 out_attr%d%s;\n", i, i, oarr);
     } else if (t->stage == NX_SH_FRAGMENT) {
         for (int i = 0; i < 32; i++)
             if (t->info->inputs >> i & 1)
@@ -1332,6 +1629,15 @@ static void header(T *t, Sb *h) {
         for (int rt = 0; rt < 8; rt++)
             if (omap >> (rt * 4) & 15) sb_add(h, "layout(location = %d) out vec4 frag%d;\n", rt, rt);
     }
+    if (t->stage == NX_SH_COMPUTE)
+        sb_add(h, "layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;\n", t->key->local[0] ? t->key->local[0] : 1,
+               t->key->local[1] ? t->key->local[1] : 1, t->key->local[2] ? t->key->local[2] : 1);
+    if (t->uses_shared) {
+        uint32_t n = (t->key->shared_bytes + 3) / 4;
+        sb_add(h, "const uint SMEM = %uu;\nshared uint smem[SMEM];\n", n ? n : 1);
+    }
+    for (int k = 0; k < t->info->nssbo; k++)
+        sb_add(h, "layout(std430, binding = %d) buffer Sb%d { uint sb%d[]; };\n", t->key->sb_binding + k, k, k);
     for (int s = 0; s < 18; s++)
         if (t->info->cbufs >> s & 1)
             sb_add(h, "layout(std140, binding = %d) uniform Cb%d { uvec4 cb%d[4096]; };\n", t->key->cb_binding + s, s, s);
@@ -1350,7 +1656,7 @@ static void header(T *t, Sb *h) {
     if (t->stage == NX_SH_FRAGMENT)
         for (int rt = 0; rt < 8; rt++)
             if (t->sph[18] >> (rt * 4) & 15) sb_add(h, "    frag%d = vec4(0.0);\n", rt);
-    if (t->stage == NX_SH_VERTEX)
+    if (t->stage == NX_SH_VERTEX || t->stage == NX_SH_TESS_EVAL)
         for (int i = 0; i < 32; i++)
             if (t->info->outputs >> i & 1) sb_add(h, "    out_attr%d = vec4(0.0, 0.0, 0.0, 1.0);\n", i);
 }
@@ -1362,19 +1668,21 @@ char *nx_shader_glsl(const uint8_t *code, size_t avail, int stage, const NxShade
     t->info = info;
     t->key = key;
     t->stage = stage;
-    memcpy(t->sph, code, sizeof t->sph);
-    t->code = code + 0x50;
-    t->ninsn = (uint32_t)((avail - 0x50) / 8);
+    size_t hdr = stage == NX_SH_COMPUTE ? 0 : 0x50; // los de cómputo no tienen cabecera (la QMD hace de cabecera)
+    if (hdr) memcpy(t->sph, code, sizeof t->sph);
+    t->code = code + hdr;
+    t->ninsn = (uint32_t)((avail - hdr) / 8);
     if (t->ninsn > 0x40000) t->ninsn = 0x40000;
     t->visited = calloc(t->ninsn + 2, 1);
     t->leader = calloc(t->ninsn + 2, 1);
     t->local_words = (int)(((t->sph[1] & 0xFFFFFF) + (t->sph[2] & 0xFFFFFF)) / 4);
+    if (stage == NX_SH_COMPUTE) t->local_words = (int)(key->local_bytes / 4);
     if (t->local_words < 1) t->local_words = 1;
     if (t->local_words > 4096) t->local_words = 4096;
     discover(t);
     for (uint32_t i = t->ninsn; i-- > 0;)
         if (t->visited[i]) {
-            info->code_size = 0x50 + (i + 1) * 8;
+            info->code_size = (uint32_t)hdr + (i + 1) * 8;
             break;
         }
 

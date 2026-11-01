@@ -52,7 +52,7 @@ Hay dos ejemplos de audio:
 - `playtone` (`audout`) toca 220, 440 y 1760 Hz con A, B y X, y se compara el WAV.
 - `audren-simple` (el renderizador) tiene que sacar su `sample.bin` intacto, muestra por muestra, en los dos canales.
 
-Y dos de la GPU, con deko3d (el driver de bajo nivel de los homebrew modernos): `deko_basic` arranca el dispositivo, crea las colas, sube sus shaders y dibuja su triángulo de colores; `deko_console` dibuja una consola de texto con una textura de fuente (un arreglo 2D de 256 capas subido con el motor de copia) y 3600 instancias por cuadro. `make test` comprueba varios píxeles de cada uno.
+Y los de la GPU, con deko3d (el driver de bajo nivel de los homebrew modernos): `deko_basic` arranca el dispositivo, crea las colas, sube sus shaders y dibuja su triángulo de colores; `deko_console` dibuja una consola de texto con una textura de fuente (un arreglo 2D de 256 capas subido con el motor de copia) y 3600 instancias por cuadro. `make test` comprueba varios píxeles de cada uno. Además corren los 9 ejemplos de `deko_examples` (elegidos desde su menú con `NX_PULSAR`, `tools/deko_ejemplo.sh N`): triángulo con vertex buffer, cubo con profundidad, cubo con textura BC1, teselación en alambre, multisampling, iluminación en sRGB, deferred shading con varios render targets y un shader de cómputo que genera la geometría. Necesitan glm (`switch-glm` o sus cabeceras en `~/src/glm`); como están animados, se comprueba la fracción de píxeles dibujados y su color medio.
 
 Para probar uno nuevo: `tools/probar_libnx.sh <nombre>` lo compila, lo recompila con `--traza` y lo corre. Para depurar:
 - Con `NX_TRAZA_SVC=1` se ven las llamadas al kernel.
@@ -96,6 +96,7 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
     - Texturas: los handles del constbuf de texturas llevan al descriptor de imagen (TIC) y al de sampler (TSC). Se leen el formato (RGBA8, sRGB, float, enteros, BC1-BC7, profundidad...), el tipo (2D, 3D, cubo, arreglos), los mipmaps y el swizzle; se deshace el "block linear" de cada nivel y se suben a OpenGL con una caché que vuelve a mirar la memoria en cada envío. Un render target que se lee como textura se usa directo de la GPU. El traductor cubre TEX, TEXS, TLD, TLDS, TLD4, TLD4S y TXQ.
     - Motor de copia (DMA): copias entre memoria lineal y "block linear", con remapeo de componentes.
     - Las instancias que los drivers dibujan una por una se juntan en un draw instanciado.
+    - También: profundidad y stencil sincronizados con la memoria, limpiezas en la GPU, cuadriláteros, MSAA (se dibuja a resolución lógica y cada píxel se replica en sus muestras), motor 2D (blits con escala), shadow RAM de las macros, teselación, geometría, polígonos en alambre y offset, y shaders de cómputo con memoria global (cada base de dirección leída de un constbuf es un storage buffer, como en Ryujinx), compartida y atómicos.
     - Falta: ASTC (la mayoría de los juegos lo usa y las GPU de PC no lo leen), texturas enteras, half floats, motores 2D, de cómputo y de copia, profundidad sincronizada con la memoria, geometría y teselación, y un backend Vulkan.
 
   Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.

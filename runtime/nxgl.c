@@ -88,6 +88,7 @@ static int iniciar(void) {
     glNamedBufferData(vbo_ring, RING, NULL, GL_STREAM_DRAW);
     glNamedBufferData(ibo_ring, RING, NULL, GL_STREAM_DRAW);
     glVertexArrayElementBuffer(vao, ibo_ring);
+    glEnable(GL_FRAMEBUFFER_SRGB); // como la GPU: los render targets sRGB convierten al escribir
     estado = 1;
     return 1;
 }
@@ -117,6 +118,8 @@ typedef struct {
     uint32_t fmt;
     GLenum internal, format, type;
     uint32_t bpp;
+    int depth; // 0 color, 1 profundidad, 2 profundidad y stencil
+    int rot8;  // la memoria tiene la profundidad en los 24 bits bajos: rotar al subir y al bajar
 } Formato;
 
 static const Formato formatos[] = {
@@ -141,6 +144,14 @@ static const Formato formatos[] = {
     {0xEE, GL_R16, GL_RED, GL_UNSIGNED_SHORT, 2},
     {0xF2, GL_R16F, GL_RED, GL_HALF_FLOAT, 2},
     {0xF3, GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1},
+    // Superficies de profundidad (DepthTargetFormat), con códigos que no chocan con los de color.
+    {0x0A, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, 4, 1},
+    {0x13, GL_DEPTH_COMPONENT16, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 2, 1},
+    {0x14, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 2},
+    {0x15, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 2},
+    {0x16, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 2, 1},
+    {0x18, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 2},
+    {0x19, GL_DEPTH32F_STENCIL8, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 8, 2},
 };
 
 static const Formato *formato(uint32_t fmt) {
@@ -151,11 +162,19 @@ static const Formato *formato(uint32_t fmt) {
 
 typedef struct {
     uint64_t addr;
-    uint32_t w, h, fmt, tile;
+    uint32_t w, h, fmt, tile; // w y h son los de la imagen lógica (sin las muestras de MSAA)
     const Formato *f;
     GLuint tex;
     int stale, dirty;
+    uint32_t sx, sy; // muestras por píxel en x e y: en memoria cada píxel ocupa sx × sy
 } Rt;
+
+// Muestras de cada modo de MultisampleMode (maxwell::MsaaMode).
+static void msaa(uint32_t mode, uint32_t *sx, uint32_t *sy) {
+    static const uint8_t x[] = {1, 2, 2, 4, 4, 2, 4, 1, 2, 2, 4, 4}, y[] = {1, 1, 2, 2, 2, 1, 4, 1, 2, 2, 2, 2};
+    *sx = mode < 12 ? x[mode] : 1;
+    *sy = mode < 12 ? y[mode] : 1;
+}
 
 static Rt rts[64];
 static int nrts;
@@ -163,10 +182,11 @@ static uint8_t *tmp;
 static size_t tmp_cap;
 
 static uint64_t rt_bytes(const Rt *r) {
-    if (r->tile >> 12 & 1) return (uint64_t)r->w * r->f->bpp * r->h;
+    uint32_t w = r->w * r->sx, h = r->h * r->sy;
+    if (r->tile >> 12 & 1) return (uint64_t)w * r->f->bpp * h;
     uint32_t bh = 8u << (r->tile >> 4 & 15);
-    uint32_t gobs = (r->w * r->f->bpp + 63) / 64;
-    return (uint64_t)gobs * 64 * ((r->h + bh - 1) / bh * bh);
+    uint32_t gobs = (w * r->f->bpp + 63) / 64;
+    return (uint64_t)gobs * 64 * ((h + bh - 1) / bh * bh);
 }
 
 // Memoria del juego <-> imagen lineal (filas de w*bpp bytes).
@@ -179,6 +199,19 @@ static void rt_copia(Rt *r, uint8_t *lin, int a_memoria) {
         return;
     }
     uint32_t bpp = r->f->bpp, row = r->w * bpp;
+    if (r->sx > 1 || r->sy > 1) { // MSAA: se lee la primera muestra y se escribe en todas
+        uint32_t prow = r->w * r->sx * bpp, bhl = r->tile >> 4 & 15, gobs = (prow + 63) / 64, lin_ = r->tile >> 12 & 1;
+        for (uint32_t y = 0; y < r->h; y++)
+            for (uint32_t x = 0; x < r->w; x++)
+                for (uint32_t j = 0; j < (a_memoria ? r->sy : 1); j++)
+                    for (uint32_t i = 0; i < (a_memoria ? r->sx : 1); i++) {
+                        uint32_t px = x * r->sx + i, py = y * r->sy + j;
+                        uint64_t o = lin_ ? (uint64_t)py * prow + px * bpp : nx_bl_offset(px * bpp, py, gobs, bhl);
+                        if (a_memoria) memcpy(mem + o, lin + (uint64_t)y * row + x * bpp, bpp);
+                        else memcpy(lin + (uint64_t)y * row + x * bpp, mem + o, bpp);
+                    }
+        return;
+    }
     if (r->tile >> 12 & 1) {
         for (uint32_t y = 0; y < r->h; y++)
             if (a_memoria) memcpy(mem + (uint64_t)y * row, lin + (uint64_t)y * row, row);
@@ -200,10 +233,16 @@ static uint8_t *tmp_buf(size_t n) {
     return tmp;
 }
 
+static void rotar8(uint8_t *lin, size_t n, int izq) {
+    uint32_t *w = (uint32_t *)lin;
+    for (size_t i = 0; i < n / 4; i++) w[i] = izq ? w[i] << 8 | w[i] >> 24 : w[i] >> 8 | w[i] << 24;
+}
+
 static void rt_cargar(Rt *r) {
     if (traza) fprintf(stderr, "[nxgl] cargo el render target 0x%llx\n", (unsigned long long)r->addr);
     uint8_t *lin = tmp_buf((size_t)r->w * r->h * r->f->bpp);
     rt_copia(r, lin, 0);
+    if (r->f->rot8) rotar8(lin, (size_t)r->w * r->h * 4, 1);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTextureSubImage2D(r->tex, 0, 0, 0, r->w, r->h, r->f->format, r->f->type, lin);
     r->stale = 0;
@@ -215,13 +254,21 @@ static void rt_escribir(Rt *r) {
     uint8_t *lin = tmp_buf(n);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glGetTextureImage(r->tex, 0, r->f->format, r->f->type, (GLsizei)n, lin);
+    if (r->f->rot8) rotar8(lin, n, 0);
     rt_copia(r, lin, 1);
     r->dirty = 0;
 }
 
+static uint32_t modo_msaa; // MultisampleMode del draw o limpieza en curso
+
 static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32_t tile) {
+    uint32_t sx, sy;
+    msaa(modo_msaa, &sx, &sy);
+    w /= sx, h /= sy; // los registros dan el tamaño en muestras
+    if (!w || !h) return NULL;
     for (int i = 0; i < nrts; i++)
-        if (rts[i].addr == addr && rts[i].w == w && rts[i].h == h && rts[i].fmt == fmt && rts[i].tile == tile)
+        if (rts[i].addr == addr && rts[i].w == w && rts[i].h == h && rts[i].fmt == fmt && rts[i].tile == tile && rts[i].sx == sx &&
+            rts[i].sy == sy)
             return &rts[i];
     const Formato *f = formato(fmt);
     if (!f) {
@@ -249,9 +296,11 @@ static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32
         rts[0] = rts[--nrts];
     }
     Rt *r = &rts[nrts++];
-    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0};
+    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy};
     glCreateTextures(GL_TEXTURE_2D, 1, &r->tex);
     glTextureStorage2D(r->tex, 1, f->internal, w, h);
+    glTextureParameteri(r->tex, GL_TEXTURE_MAX_LEVEL, 0); // un solo nivel: completa aunque se lea sin sampler
+    glTextureParameteri(r->tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     return r;
 }
 
@@ -314,7 +363,9 @@ static Shader *shader(uint64_t addr, int stage, const NxShaderKey *key) {
     if (!glsl) return NULL;
     if (traza) fprintf(stderr, "[nxgl] shader de etapa %d en 0x%llx:\n%s", stage, (unsigned long long)addr, glsl);
     const char *src = glsl;
-    s->prog = glCreateShaderProgramv(stage == NX_SH_FRAGMENT ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, 1, &src);
+    static const GLenum tipos[] = {GL_VERTEX_SHADER, GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER,
+                                   GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER, GL_COMPUTE_SHADER};
+    s->prog = glCreateShaderProgramv(tipos[stage], 1, &src);
     GLint ok = 0;
     glGetProgramiv(s->prog, GL_LINK_STATUS, &ok);
     if (!ok) {
@@ -668,10 +719,10 @@ static GLuint sampler(const uint32_t *tsc) {
     return s;
 }
 
-static void texturas(const NxDraw *d, int stage, const NxShaderInfo *info, int base) {
-    const uint32_t *R = d->regs;
+// `R`: registros del motor (3D o cómputo, mismas posiciones); `cbs`: los constbufs de la etapa.
+static void texturas(const uint32_t *R, const uint64_t *cbs, int stage, const NxShaderInfo *info, int base) {
     int slot = R[0x982] & 7;
-    uint64_t cb = d->cb_addr[stage][slot];
+    uint64_t cb = cbs[slot];
     uint64_t tic_pool = (uint64_t)R[0x55D] << 32 | R[0x55E], tsc_pool = (uint64_t)R[0x557] << 32 | R[0x558];
     for (int i = 0; i < info->ntex; i++) {
         uint64_t avail;
@@ -684,6 +735,8 @@ static void texturas(const NxDraw *d, int stage, const NxShaderInfo *info, int b
             const uint32_t *sw = nx_gpu_ptr_n(tsc_pool + tsc * 32ull, &avail);
             if (sw && avail >= 32) smp = sampler(sw);
         }
+        if (traza) fprintf(stderr, "[nxgl] textura %d de la etapa %d: handle 0x%x → tex %u, sampler %u\n", i, stage,
+                           hp ? *hp : 0, tex, smp);
         glBindTextureUnit(base + i, tex);
         glBindSampler(base + i, smp);
     }
@@ -703,12 +756,125 @@ void nx_gl_cpu_write(uint64_t gpu, uint64_t size) {
         }
 }
 
+static float f32(uint32_t v);
+
+// ClearBuffers en la GPU: v trae Z (bit 0), S (bit 1), RGBA (2-5) y el render target (6-9).
+int nx_gl_clear(const uint32_t *R, uint32_t v) {
+    if (!iniciar()) return 0;
+    tomar();
+    modo_msaa = R[0x574] & 15;
+    if (traza) fprintf(stderr, "[nxgl] limpieza 0x%x: profundidad %g, color %g %g %g %g\n", v, f32(R[0x364]), f32(R[0x360]),
+                       f32(R[0x361]), f32(R[0x362]), f32(R[0x363]));
+    static GLuint fb;
+    if (!fb) glCreateFramebuffers(1, &fb);
+    uint32_t x0 = 0, y0 = 0, x1 = 0xFFFF, y1 = 0xFFFF;
+    int tijera = (R[0x43E] & 0x100) && (R[0x380] & 1);
+    if (tijera) x0 = R[0x381] & 0xFFFF, x1 = R[0x381] >> 16, y0 = R[0x382] & 0xFFFF, y1 = R[0x382] >> 16;
+    Rt *c = NULL, *z = NULL;
+    if (v & 0x3C) {
+        uint32_t b = 0x200 + (v >> 6 & 15) * 0x10;
+        uint64_t a = (uint64_t)R[b] << 32 | R[b + 1];
+        if (a) c = rt_buscar(a, R[b + 2], R[b + 3], R[b + 4], R[b + 5]);
+        if (!c) return 0; // formato desconocido: que lo haga la CPU
+    }
+    if (v & 3) {
+        uint64_t a = (uint64_t)R[0x3F8] << 32 | R[0x3F9];
+        if (a) z = rt_buscar(a, R[0x48A], R[0x48B], R[0x3FA], R[0x3FB] & 0xFFFF);
+        if (z && !z->f->depth) z = NULL;
+        if (!z && !c) return 1;
+    }
+    Rt *both[2] = {c, z};
+    for (int i = 0; i < 2; i++) {
+        Rt *r = both[i];
+        if (!r) continue;
+        int total = x0 == 0 && y0 == 0 && x1 >= r->w && y1 >= r->h && (r != c || (v & 0x3C) == 0x3C);
+        if (r->stale && !total) rt_cargar(r);
+        r->stale = 0;
+        r->dirty = 1;
+    }
+    if (tijera) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissorIndexed(0, x0, y0, x1 - x0, y1 - y0);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    if (c) {
+        glNamedFramebufferTexture(fb, GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
+        glNamedFramebufferTexture(fb, GL_COLOR_ATTACHMENT0, c->tex, 0);
+        glNamedFramebufferDrawBuffer(fb, GL_COLOR_ATTACHMENT0);
+        glColorMaski(0, v >> 2 & 1, v >> 3 & 1, v >> 4 & 1, v >> 5 & 1);
+        float col[4];
+        memcpy(col, &R[0x360], 16);
+        glClearNamedFramebufferfv(fb, GL_COLOR, 0, col);
+        glNamedFramebufferTexture(fb, GL_COLOR_ATTACHMENT0, 0, 0);
+    }
+    if (z && traza) fprintf(stderr, "[nxgl] limpio la profundidad: tex %u en 0x%llx %ux%u fmt 0x%x\n", z->tex, (unsigned long long)z->addr, z->w, z->h, z->fmt);
+    if (z) {
+        glNamedFramebufferTexture(fb, GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
+        glNamedFramebufferTexture(fb, z->f->depth == 2 ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, z->tex, 0);
+        glNamedFramebufferDrawBuffer(fb, GL_NONE);
+        glDepthMask(GL_TRUE);
+        glStencilMask(0xFF);
+        float zd = f32(R[0x364]);
+        GLint s = (GLint)R[0x368];
+        if ((v & 3) == 3 && z->f->depth == 2) glClearNamedFramebufferfi(fb, GL_DEPTH_STENCIL, 0, zd, s);
+        else if (v & 1) glClearNamedFramebufferfv(fb, GL_DEPTH, 0, &zd);
+        else if (z->f->depth == 2) glClearNamedFramebufferiv(fb, GL_STENCIL, 0, &s);
+    }
+    return 1;
+}
+
+// Con NX_TRAZA_GL: el píxel del centro de cada render target después de un draw.
+static void depurar_rts(const char *que) {
+    if (!traza) return;
+    GLint vp[4], df, ds = 0;
+    glGetIntegerv(GL_VIEWPORT, vp);
+    glGetIntegerv(GL_DEPTH_FUNC, &df);
+    glGetNamedFramebufferAttachmentParameteriv(fbo, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &ds);
+    fprintf(stderr, "[nxgl] %s: viewport %d %d %d %d, profundidad %d (func 0x%x, tex %d), stencil %d, cull %d, estado 0x%x\n", que,
+            vp[0], vp[1], vp[2], vp[3], glIsEnabled(GL_DEPTH_TEST), df, ds, glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_CULL_FACE),
+            glCheckNamedFramebufferStatus(fbo, GL_DRAW_FRAMEBUFFER));
+    if (ds) {
+        float z = -1;
+        glGetTextureSubImage(ds, 0, 960, 540, 0, 1, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, sizeof z, &z);
+        GLfloat dr[2];
+        glGetFloati_v(GL_DEPTH_RANGE, 0, dr);
+        GLint cd;
+        glGetIntegerv(GL_CLIP_DEPTH_MODE, &cd);
+        fprintf(stderr, "[nxgl] %s: z del centro %g, rango %g-%g, modo 0x%x\n", que, z, dr[0], dr[1], cd);
+    }
+    for (int i = 0; i < 8; i++) {
+        GLint obj = 0;
+        glGetNamedFramebufferAttachmentParameteriv(fbo, GL_COLOR_ATTACHMENT0 + i, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &obj);
+        if (!obj) continue;
+        GLint w, h;
+        glGetTextureLevelParameteriv(obj, 0, GL_TEXTURE_WIDTH, &w);
+        glGetTextureLevelParameteriv(obj, 0, GL_TEXTURE_HEIGHT, &h);
+        static float img[4096 * 4096 * 4 / 16];
+        int sw = w / 16, sh = h / 16, n = 0;
+        float px[4] = {0};
+        if ((size_t)sw * sh * 4 <= sizeof img / sizeof *img) {
+            for (int y = 0; y < sh; y++)
+                for (int x = 0; x < sw; x++) {
+                    glGetTextureSubImage(obj, 0, x * 16, y * 16, 0, 1, 1, 1, GL_RGBA, GL_FLOAT, sizeof px, px);
+                    if (px[0] || px[1] || px[2]) n++;
+                }
+        }
+        fprintf(stderr, "[nxgl] %s: RT%d (tex %d, %dx%d) %d de %d muestras con color\n", que, i, obj, w, h, n, sw * sh);
+    }
+}
+
 // ---------- estado ----------
 
 static GLenum gl_compare(uint32_t v) {
     if (v >= 0x200 && v <= 0x207) return v;
     if (v >= 1 && v <= 8) return GL_NEVER + v - 1;
     return GL_ALWAYS;
+}
+static GLenum gl_stencil_op(uint32_t v) {
+    static const GLenum ops[] = {GL_KEEP, GL_KEEP, GL_ZERO, GL_REPLACE, GL_INCR, GL_DECR, GL_INVERT, GL_INCR_WRAP, GL_DECR_WRAP};
+    if (v >= 1 && v <= 8) return ops[v];
+    return v ? v : GL_KEEP; // los valores de OpenGL (0x1E00...) ya sirven
 }
 static GLenum gl_blend_eq(uint32_t v) {
     switch (v) {
@@ -772,10 +938,12 @@ static void estado_raster(const uint32_t *R) {
     } else {
         glDisable(GL_SCISSOR_TEST);
     }
-    // Caras: la GPU mide el giro sobre las coordenadas de ventana tal cual (filas hacia abajo), al
-    // revés si SetWindowOrigin.FlipY. OpenGL con origen arriba (UPPER_LEFT) lo mide invertido.
-    int ccw = R[0x647] == 0x901 || R[0x647] == 1, flip = R[0x4EB] >> 4 & 1, arriba = sy < 0;
-    glFrontFace(ccw ^ arriba ^ flip ? GL_CCW : GL_CW);
+    // Caras: la GPU mide el giro en coordenadas del framebuffer con +Y hacia abajo (al revés si
+    // SetWindowOrigin.FlipY, el modo "origen abajo"). OpenGL lo mide siempre como en NDC (+Y arriba):
+    // coinciden cuando el viewport invierte y (sy < 0).
+    int ccw = R[0x647] == 0x901 || R[0x647] == 1, flip = R[0x4EB] >> 4 & 1, abajo = sy > 0;
+    glFrontFace(ccw ^ abajo ^ flip ? GL_CCW : GL_CW);
+    if (traza) fprintf(stderr, "[nxgl] caras: front 0x%x cull 0x%x (activo %u) flip %d sy %g\n", R[0x647], R[0x648], R[0x646], flip, sy);
     if (R[0x646] & 1) {
         glEnable(GL_CULL_FACE);
         uint32_t c = R[0x648];
@@ -790,6 +958,35 @@ static void estado_raster(const uint32_t *R) {
         glDisable(GL_DEPTH_TEST);
     }
     glDepthMask(R[0x4BA] & 1);
+    // Polígonos: modo (OpenGL core no distingue frente y dorso: manda el del frente), offset y líneas.
+    uint32_t pm = R[0x36B];
+    glPolygonMode(GL_FRONT_AND_BACK, pm == 0x1B00 || pm == 1 ? GL_POINT : pm == 0x1B01 || pm == 2 ? GL_LINE : GL_FILL);
+    if (R[0x370] & 1) glEnable(GL_POLYGON_OFFSET_POINT); else glDisable(GL_POLYGON_OFFSET_POINT);
+    if (R[0x371] & 1) glEnable(GL_POLYGON_OFFSET_LINE); else glDisable(GL_POLYGON_OFFSET_LINE);
+    if (R[0x372] & 1) glEnable(GL_POLYGON_OFFSET_FILL); else glDisable(GL_POLYGON_OFFSET_FILL);
+    static PFNGLPOLYGONOFFSETCLAMPPROC offset_clamp; // de OpenGL 4.6, no siempre exportada
+    if (!offset_clamp) offset_clamp = (PFNGLPOLYGONOFFSETCLAMPPROC)eglGetProcAddress("glPolygonOffsetClamp");
+    if (offset_clamp) offset_clamp(f32(R[0x55B]), f32(R[0x56F]), f32(R[0x61F]));
+    else glPolygonOffset(f32(R[0x55B]), f32(R[0x56F]));
+    if (R[0x55C] & 1) glEnable(GL_LINE_SMOOTH); else glDisable(GL_LINE_SMOOTH);
+    float lw = f32(R[0x55C] & 1 ? R[0x4EC] : R[0x4ED]);
+    glLineWidth(lw > 0 && lw < 64 ? lw : 1.0f);
+    if (R[0x644] & 1) glEnable(GL_PROGRAM_POINT_SIZE); else glDisable(GL_PROGRAM_POINT_SIZE);
+    float ps = f32(R[0x546]);
+    glPointSize(ps > 0 && ps < 256 ? ps : 1.0f);
+    if (R[0x4E0] & 1) {
+        glEnable(GL_STENCIL_TEST);
+        int dos = R[0x565] & 1;
+        glStencilFuncSeparate(GL_FRONT, gl_compare(R[0x4E4]), R[0x4E5], R[0x4E6]);
+        glStencilOpSeparate(GL_FRONT, gl_stencil_op(R[0x4E1]), gl_stencil_op(R[0x4E2]), gl_stencil_op(R[0x4E3]));
+        glStencilMaskSeparate(GL_FRONT, R[0x4E7]);
+        glStencilFuncSeparate(GL_BACK, gl_compare(dos ? R[0x569] : R[0x4E4]), dos ? R[0x3D5] : R[0x4E5], dos ? R[0x3D7] : R[0x4E6]);
+        glStencilOpSeparate(GL_BACK, gl_stencil_op(dos ? R[0x566] : R[0x4E1]), gl_stencil_op(dos ? R[0x567] : R[0x4E2]),
+                            gl_stencil_op(dos ? R[0x568] : R[0x4E3]));
+        glStencilMaskSeparate(GL_BACK, dos ? R[0x3D6] : R[0x4E7]);
+    } else {
+        glDisable(GL_STENCIL_TEST);
+    }
     if (R[0x591] & 1) {
         glEnable(GL_PRIMITIVE_RESTART);
         glPrimitiveRestartIndex(R[0x592]);
@@ -908,11 +1105,16 @@ static int vertices(const uint32_t *R, const NxShaderInfo *vi, const NxDraw *d) 
     return 1;
 }
 
-static void constbufs(const NxDraw *d, int stage, const NxShaderInfo *info, int base) {
+static void constbufs(const uint64_t *cb_addr, const uint32_t *cb_size, int stage, const NxShaderInfo *info, int base) {
     for (int s = 0; s < 18; s++) {
         if (!(info->cbufs >> s & 1)) continue;
-        uint64_t addr = d->cb_addr[stage][s];
-        uint32_t size = d->cb_size[stage][s];
+        if (s >= 16 && stage != 5) { // 16 puntos de enlace por etapa (OpenGL da 84 en total)
+            static int avisado;
+            if (!avisado++) fprintf(stderr, "[RED] GPU: constbuf %d en un shader gráfico\n", s);
+            continue;
+        }
+        uint64_t addr = cb_addr[s];
+        uint32_t size = cb_size[s];
         uint64_t avail;
         const void *p = addr ? nx_gpu_ptr_n(addr, &avail) : NULL;
         if (!p) {
@@ -921,8 +1123,63 @@ static void constbufs(const NxDraw *d, int stage, const NxShaderInfo *info, int 
         }
         if (size > avail) size = (uint32_t)avail;
         if (size > 65536) size = 65536;
+        if (traza) fprintf(stderr, "[nxgl] cb%d de la etapa %d: 0x%llx, %u bytes, primeras palabras %08x %08x %08x %08x\n", s, stage,
+                           (unsigned long long)addr, size, ((const uint32_t *)p)[0], size > 4 ? ((const uint32_t *)p)[1] : 0,
+                           size > 8 ? ((const uint32_t *)p)[2] : 0, size > 12 ? ((const uint32_t *)p)[3] : 0);
         GLintptr o = subir(ubo_ring, &ubo_off, p, size, 256);
         glBindBufferRange(GL_UNIFORM_BUFFER, base + s, ubo_ring, o, 65536); // el bloque declara 64 KiB
+    }
+}
+
+// ---------- storage buffers (memoria global de los shaders) ----------
+// Cada SSBO del shader nombra un descriptor en un constbuf: dirección de 64 bits y tamaño de 32. Se
+// copia esa memoria a un buffer de OpenGL, y lo que el shader escribe vuelve a la memoria del juego
+// después del draw o del dispatch (sb_volver).
+
+typedef struct {
+    GLuint buf;
+    uint64_t addr;
+    uint32_t size;
+    int written;
+} SbBind;
+static SbBind sb_pend[96];
+static GLuint sb_bufs[96];
+
+static int ssbos(const uint64_t *cbs, const NxShaderInfo *info, int base, int n) {
+    for (int k = 0; k < info->nssbo && base + k < 96; k++) {
+        uint64_t avail, addr = 0;
+        uint32_t size = 0;
+        const uint8_t *desc = cbs[info->ssbo[k].slot] ? nx_gpu_ptr_n(cbs[info->ssbo[k].slot] + info->ssbo[k].offset, &avail) : NULL;
+        if (desc && avail >= 12) memcpy(&addr, desc, 8), memcpy(&size, desc + 8, 4);
+        const uint8_t *mem = addr ? nx_gpu_ptr_n(addr, &avail) : NULL;
+        if (!sb_bufs[base + k]) glCreateBuffers(1, &sb_bufs[base + k]);
+        GLuint b = sb_bufs[base + k];
+        if (!mem) {
+            static const uint32_t cero[4];
+            glNamedBufferData(b, 16, cero, GL_DYNAMIC_COPY);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, base + k, b);
+            continue;
+        }
+        if (!size || size > avail) size = avail > (64u << 20) ? 64u << 20 : (uint32_t)avail;
+        nx_gl_cpu_write(addr, size); // lo que la GPU tenga pendiente en esa memoria, antes
+        glNamedBufferData(b, size, mem, GL_DYNAMIC_COPY);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, base + k, b);
+        if (info->ssbo[k].written && n < 96) sb_pend[n++] = (SbBind){b, addr, size, 1};
+        if (traza) fprintf(stderr, "[nxgl] storage buffer %d: c%d[0x%x] → 0x%llx, %u bytes%s\n", base + k, info->ssbo[k].slot,
+                           info->ssbo[k].offset, (unsigned long long)addr, size, info->ssbo[k].written ? ", escrito" : "");
+    }
+    return n;
+}
+
+static void sb_volver(int n) {
+    if (!n) return;
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    for (int i = 0; i < n; i++) {
+        uint64_t avail;
+        uint8_t *mem = nx_gpu_ptr_n(sb_pend[i].addr, &avail);
+        if (!mem || avail < sb_pend[i].size) continue;
+        glGetNamedBufferSubData(sb_pend[i].buf, 0, sb_pend[i].size, mem);
+        nx_gl_cpu_write(sb_pend[i].addr, sb_pend[i].size); // las copias de esa memoria quedan viejas
     }
 }
 
@@ -931,27 +1188,35 @@ int nx_gl_draw(const NxDraw *d) {
     tomar();
     const uint32_t *R = d->regs;
     uint64_t region = (uint64_t)R[0x582] << 32 | R[0x583];
-    NxShaderKey kv = {0}, kf = {0};
-    claves(R, &kv);
-    kv.cb_binding = 0, kv.tex_binding = 0;
-    kf.cb_binding = 18, kf.tex_binding = 32;
-    Shader *vs = NULL, *fs = NULL;
+    // Etapas: vértice, control y evaluación de teselación, geometría y fragmento. La etapa e (0-4,
+    // como los Bind del motor 3D) usa los constbufs e*16..., las unidades de textura e*32... y los
+    // storage buffers e*16...
+    Shader *st[5] = {0};
+    static const GLbitfield bits[5] = {GL_VERTEX_SHADER_BIT, GL_TESS_CONTROL_SHADER_BIT, GL_TESS_EVALUATION_SHADER_BIT,
+                                       GL_GEOMETRY_SHADER_BIT, GL_FRAGMENT_SHADER_BIT};
+    uint32_t topo = d->topology;
     for (int i = 0; i < 6; i++) {
         uint32_t cfg = R[0x800 + i * 0x10];
         if (!(cfg & 1)) continue;
         int stage = cfg >> 4 & 15;
-        uint64_t addr = region + R[0x801 + i * 0x10];
-        if (stage == NX_SH_VERTEX) vs = shader(addr, NX_SH_VERTEX, &kv);
-        else if (stage == NX_SH_FRAGMENT) fs = shader(addr, NX_SH_FRAGMENT, &kf);
-        else {
+        if (stage < NX_SH_VERTEX || stage > NX_SH_FRAGMENT) {
             static int avisado;
-            if (!avisado++) fprintf(stderr, "[RED] GPU: etapa de shader %d (solo hay vértice y fragmento)\n", stage);
+            if (!avisado++) fprintf(stderr, "[RED] GPU: etapa de shader %d (VertexA)\n", stage);
+            continue;
         }
+        int e = stage - 1;
+        NxShaderKey k = {0};
+        if (e == 0) claves(R, &k);
+        k.cb_binding = (uint8_t)(e * 16), k.tex_binding = (uint8_t)(e * 32), k.sb_binding = (uint8_t)(e * 16);
+        k.tess_mode = (uint16_t)R[0x0C8];
+        k.gs_input = topo == 0 ? 0 : topo <= 3 ? 1 : topo == 10 || topo == 11 ? 2 : topo == 12 || topo == 13 ? 4 : 3;
+        st[e] = shader(region + R[0x801 + i * 0x10], stage, &k);
     }
+    Shader *vs = st[0];
     if (!vs) return 1;
-    glUseProgramStages(pipeline, GL_VERTEX_SHADER_BIT, vs->prog);
-    glUseProgramStages(pipeline, GL_FRAGMENT_SHADER_BIT, fs ? fs->prog : 0);
+    for (int e = 0; e < 5; e++) glUseProgramStages(pipeline, bits[e], st[e] ? st[e]->prog : 0);
 
+    modo_msaa = R[0x574] & 15;
     // Render targets: RenderTargetControl dice cuántos y en qué orden.
     uint32_t ctl = R[0x487], nt = ctl & 15;
     GLenum bufs[8];
@@ -972,6 +1237,18 @@ int nx_gl_draw(const NxDraw *d) {
         r->dirty = 1;
         any = 1;
     }
+    glNamedFramebufferTexture(fbo, GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
+    if (R[0x54E] & 1) { // superficie de profundidad
+        uint64_t za = (uint64_t)R[0x3F8] << 32 | R[0x3F9];
+        Rt *z = za ? rt_buscar(za, R[0x48A], R[0x48B], R[0x3FA], R[0x3FB] & 0xFFFF) : NULL;
+        if (z && traza) fprintf(stderr, "[nxgl] profundidad del draw: tex %u en 0x%llx %ux%u fmt 0x%x\n", z->tex, (unsigned long long)z->addr, z->w, z->h, z->fmt);
+        if (z && z->f->depth) {
+            if (z->stale) rt_cargar(z);
+            glNamedFramebufferTexture(fbo, z->f->depth == 2 ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, z->tex, 0);
+            if (R[0x4BA] & 1 || (R[0x4E0] & 1)) z->dirty = 1;
+            any = 1;
+        }
+    }
     if (!any) return 1;
     glNamedFramebufferDrawBuffers(fbo, 8, bufs);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
@@ -979,14 +1256,58 @@ int nx_gl_draw(const NxDraw *d) {
     estado_raster(R);
     if (!vertices(R, &vs->info, d)) return 1;
     if (vs->info.uses_instance) glProgramUniform1ui(vs->prog, 0, d->instance);
-    constbufs(d, 0, &vs->info, 0);
-    texturas(d, 0, &vs->info, 0);
-    if (fs) constbufs(d, 4, &fs->info, 18), texturas(d, 4, &fs->info, 32);
+    int nsb = 0;
+    for (int e = 0; e < 5; e++)
+        if (st[e]) {
+            constbufs(d->cb_addr[e], d->cb_size[e], e, &st[e]->info, e * 16);
+            texturas(R, d->cb_addr[e], e, &st[e]->info, e * 32);
+            nsb = ssbos(d->cb_addr[e], &st[e]->info, e * 16, nsb);
+        }
 
     GLenum mode = d->topology <= 6 || (d->topology >= 10 && d->topology <= 13) ? d->topology : GL_TRIANGLES;
-    if (d->topology == 7 || d->topology == 8 || d->topology == 9) {
-        static int avisado;
-        if (!avisado++) fprintf(stderr, "[RED] GPU: primitiva %u (cuadriláteros/polígonos)\n", d->topology);
+    if (d->topology == 14) { // parches: los vértices por parche los dice TessellationPatchSize
+        mode = GL_PATCHES;
+        glPatchParameteri(GL_PATCH_VERTICES, R[0x373] ? R[0x373] : 3);
+    }
+    if (d->topology >= 7 && d->topology <= 9) { // cuadriláteros, tira de cuadriláteros, polígono: a triángulos
+        static uint32_t *src, *out;
+        static size_t cap;
+        if (d->count * 3 + 16 > cap) {
+            cap = d->count * 3 + 16;
+            src = realloc(src, cap * 4);
+            out = realloc(out, cap * 4);
+        }
+        if (d->indexed) {
+            static const uint32_t isz[] = {1, 2, 4};
+            uint32_t fmt = R[0x5F6] & 3, sz = isz[fmt > 2 ? 2 : fmt];
+            uint64_t start = (uint64_t)R[0x5F2] << 32 | R[0x5F3], avail;
+            const uint8_t *p = nx_gpu_ptr_n(start + (uint64_t)d->first * sz, &avail);
+            if (!p || avail < (uint64_t)d->count * sz) return 1;
+            for (uint32_t i = 0; i < d->count; i++)
+                src[i] = sz == 1 ? p[i] : sz == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i];
+        } else {
+            for (uint32_t i = 0; i < d->count; i++) src[i] = d->first + i;
+        }
+        size_t n = 0;
+        if (d->topology == 7)
+            for (uint32_t q = 0; q + 3 < d->count; q += 4) {
+                uint32_t a = src[q], b = src[q + 1], c = src[q + 2], e = src[q + 3];
+                out[n++] = a, out[n++] = b, out[n++] = c, out[n++] = a, out[n++] = c, out[n++] = e;
+            }
+        else if (d->topology == 8)
+            for (uint32_t q = 0; q + 3 < d->count; q += 2) {
+                uint32_t a = src[q], b = src[q + 1], c = src[q + 3], e = src[q + 2];
+                out[n++] = a, out[n++] = b, out[n++] = c, out[n++] = a, out[n++] = c, out[n++] = e;
+            }
+        else
+            for (uint32_t i = 1; i + 1 < d->count; i++) out[n++] = src[0], out[n++] = src[i], out[n++] = src[i + 1];
+        if (!n) return 1;
+        GLintptr o = subir(ibo_ring, &ibo_off, out, n * 4, 4);
+        glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, (GLsizei)n, GL_UNSIGNED_INT, (void *)o, d->ninstances,
+                                                      d->indexed ? (GLint)R[0x50D] : 0, R[0x50E] + d->instance);
+        sb_volver(nsb);
+        if (traza) fprintf(stderr, "[nxgl] draw de cuadriláteros: %u vértices → %zu índices\n", d->count, n);
+        depurar_rts("cuadriláteros");
         return 1;
     }
     if (d->indexed) {
@@ -1002,8 +1323,39 @@ int nx_gl_draw(const NxDraw *d) {
     } else {
         glDrawArraysInstancedBaseInstance(mode, d->first, d->count, d->ninstances, R[0x50E] + d->instance);
     }
+    sb_volver(nsb);
     if (traza)
         fprintf(stderr, "[nxgl] draw %u: %u vértices desde %u, %u instancias desde %u%s\n", mode, d->count, d->first,
                 d->ninstances, d->instance, d->indexed ? " (índices)" : "");
+    depurar_rts("draw");
+    return 1;
+}
+
+// ---------- cómputo ----------
+// Un lanzamiento es una QMD (Queue Meta Data) en memoria: programa, tamaño de la grilla y del grupo,
+// memoria compartida y los constbufs. Los registros del motor de cómputo dan la región de código, los
+// pools de texturas y el constbuf de los handles.
+int nx_gl_dispatch(const uint32_t *C, const uint32_t *q) {
+    if (!iniciar()) return 0;
+    tomar();
+    uint64_t region = (uint64_t)C[0x582] << 32 | C[0x583];
+    NxShaderKey k = {0};
+    k.local[0] = (uint16_t)(q[18] >> 16), k.local[1] = (uint16_t)q[19], k.local[2] = (uint16_t)(q[19] >> 16);
+    k.shared_bytes = q[17] & 0x3FFFF;
+    k.local_bytes = (q[45] & 0xFFFFFF) + (q[46] & 0xFFFFFF);
+    Shader *s = shader(region + q[8], NX_SH_COMPUTE, &k);
+    if (!s) return 1;
+    uint64_t cba[18] = {0};
+    uint32_t cbs[18] = {0};
+    for (int i = 0; i < 8; i++)
+        if (q[20] >> i & 1) cba[i] = (uint64_t)(q[30 + 2 * i] & 0xFF) << 32 | q[29 + 2 * i], cbs[i] = q[30 + 2 * i] >> 15;
+    constbufs(cba, cbs, 5, &s->info, 0);
+    texturas(C, cba, 5, &s->info, 0);
+    int nsb = ssbos(cba, &s->info, 0, 0);
+    glUseProgram(s->prog);
+    glDispatchCompute(q[12], q[13] & 0xFFFF ? q[13] & 0xFFFF : 1, q[13] >> 16 ? q[13] >> 16 : 1);
+    glUseProgram(0);
+    sb_volver(nsb);
+    if (traza) fprintf(stderr, "[nxgl] dispatch %u×%u×%u grupos de %u×%u×%u\n", q[12], q[13] & 0xFFFF, q[13] >> 16, k.local[0], k.local[1], k.local[2]);
     return 1;
 }

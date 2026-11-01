@@ -10,7 +10,9 @@ typedef struct {
     int indexed;
 } NxDraw;
 
-int nx_gl_draw(const NxDraw *d);  // 0 si no hay OpenGL (NX_SIN_GPU o sin EGL)
+int nx_gl_draw(const NxDraw *d);
+int nx_gl_dispatch(const uint32_t *compute_regs, const uint32_t *qmd); // lanzamiento de cómputo  // 0 si no hay OpenGL (NX_SIN_GPU o sin EGL)
+int nx_gl_clear(const uint32_t *regs, uint32_t v); // ClearBuffers en la GPU; 0 si la tiene que hacer la CPU
 void nx_gl_flush(void);           // escribe en la memoria del juego lo que la GPU dibujó
 void nx_gl_release(void);         // flush y suelta el contexto (al terminar un envío)
 // La CPU va a escribir esa memoria (ClearBuffers por CPU, cargas en línea): lo pendiente se escribe

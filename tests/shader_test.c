@@ -234,8 +234,91 @@ static int comparar(const char *orig, const char *dksh) {
     return malos != 0 || info.errors;
 }
 
+// ---------- cómputo: el GLSL original contra su traducción, sobre storage buffers ----------
+// La traducción lee la base de cada storage buffer del constbuf del driver de deko3d (c0: ctaSize,
+// gridSize, ..., storageBufs[16] en 0x140, 16 bytes cada uno); aquí se arma ese constbuf.
+static int comparar_comp(const char *orig, const char *dksh) {
+    size_t n;
+    char *src = (char *)read_file(orig, &n);
+    Prog cs;
+    if (!src || !load_dksh(dksh, &cs)) return 2;
+    src = realloc(src, n + 1);
+    src[n] = 0;
+    uint32_t *qmd_like = (uint32_t *)(cs.code - 0); // el tamaño del grupo está en la cabecera del programa del dksh
+    (void)qmd_like;
+    NxShaderKey key = {0};
+    key.cb_binding = 18, key.tex_binding = 8, key.sb_binding = 8;
+    key.local[0] = 32, key.local[1] = key.local[2] = 1; // los shaders de prueba usan local_size_x = 32
+    key.shared_bytes = 4096;
+    NxShaderInfo info;
+    char *tr = nx_shader_glsl(cs.code, cs.size, NX_SH_COMPUTE, &key, &info);
+    if (!tr) return 1;
+    const char *srcs[1] = {src};
+    GLuint pa = glCreateShaderProgramv(GL_COMPUTE_SHADER, 1, srcs);
+    srcs[0] = tr;
+    GLuint pb = glCreateShaderProgramv(GL_COMPUTE_SHADER, 1, srcs);
+    GLint ok;
+    glGetProgramiv(pb, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetProgramInfoLog(pb, sizeof log, NULL, log);
+        fprintf(stderr, "%s: la traducción no compila:\n%s\n%s", orig, log, tr);
+        return 1;
+    }
+    enum { GRUPOS = 4, PALABRAS = 4096 };
+    static uint32_t ini[4][PALABRAS], ra[4][PALABRAS], rb[4][PALABRAS];
+    uint32_t x = 99;
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < PALABRAS; i++) x = x * 1103515245 + 12345, ini[k][i] = x >> 8;
+    // Constbufs: c0 del driver y los uniform buffers 0-3 (ranuras 2-5) con los mismos datos de siempre.
+    static uint32_t c0[16384];
+    memset(c0, 0, sizeof c0);
+    c0[0] = 32, c0[1] = 1, c0[2] = 1, c0[3] = GRUPOS, c0[4] = 1, c0[5] = 1;
+    for (int k = 0; k < 4; k++) {
+        uint64_t base = 0x100000000ull + (uint64_t)k * 0x1000000;
+        memcpy(&c0[(0x140 + k * 16) / 4], &base, 8);
+        c0[(0x140 + k * 16) / 4 + 2] = PALABRAS * 4;
+    }
+    GLuint cb;
+    glCreateBuffers(1, &cb);
+    glNamedBufferData(cb, sizeof c0, c0, GL_STATIC_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 18, cb);
+    for (int pasada = 0; pasada < 2; pasada++) {
+        GLuint sb[4];
+        glCreateBuffers(4, sb);
+        for (int k = 0; k < 4; k++) {
+            glNamedBufferData(sb[k], PALABRAS * 4, ini[k], GL_DYNAMIC_COPY);
+            if (pasada == 0) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, k, sb[k]);
+        }
+        if (pasada == 1)
+            for (int i = 0; i < info.nssbo; i++) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8 + i, sb[(info.ssbo[i].offset - 0x140) / 16 & 3]);
+        glUseProgram(pasada ? pb : pa);
+        glDispatchCompute(GRUPOS, 1, 1);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        for (int k = 0; k < 4; k++) glGetNamedBufferSubData(sb[k], 0, PALABRAS * 4, pasada ? rb[k] : ra[k]);
+        glDeleteBuffers(4, sb);
+    }
+    int malos = 0;
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < PALABRAS; i++) {
+            float fa, fb;
+            memcpy(&fa, &ra[k][i], 4);
+            memcpy(&fb, &rb[k][i], 4);
+            if (ra[k][i] != rb[k][i] && !iguales(fa, fb) && malos++ < 8)
+                fprintf(stderr, "%s: buffer %d palabra %d: original %08x (%g), traducido %08x (%g)\n", orig, k, i, ra[k][i], fa, rb[k][i], fb);
+        }
+    if (malos) fprintf(stderr, "%s: %d palabras distintas\n", orig, malos);
+    if (malos && getenv("NX_VER_GLSL")) fprintf(stderr, "%s", tr);
+    return malos != 0 || info.errors;
+}
+
 int main(int argc, char **argv) {
     egl_init();
+    if (argc >= 4 && !strcmp(argv[1], "--comparar-comp")) {
+        int bad = 0;
+        for (int i = 2; i + 1 < argc; i += 2) bad += comparar_comp(argv[i], argv[i + 1]) != 0;
+        return bad != 0;
+    }
     if (argc >= 4 && !strcmp(argv[1], "--comparar")) {
         int bad = 0;
         for (int i = 2; i + 1 < argc; i += 2) bad += comparar(argv[i], argv[i + 1]) != 0;
@@ -306,7 +389,9 @@ int main(int argc, char **argv) {
         printf("%s", g);
         GLenum type = p.stage == NX_SH_FRAGMENT ? GL_FRAGMENT_SHADER
                       : p.stage == NX_SH_COMPUTE ? GL_COMPUTE_SHADER
-                      : p.stage == NX_SH_GEOMETRY ? GL_GEOMETRY_SHADER : GL_VERTEX_SHADER;
+                      : p.stage == NX_SH_GEOMETRY ? GL_GEOMETRY_SHADER
+                      : p.stage == NX_SH_TESS_CTRL ? GL_TESS_CONTROL_SHADER
+                      : p.stage == NX_SH_TESS_EVAL ? GL_TESS_EVALUATION_SHADER : GL_VERTEX_SHADER;
         if (!compile(type, g) || info.errors) bad++;
         free(g);
     }

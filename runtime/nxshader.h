@@ -11,7 +11,15 @@ typedef struct {
     uint8_t attr_int[32]; // atributos de vértice: 0 float, 1 entero con signo, 2 sin signo
     uint8_t cb_binding;   // primer punto de enlace de los constbufs de esta etapa
     uint8_t tex_binding;  // primera unidad de textura de esta etapa
+    uint8_t sb_binding;   // primer punto de enlace de los storage buffers de esta etapa
+    uint8_t gs_input;     // geometría: primitiva de entrada (0 puntos, 1 líneas, 2 líneas con adyacencia,
+                          // 3 triángulos, 4 triángulos con adyacencia)
+    uint16_t tess_mode;   // evaluación de teselación: TessellationMode del motor 3D
+    uint16_t local[3];    // cómputo: hilos por grupo (de la QMD)
+    uint32_t shared_bytes, local_bytes; // cómputo: memoria compartida y local (las gráficas la leen de su cabecera)
 } NxShaderKey;
+
+#define NX_MAX_SSBO 16
 
 // Tipos de textura que usa un shader (lo que dice la instrucción, no el descriptor).
 enum { NX_TEX_2D, NX_TEX_3D, NX_TEX_CUBE, NX_TEX_2D_ARRAY, NX_TEX_CUBE_ARRAY, NX_TEX_2D_MS, NX_TEX_BUFFER, NX_TEX_SHADOW = 0x10 };
@@ -29,6 +37,11 @@ typedef struct {
         uint16_t handle;
         uint8_t type;
     } tex[NX_MAX_TEX];
+    int nssbo;            // memoria global: cada base distinta (leída de un constbuf) es un storage buffer
+    struct {
+        uint8_t slot, written;
+        uint16_t offset;  // en bytes: ahí están la dirección (64 bits) y, si el driver la pone, el tamaño
+    } ssbo[NX_MAX_SSBO];
     int uses_instance;    // lee el índice de instancia (uniform nx_inst0 en la location 0)
     int errors;           // instrucciones que no supo traducir
 } NxShaderInfo;

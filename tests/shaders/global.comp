@@ -1,0 +1,19 @@
+#version 460
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) buffer A { uint a[]; };
+layout(std430, binding = 1) buffer B { float b[]; };
+layout(std430, binding = 2) buffer C { uint c[]; };
+layout(std140, binding = 0) uniform U { vec4 fu[4]; uvec4 uu[4]; };
+shared uint tmp[32];
+void main() {
+    uint id = gl_GlobalInvocationID.x, l = gl_LocalInvocationID.x;
+    tmp[l] = a[id] ^ uu[0].x;
+    barrier();
+    uint v = tmp[31 - l] + gl_WorkGroupID.x * 1000u + gl_NumWorkGroups.x;
+    a[id + 256u] = v;
+    b[id] = b[id + 512u] * 0.5 + fu[1].y + float(l);
+    atomicAdd(c[id & 7u], v & 0xffu);
+    atomicMax(c[64u + (id & 3u)], v);
+    uint old = atomicExchange(c[128u + id], id);
+    c[300u + id] = old;
+}
