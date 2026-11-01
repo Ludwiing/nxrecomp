@@ -46,7 +46,11 @@ Con devkitPro instalado (`tools/instalar-devkitpro.sh`, que necesita sudo y se c
 - `guest/libnx/basico`: el arranque completo de libnx (`crt0`, reubicación, heap, `sm`, `set:sys`, `appletOE`, `hid`, `time`, `fs`), `main` y la salida por `ISelfController::Exit`.
 - `guest/libnx/sistema`: las API de libnx como las usa cualquier homebrew: hilos con `Mutex` y `CondVar`, idioma, versión del sistema, relojes y calendario, archivos y carpetas en la SD con `fopen`/`opendir`, mandos con `padUpdate` y `malloc` de 64 MiB.
 
-Además corren dos ejemplos oficiales de devkitPro con pantalla, sin tocar: `printing/hello-world` (la consola de texto de libnx) y `simplegfx` (dibuja píxeles directo en el framebuffer). `make test` compara la huella del décimo cuadro. Y `guest/libnx/mandos` comprueba los mandos: un guion aprieta botones, combinaciones, la cruceta y + para salir.
+Además corren dos ejemplos oficiales de devkitPro con pantalla, sin tocar: `printing/hello-world` (la consola de texto de libnx) y `simplegfx` (dibuja píxeles directo en el framebuffer). `make test` compara la huella del décimo cuadro. `guest/libnx/mandos` comprueba los mandos: un guion aprieta botones, combinaciones, la cruceta y + para salir.
+
+Hay dos ejemplos de audio:
+- `playtone` (`audout`) toca 220, 440 y 1760 Hz con A, B y X, y se compara el WAV.
+- `audren-simple` (el renderizador) tiene que sacar su `sample.bin` intacto, muestra por muestra, en los dos canales.
 
 Para probar uno nuevo: `tools/probar_libnx.sh <nombre>` lo compila, lo recompila con `--traza` y lo corre. Para depurar:
 - Con `NX_TRAZA_SVC=1` se ven las llamadas al kernel.
@@ -74,6 +78,11 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
     - Teclado (como el predeterminado de Ryujinx): stick izquierdo WASD, cruceta con las flechas, A/B/X/Y en Z/X/C/V, L/ZL en E/Q, R/ZR en U/O, stick derecho IJKL, + en Enter, − en Retroceso.
     - Mandos: por posición, como en la Switch.
     - Pruebas: `NX_PULSAR="30:plus,45:a+b"` aprieta botones en cuadros fijos.
+
+  - Audio, en `runtime/nxaudio.c` (salida SDL3), `nxsvc_audio.c` (`audout`) y `nxsvc_audren.c` (el renderizador `audren`, el que usan los juegos).
+    - El renderizador mezcla 240 muestras cada 5 ms. Lee voces en PCM de 8/16/32 bits, float y DSP-ADPCM, con remuestreo lineal, factores de mezcla por canal, submezclas y salida estéreo o 5.1.
+    - `NX_SIN_AUDIO=1` no abre el dispositivo.
+    - `NX_AUDIO_WAV=f.wav` graba lo que suena.
 
   Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.
 
@@ -105,6 +114,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 - **Arranque de un juego real**: después de los constructores se salta directo a `nnMain`. Un juego con el SDK de Nintendo necesita antes la secuencia de `nn::init::Start` (`nnosInitialize`, `nninitStartup`...), y esa secuencia necesita hilos, SVC y servicios de Horizon. Es el siguiente paso.
 - **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
+- **Audio**: el ADPCM, el remuestreo con tono distinto de 1 y las submezclas están escritos, pero ningún ejemplo los prueba todavía. Faltan los efectos (reverb, delay...) y los formatos de revisión más nuevos que usa el SDK de Nintendo.
 - **Servicios**: falta la GPU (NVN sobre Vulkan, la parte más grande; hoy solo se muestran cuadros dibujados por la CPU), `audren`/`audout`, `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
 - **Excepciones de C++ y `longjmp`**: un RET a una dirección que no es inicio de función (el destino de un `longjmp`, o una plataforma de aterrizaje de una excepción) todavía no se resuelve.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.

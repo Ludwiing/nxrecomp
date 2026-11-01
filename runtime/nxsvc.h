@@ -60,3 +60,4 @@ uint32_t nx_fsp(ServiceObject *self, NxRequest *r);
 uint32_t nx_vi(ServiceObject *self, NxRequest *r);
 uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r);
 uint32_t nx_audout(ServiceObject *self, NxRequest *r);
+uint32_t nx_audren(ServiceObject *self, NxRequest *r);
