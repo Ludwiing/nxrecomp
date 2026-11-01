@@ -6,7 +6,7 @@ PROGS := hola neon vm multi
 PROGS_ESPERADO := hilos servicios
 # Homebrew hechos con libnx (devkitPro): se compilan con su toolchain si está instalado.
 DEVKITPRO ?= /opt/devkitpro
-LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema)
+LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema kernel)
 # Ejemplos oficiales de libnx con pantalla: se compara la huella del cuadro 10 (sin ventana).
 LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
 # deko3d por la GPU: el color de limpieza y el triángulo con sus colores interpolados.

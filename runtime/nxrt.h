@@ -68,6 +68,8 @@ extern const int nx_nimports;
 extern const uint64_t nx_inits[];
 extern const int nx_ninits;
 extern const uint64_t nx_main_addr, nx_entry_addr, nx_main_stack;
+extern const uint64_t nx_system_resource, nx_program_id; // del main.npdm (0 si no hay)
+extern const int nx_main_priority, nx_main_core;
 extern const unsigned char nx_romfs_data[]; // el RomFS que venía dentro del NRO (homebrew)
 extern const uint64_t nx_romfs_size;
 void nx_dispatch(Ctx *c, uint64_t addr);

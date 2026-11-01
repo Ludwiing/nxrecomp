@@ -1,0 +1,7 @@
+id del hilo en TLS+0x110: sí, sí
+pausado: sí (0x0), contexto: sí (0x0)
+reanudado: sí
+ticks de CPU del hilo: sí
+WaitForAddress de 64 bits: igual 0xea01, distinto 0xfa01
+SignalToAddress tipo 2, cuenta -1: 0x0, la palabra queda en 3
+SetHeapSize de 64 GiB: 0xd001

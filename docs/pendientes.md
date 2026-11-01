@@ -59,15 +59,15 @@ Se marca [x] lo hecho.
 
 ## Kernel
 
-1. [ ] ID del hilo en TLS+0x110 (SDK 22).
-2. [ ] GetInfo 16/17 (tamaño de recursos del sistema, del NPDM), 18 (program ID), 20 (contexto de
-   excepción), 25 (ticks del hilo).
-3. [ ] SetHeapSize: devolver "sin memoria" (0xD001) por encima del límite.
-4. [ ] WaitForAddress tipo 3 (64 bits), SignalToAddress tipo 2 con cuenta ≤ 0.
-5. [ ] SetThreadActivity / GetThreadContext3 (recolectores de basura de Unity y .NET).
-6. [ ] Número de procesador dentro de la máscara del hilo; prioridad y núcleo del hilo principal
-   desde el NPDM.
-7. [ ] SVC que faltan: 0x30/0x31, 0x2A/0x2B, 0x22, 0x24.
+1. [x] ID del hilo en TLS+0x110 (SDK 22).
+2. [x] GetInfo 16/17 (recurso del sistema del NPDM), 18 (program ID del ACI0 o NX_TITLE_ID), 20
+   (contexto de excepción), 25 (ticks de CPU del hilo), 26.
+3. [x] SetHeapSize: "sin memoria" (0xD001) por encima del límite.
+4. [x] WaitForAddress tipo 3 (64 bits), SignalToAddress tipo 2 con cuenta ≤ 0 (−2).
+5. [x] SetThreadActivity / GetThreadContext3: pausa con una señal, contexto desde el Ctx.
+6. [x] Número de procesador del núcleo del hilo; prioridad y núcleo del hilo principal del NPDM.
+7. [x] SVC 0x22, 0x24, 0x2A/0x2B, 0x30/0x31, 0x36.
+   Prueba: guest/libnx/kernel (guest/esperado/kernel.txt).
 
 ## Servicios
 

@@ -35,6 +35,7 @@
 #define R_INVALID_ENUM 0xF001u      // 120
 #define R_INVALID_STATE 0xFA01u     // 125
 #define R_INVALID_CMB 0xE001u       // 112 InvalidCombination
+#define R_OUT_OF_MEMORY 0xD001u     // 104: el SDK solo acepta este (o el de límite) al pedir heap de más
 #define WAITERS 0x40000000u
 #define H_CUR_THREAD 0xFFFF8000u
 #define H_CUR_PROCESS 0xFFFF8001u
@@ -96,6 +97,9 @@ static KThread *thread_new(void) {
     t->tls = tls_next;
     tls_next += 0x200;
     memset((void *)(uintptr_t)t->tls, 0, 0x200);
+    // El id del hilo en ThreadLocalRegion+0x110: los mutex del SDK 22 comparan su dueño con él
+    // (si queda en 0, todo mutex libre parece del hilo actual y el SDK aborta; nxnative, Well Dweller).
+    *(uint32_t *)(uintptr_t)(t->tls + 0x110) = (uint32_t)t->id;
     t->ctx->tpidrro = t->tls;
     for (int k = 0; k < MAX_THREADS; k++)
         if (!threads[k]) {
@@ -114,7 +118,8 @@ KThread *nx_kernel_main_thread(void) {
     nx_memory_init();
     pthread_mutex_lock(&G);
     KThread *t = thread_new();
-    t->priority = 44;
+    t->priority = nx_main_priority ? nx_main_priority : 44; // prioridad y núcleo del hilo principal: del NPDM
+    t->core = nx_main_core >= 0 && nx_main_core < 4 ? nx_main_core : 0;
     t->state = TS_RUNNING;
     t->handle = nx_handle_new(KO_THREAD, t, 1);
     cur = t;
@@ -311,12 +316,14 @@ static uint32_t signal_key(uint64_t key, int32_t count) {
 }
 
 // ---------- árbitro de direcciones ----------
-static uint32_t wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
-    if (addr & 3) return R_INVALID_ADDR;
+static uint32_t wait_for_address(uint64_t addr, uint32_t type, int64_t value64, int64_t timeout) {
+    if (addr & (type == 3 ? 7 : 3)) return R_INVALID_ADDR;
+    int32_t value = (int32_t)value64;
     pthread_mutex_lock(&G);
     int32_t v = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     int wait;
-    if (type == 0) wait = v < value;                    // WaitIfLessThan
+    if (type == 3) wait = (int64_t)__atomic_load_n((uint64_t *)(uintptr_t)addr, __ATOMIC_SEQ_CST) == value64; // WaitIfEqual64 (SDK 19)
+    else if (type == 0) wait = v < value;                    // WaitIfLessThan
     else if (type == 1) {                               // DecrementAndWaitIfLessThan
         wait = v < value;
         if (wait) __atomic_store_n(u32p(addr), (uint32_t)(v - 1), __ATOMIC_SEQ_CST);
@@ -344,7 +351,7 @@ static uint32_t signal_to_address(uint64_t addr, uint32_t type, int32_t value, i
         if (type == 1) nv = value + 1;                  // SignalAndIncrementIfEqual
         else {                                          // SignalAndModifyByWaitingCountIfEqual
             int w = count_waiters(W_ADDRESS, addr, NULL);
-            if (count <= 0) nv = w > 0 ? value - 1 : value + 1;
+            if (count <= 0) nv = w > 0 ? value - 2 : value + 1; // como mesosphere: -2 con esperas
             else if (w == 0) nv = value + 1;
             else if (w <= count) nv = value - 1;
             else nv = value;
@@ -464,7 +471,8 @@ void nx_memory_init(void) {
 void nx_memory_add_stack(uint64_t addr, uint64_t size) { region_add(addr, size, 0x0B, 0x3); }
 
 static uint32_t set_heap_size(uint64_t size, uint64_t *out) {
-    if (size & 0x1FFFFF || size > NX_HEAP_MAX) return R_INVALID_SIZE; // múltiplo de 2 MiB
+    if (size & 0x1FFFFF) return R_INVALID_SIZE; // múltiplo de 2 MiB
+    if (size > NX_HEAP_MAX) return R_OUT_OF_MEMORY; // DKC Tropical Freeze busca el máximo probando
     pthread_mutex_lock(&G);
     if (size > heap_size)
         mprotect((void *)(uintptr_t)(NX_HEAP_BASE + heap_size), size - heap_size, PROT_READ | PROT_WRITE);
@@ -541,7 +549,23 @@ static void query_memory(uint64_t out, uint64_t addr) {
     o32[0] = type, o32[1] = 0, o32[2] = perm, o32[3] = 0, o32[4] = 0, o32[5] = 0;
 }
 
+// Tiempo de CPU de un hilo en ticks de 19,2 MHz.
+static uint64_t ticks_de_hilo(KThread *t) {
+    clockid_t reloj;
+    struct timespec ts;
+    if (!t || pthread_getcpuclockid(t->pthread ? t->pthread : pthread_self(), &reloj) || clock_gettime(reloj, &ts)) return 0;
+    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return ns / 625 * 12 + ns % 625 * 12 / 625;
+}
+
+static uint64_t program_id(void) {
+    const char *e = getenv("NX_TITLE_ID"); // lo pone NX2Linux
+    if (e && *e) return strtoull(e, NULL, 16);
+    return nx_program_id ? nx_program_id : 0x0100000000001000ull;
+}
+
 static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
+    static uint8_t contexto_excepcion[0x1000]; // el SDK escribe ahí (+0x1C0) al instalar su manejador
     switch (id) {
     case 0: *out = 0xF; return R_OK_;                        // núcleos permitidos
     case 1: *out = 0x3FFFFFFFFFFFFFFFull; return R_OK_;      // prioridades permitidas
@@ -559,9 +583,17 @@ static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
     case 13: *out = (1ull << 39) - 0x8000000ull; return R_OK_;
     case 14: *out = NX_STACK_BASE; return R_OK_;
     case 15: *out = NX_STACK_SIZE; return R_OK_;
-    case 16: case 17: *out = 0; return R_OK_;                // recurso del sistema
-    case 18: *out = 0x0100000000001000ull; return R_OK_;     // id de programa
-    case 20: *out = 0; return R_OK_;                         // contexto de excepción
+    // Recurso del sistema (del NPDM): con 0, Unreal 4.26+/UE5 y Unity 6 eligen otro asignador o salen.
+    case 16: *out = nx_system_resource; return R_OK_;
+    case 17: *out = nx_system_resource / 4; return R_OK_;
+    case 18: *out = program_id(); return R_OK_;              // id de programa
+    case 20: *out = (uint64_t)(uintptr_t)contexto_excepcion; return R_OK_; // contexto de excepción del usuario
+    case 25: { // ticks de CPU de un hilo (handle 0xFFFF8000 = el actual)
+        KThread *t = h == 0xFFFF8000u ? cur : nx_handle_get(h, KO_THREAD);
+        *out = ticks_de_hilo(t);
+        return R_OK_;
+    }
+    case 26: *out = 1; return R_OK_;                         // IsSvcPermitted: todas
     case 23: *out = 1; return R_OK_;                         // es una aplicación
     case 28: *out = 0; return R_OK_;                         // tamaño extra de la región alias
     case 24: *out = 256; return R_OK_;                       // hilos libres
@@ -570,6 +602,62 @@ static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
     (void)h;
     fprintf(stderr, "[RED] GetInfo(%u, 0x%x, %llu) no implementado\n", id, h, (unsigned long long)sub);
     return R_INVALID_ENUM;
+}
+
+// ---------- pausar hilos (recolectores de basura de Unity IL2CPP, Mono, .NET) ----------
+// SetThreadActivity(1) detiene el hilo donde esté: una señal lo deja esperando dentro de su
+// manejador hasta que lo reanudan. GetThreadContext3 lee sus registros, que viven en su Ctx.
+static void pausa_senal(int s) {
+    (void)s;
+    KThread *t = cur;
+    if (!t) return;
+    sigset_t m;
+    sigfillset(&m);
+    sigdelset(&m, SIGUSR2);
+    __atomic_store_n(&t->pausado, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&t->pausa, __ATOMIC_SEQ_CST)) sigsuspend(&m);
+    __atomic_store_n(&t->pausado, 0, __ATOMIC_SEQ_CST);
+}
+
+static uint32_t set_thread_activity(uint32_t h, uint32_t pausar) {
+    static int instalado;
+    if (!instalado++) {
+        struct sigaction sa = {0};
+        sa.sa_handler = pausa_senal;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR2, &sa, NULL);
+    }
+    KThread *t = nx_handle_get(h, KO_THREAD);
+    if (!t) return R_INVALID_HANDLE;
+    if (t == cur) return R_INVALID_HANDLE; // un hilo no se pausa a sí mismo
+    if (t->state != TS_RUNNING) return R_INVALID_STATE;
+    __atomic_store_n(&t->pausa, pausar ? 1 : 0, __ATOMIC_SEQ_CST);
+    pthread_kill(t->pthread, SIGUSR2);
+    if (pausar) // esperar a que de verdad se detenga
+        for (int i = 0; i < 2000 && !__atomic_load_n(&t->pausado, __ATOMIC_SEQ_CST); i++) usleep(50);
+    return R_OK_;
+}
+
+// ThreadContext de 0x320 bytes: x0-x28, fp, lr, sp, pc, pstate, v0-v31, fpcr, fpsr, tpidr.
+static uint32_t get_thread_context(uint32_t h, uint64_t dst) {
+    KThread *t = nx_handle_get(h, KO_THREAD);
+    if (!t) return R_INVALID_HANDLE;
+    if (t == cur) return R_INVALID_HANDLE;
+    uint8_t *o = (uint8_t *)(uintptr_t)dst;
+    const Ctx *c = t->ctx;
+    memset(o, 0, 0x320);
+    memcpy(o, c->x, 31 * 8);           // x0-x28, fp (x29), lr (x30)
+    memcpy(o + 0xF8, &c->sp, 8);
+    memcpy(o + 0x100, &c->pc, 8);
+    uint32_t psr = (uint32_t)c->n << 31 | (uint32_t)c->z << 30 | (uint32_t)c->c << 29 | (uint32_t)c->v << 28;
+    memcpy(o + 0x108, &psr, 4);
+    memcpy(o + 0x110, c->vr, 32 * 16);
+    uint32_t fpcr = (uint32_t)c->fpcr, fpsr = (uint32_t)c->fpsr;
+    memcpy(o + 0x310, &fpcr, 4);
+    memcpy(o + 0x314, &fpsr, 4);
+    memcpy(o + 0x318, &c->tpidr, 8);
+    return R_OK_;
 }
 
 // ---------- la tabla de SVC ----------
@@ -635,7 +723,12 @@ void nx_svc(Ctx *c, uint32_t imm) {
     case 0x0D: { KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD); if (t) t->priority = (int)x[1]; x[0] = t ? R_OK_ : R_INVALID_HANDLE; return; }
     case 0x0E: { KThread *t = nx_handle_get((uint32_t)x[2], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->core : 0; x[2] = 0xF; return; }
     case 0x0F: { KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD); if (t && (int32_t)x[1] >= 0) t->core = (int)x[1]; x[0] = t ? R_OK_ : R_INVALID_HANDLE; return; }
-    case 0x10: { int cpu = sched_getcpu(); x[0] = (uint64_t)(cpu < 0 ? 0 : cpu % 4); return; }
+    case 0x10: { // GetCurrentProcessorNumber: el núcleo del hilo (las colas por núcleo de los motores
+                 // esperan que coincida con su máscara), si no, el del host
+        int cpu = cur && cur->core >= 0 && cur->core < 4 ? cur->core : sched_getcpu();
+        x[0] = (uint64_t)(cpu < 0 ? 0 : cpu % 4);
+        return;
+    }
     case 0x11: case 0x12: case 0x17: { // SignalEvent, ClearEvent, ResetSignal
         pthread_mutex_lock(&G);
         HandleEntry *e = handle_entry((uint32_t)x[0]);
@@ -732,6 +825,25 @@ void nx_svc(Ctx *c, uint32_t imm) {
     case 0x1E: x[0] = nx_ticks(); return;
     case 0x1F: x[0] = nx_connect_named_port((const char *)(uintptr_t)x[1], &out); x[1] = out; return;
     case 0x21: x[0] = nx_send_sync_request(c, (uint32_t)x[0]); return;
+    case 0x22: { // SendSyncRequestWithUserBuffer(buffer, tamaño, handle): el mensaje va en el buffer, no en el TLS
+        uint64_t tls = c->tpidrro;
+        c->tpidrro = x[0];
+        x[0] = nx_send_sync_request(c, (uint32_t)x[2]);
+        c->tpidrro = tls;
+        return;
+    }
+    case 0x24: x[0] = R_OK_; x[1] = 0x51; return;      // GetProcessId: un solo proceso
+    case 0x2A: case 0x2B: x[0] = R_OK_; return;        // FlushEntireDataCache, FlushDataCache: x86 es coherente
+    case 0x30: case 0x31: { // GetResourceLimitLimitValue / CurrentValue(límite, recurso)
+        static const uint64_t limite[] = {0xCD500000ull, 256, 700, 200, 900};
+        uint32_t k = (uint32_t)x[2];
+        x[0] = k < 5 ? R_OK_ : R_INVALID_ENUM;
+        x[1] = k >= 5 ? 0 : imm == 0x30 ? limite[k] : k == 0 ? heap_size : k == 1 ? 32 : limite[k] / 8;
+        return;
+    }
+    case 0x32: x[0] = set_thread_activity((uint32_t)x[0], (uint32_t)x[1]); return;
+    case 0x33: x[0] = get_thread_context((uint32_t)x[1], x[0]); return;
+    case 0x36: x[0] = R_OK_; return;                   // SynchronizePreemptionState
     case 0x25: { KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? t->id : 0; return; }
     case 0x26:
         fflush(stdout);
@@ -752,7 +864,7 @@ void nx_svc(Ctx *c, uint32_t imm) {
     case 0x29: x[0] = get_info((uint32_t)x[1], (uint32_t)x[2], x[3], &out); x[1] = out; return;
     case 0x2C: x[0] = map_physical(x[0], x[1], 1); return;
     case 0x2D: x[0] = map_physical(x[0], x[1], 0); return;
-    case 0x34: x[0] = wait_for_address(x[0], (uint32_t)x[1], (int32_t)x[2], (int64_t)x[3]); return;
+    case 0x34: x[0] = wait_for_address(x[0], (uint32_t)x[1], (int64_t)x[2], (int64_t)x[3]); return;
     case 0x35: x[0] = signal_to_address(x[0], (uint32_t)x[1], (int32_t)x[2], (int32_t)x[3]); return;
     case 0x45: { // CreateEvent → escritura, lectura
         pthread_mutex_lock(&G);

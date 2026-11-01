@@ -293,6 +293,10 @@ def main():
     out.append(f"const uint64_t nx_entry_addr = 0x{boot['entry']:x}ull;")
     stack = prog.npdm["pila"] if prog.npdm else 0x100000
     out.append(f"const uint64_t nx_main_stack = 0x{stack:x}ull;")
+    np = prog.npdm or {}
+    out.append(f"const uint64_t nx_system_resource = 0x{np.get('recurso del sistema', 0):x}ull;")
+    out.append(f"const uint64_t nx_program_id = 0x{np.get('programa', 0):x}ull;")
+    out.append(f"const int nx_main_priority = {np.get('prioridad', 44)}, nx_main_core = {np.get('núcleo', 0)};")
     out.append("")
     out.append("void nx_dispatch(Ctx *c, uint64_t a) {")
     out.append("    switch (a) {")

@@ -224,4 +224,13 @@ def parse_npdm(raw):
         "núcleo": raw[0x0F],
         "pila": struct.unpack_from("<I", raw, 0x1C)[0],
         "recurso del sistema": struct.unpack_from("<I", raw, 0x14)[0],
+        "programa": _aci0_programa(raw),
     }
+
+
+def _aci0_programa(raw):
+    """El id de programa del ACI0 (su offset y tamaño están en 0x70 del META)."""
+    off, size = struct.unpack_from("<II", raw, 0x70)
+    if size >= 0x18 and off + 0x18 <= len(raw) and raw[off:off + 4] == b"ACI0":
+        return struct.unpack_from("<Q", raw, off + 0x10)[0]
+    return 0

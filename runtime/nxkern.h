@@ -25,6 +25,7 @@ typedef struct KThread {
     uint64_t id, entry, tls;
     uint32_t handle;
     int priority, core, state;
+    int pausa, pausado; // SetThreadActivity: pedido de pausa y confirmación del hilo
     // espera
     int waiting, woken, cancel, cv_timeout_ignored;
     uint32_t result, tag;
