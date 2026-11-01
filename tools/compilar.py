@@ -26,7 +26,7 @@ def main():
     ap.add_argument("-j", type=int, default=os.cpu_count())
     ap.add_argument("-O", dest="opt", default="2", help="nivel de optimización de clang (por defecto 2)")
     args = ap.parse_args()
-    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c"]
+    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c"]
     srcs = sorted(glob.glob(os.path.join(args.carpeta, "*.c"))) + [os.path.join(ROOT, "runtime", f) for f in runtime]
     objdir = os.path.join(args.carpeta, "obj")
     os.makedirs(objdir, exist_ok=True)

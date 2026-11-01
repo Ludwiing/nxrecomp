@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "nxinput.h"
 #include "nxrt.h"
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -79,6 +80,7 @@ void nx_display_present(const NxFrame *f) {
     }
     to_rgba(f, frame);
     frames++;
+    nx_input_frame(frames);
     frame_new = 1;
     const char *cap = getenv("NX_CAPTURA");
     if (cap) {
@@ -111,7 +113,7 @@ void nx_display_run(void) {
     if (headless)
         for (;;) pause();
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[nxrt] no pude abrir la ventana (%s); sigo sin pantalla\n", SDL_GetError());
         for (;;) pause();
     }
@@ -126,11 +128,13 @@ void nx_display_run(void) {
     SDL_SetRenderVSync(ren, 1);
     for (;;) {
         SDL_Event ev;
-        while (SDL_PollEvent(&ev))
+        while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) {
                 fflush(stdout);
                 _exit(0);
             }
+            nx_input_event(&ev);
+        }
         pthread_mutex_lock(&lock);
         if (frame_new) {
             if (frame_w != tex_w || frame_h != tex_h) {

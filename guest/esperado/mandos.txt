@@ -1,0 +1,13 @@
+Prueba de mandos: esperando botones.
+bajan: A
+suben: A
+bajan: B X
+suben: B X
+bajan: Arriba
+suben: Arriba
+bajan: R ZL
+suben: R ZL
+bajan: -
+suben: -
+bajan: +
+Fin: salí con +.

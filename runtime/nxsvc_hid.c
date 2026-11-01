@@ -1,10 +1,11 @@
 // hid: controles. El juego mapea una memoria compartida de 0x40000 bytes donde el sistema
 // escribe el estado de los mandos (npad), la pantalla táctil, el teclado y el mouse.
-// Por ahora queda en cero: ningún botón apretado. Los mandos de verdad (SDL) van después.
+// Los mandos (teclado y mandos de SDL) los escribe nxinput.c.
 #include <stdlib.h>
 #include <string.h>
 
 #include "nxkern.h"
+#include "nxinput.h"
 #include "nxsvc.h"
 
 #define HID_SHMEM_SIZE 0x40000
@@ -16,7 +17,10 @@ static uint32_t hid_shmem_h;
 static uint32_t applet_resource(ServiceObject *self, NxRequest *r) {
     (void)self;
     if (r->cmd == 0) { // GetSharedMemoryHandle
-        if (!hid_shmem_h) hid_shmem_h = nx_shmem_new(HID_SHMEM_SIZE, &hid_shmem);
+        if (!hid_shmem_h) {
+            hid_shmem_h = nx_shmem_new(HID_SHMEM_SIZE, &hid_shmem);
+            nx_input_attach(hid_shmem->host); // desde aquí el sistema escribe los mandos
+        }
         nx_out_copy_handle(r, hid_shmem_h);
         return OK;
     }
