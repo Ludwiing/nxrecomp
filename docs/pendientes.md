@@ -48,8 +48,8 @@ Se marca [x] lo hecho.
 
 1. [~] Saltos indirectos a código no visto: [x] el runtime los anota en NX_PISTAS y
    `nxrecomp.py --pistas` los agrega como funciones (NX2Linux ofrece recompilar al salir el juego).
-   [ ] Formas de tablas de salto que hoy no se reconocen (base lejos, índice copiado antes, máscaras
-   de IL2CPP, cmp de 64 bits...).
+   [x] Tablas de salto con la base lejos (1024 instrucciones hacia atrás); el resolvedor ya seguía
+   índices copiados antes de la cota, máscaras, cmp de 64 bits, tablas de bytes y bases en bucles.
 2. [~] [x] QueryMemory por segmento (Code RX, Code R, CodeData RW). [ ] Excepciones de C++ y longjmp
    (necesitan continuaciones en los landing pads y en los puntos de retorno: diseño pendiente).
 3. [~] [x] Barrera después de STLR. [ ] Accesos a memoria del juego como atómicos relajados antes de

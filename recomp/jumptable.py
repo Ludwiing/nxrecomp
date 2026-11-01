@@ -14,7 +14,7 @@ código válidas.
 from a64 import bits, decode, sext
 
 M64 = (1 << 64) - 1
-MAX_BACK = 64       # instrucciones que se miran hacia atrás desde el BR
+MAX_BACK = 1024     # instrucciones que se miran hacia atrás desde el BR (la base puede estar a 700: Smash, ASTRAL CHAIN)
 MAX_ENTRIES = 1024  # tope sin cota conocida
 COND_HI, COND_HS, COND_LS, COND_LO = 0b1000, 0b0010, 0b1001, 0b0011
 CALLER_SAVED = set(range(19)) | {30}
