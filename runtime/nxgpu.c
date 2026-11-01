@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "nxgl.h"
 #include "nxrt.h"
 
 // ---------- espacio de direcciones ----------
@@ -74,6 +75,20 @@ void *nx_gpu_ptr(uint64_t gpu) {
     return NULL;
 }
 
+void *nx_gpu_ptr_n(uint64_t gpu, uint64_t *avail) {
+    pthread_mutex_lock(&as_lock);
+    for (int k = 0; k < nmaps; k++)
+        if (gpu >= maps[k].gpu && gpu < maps[k].gpu + maps[k].size) {
+            void *p = (void *)(uintptr_t)(maps[k].cpu + (gpu - maps[k].gpu));
+            *avail = maps[k].gpu + maps[k].size - gpu;
+            pthread_mutex_unlock(&as_lock);
+            return p;
+        }
+    pthread_mutex_unlock(&as_lock);
+    *avail = 0;
+    return NULL;
+}
+
 // ---------- syncpoints ----------
 #define NSYNCPT 192
 static uint32_t syncpts[NSYNCPT];
@@ -126,6 +141,10 @@ typedef struct {
     int macro_pending, macro_index;
     uint64_t i2m_dst;
     uint32_t i2m_len, i2m_done;
+    uint64_t cb_addr[5][18]; // constbufs enlazados por etapa (Bind[etapa].Constbuf)
+    uint32_t cb_size[5][18];
+    uint32_t instance;       // índice de instancia del draw en curso
+    int indexed;
 } Engine3D;
 
 static Engine3D e3d;
@@ -250,14 +269,6 @@ static void macro_flush(void) {
 }
 
 // ---------- 3D: acciones ----------
-static inline uint64_t bl_offset(uint32_t xb, uint32_t y, uint32_t width_gobs, uint32_t bh_log2) {
-    uint32_t bh = 1u << bh_log2;
-    uint64_t block = (uint64_t)(y / (8 * bh)) * width_gobs * bh * 512 + (uint64_t)(xb / 64) * bh * 512 +
-                     (uint64_t)((y % (8 * bh)) / 8) * 512;
-    uint32_t gx = xb % 64, gy = y % 8;
-    return block + (gx / 32) * 256 + (gy / 2) * 64 + ((gx % 32) / 16) * 32 + (gy % 2) * 16 + gx % 16;
-}
-
 static uint8_t unorm8(float f) { return (uint8_t)lrintf((f < 0 ? 0 : f > 1 ? 1 : f) * 255.0f); }
 
 static void clear_buffers(uint32_t v) {
@@ -272,6 +283,7 @@ static void clear_buffers(uint32_t v) {
         fprintf(stderr, "[RED] GPU: ClearBuffers en un render target sin memoria (0x%llx)\n", (unsigned long long)addr);
         return;
     }
+    nx_gl_cpu_write(addr, (uint64_t)w * 4 * (h + 128)); // lo que la GPU haya dibujado ahí va primero
     float col[4];
     memcpy(col, &R[0x360], 16);
     uint8_t px[4];
@@ -297,7 +309,7 @@ static void clear_buffers(uint32_t v) {
     uint32_t bh = tile >> 4 & 15, width_gobs = (w * 4 + 63) / 64;
     for (uint32_t y = y0; y < y1; y++)
         for (uint32_t x = x0; x < x1; x++) {
-            uint8_t *p = mem + (linear ? (uint64_t)y * w * 4 + x * 4 : bl_offset(x * 4, y, width_gobs, bh));
+            uint8_t *p = mem + (linear ? (uint64_t)y * w * 4 + x * 4 : nx_bl_offset(x * 4, y, width_gobs, bh));
             for (int c = 0; c < 4; c++)
                 if (!keep[c]) p[c] = px[c];
         }
@@ -319,6 +331,7 @@ static void report_semaphore(uint32_t v) {
     }
 }
 
+static int traza_gpu = -1; // NX_TRAZA_GPU: cada método del motor 3D
 static void method_3d(uint32_t m, uint32_t v) {
     m &= 0xFFF;
     if (m >= 0xE00) { // llamada a macro: la par empieza, la impar agrega parámetros
@@ -331,26 +344,51 @@ static void method_3d(uint32_t m, uint32_t v) {
         if (e3d.nmacro_params < 0x1000) e3d.macro_params[e3d.nmacro_params++] = v;
         return;
     }
+    if (traza_gpu) fprintf(stderr, "[gpu] 3d %03x = %08x\n", m, v);
     e3d.regs[m] = v;
     switch (m) {
     case 0x046: e3d.mme_code[e3d.mme_ptr++ & 0x1FFF] = v; break;       // MmeInstructionRamLoad
     case 0x045: e3d.mme_ptr = v; break;                                 // MmeInstructionRamPointer
     case 0x048: e3d.mme_start[e3d.mme_start_ptr++ & 0x7F] = v; break;   // MmeStartAddressRamLoad
     case 0x047: e3d.mme_start_ptr = v; break;                           // MmeStartAddressRamPointer
-    case 0x0B2: if (v >> 20 & 1) nx_syncpt_incr(v & 0xFFF); break;      // SyncptAction
+    case 0x0B2: // SyncptAction: lo dibujado tiene que estar en memoria antes de avisar
+        if (v >> 20 & 1) nx_gl_flush(), nx_syncpt_incr(v & 0xFFF);
+        break;
+    case 0x586: // VertexBeginGl: primitiva; InstanceNext suma una instancia, si no (y no sigue) vuelve a 0
+        if (v >> 26 & 1) e3d.instance++;
+        else if (!(v >> 27 & 1)) e3d.instance = 0;
+        break;
+    case 0x35E: e3d.indexed = 0; break; // DrawArraysCount
+    case 0x5F8: e3d.indexed = 1; break; // DrawElementsCount
+    case 0x585: { // VertexEndGl: dibujar
+        uint32_t *R = e3d.regs;
+        NxDraw d = {R, (const uint64_t (*)[18])e3d.cb_addr, (const uint32_t (*)[18])e3d.cb_size, R[0x586] & 0xFFFF,
+                    e3d.indexed ? R[0x5F7] : R[0x35D], e3d.indexed ? R[0x5F8] : R[0x35E], e3d.instance, e3d.indexed};
+        nx_gl_draw(&d);
+        break;
+    }
     case 0x8C4: e3d.regs[0xD00] = 1; break; // FirmwareCall4: el firmware (falcon) toca registros
                                             // que no nos importan y avisa en MmeFirmwareArgs[0]
     case 0x674: clear_buffers(v); break;                                // ClearBuffers
-    case 0x6C3: report_semaphore(v); break;                             // SetReportSemaphore
+    case 0x6C3: nx_gl_flush(), report_semaphore(v); break;              // SetReportSemaphore
     case 0x06C: // LaunchDma (carga en línea): destino y largo
         e3d.i2m_dst = iova(e3d.regs, 0x62);
         e3d.i2m_len = e3d.regs[0x60] * (e3d.regs[0x61] ? e3d.regs[0x61] : 1);
         e3d.i2m_done = 0;
         break;
     case 0x06D: { // LoadInlineData
+        if (e3d.i2m_done == 0) nx_gl_cpu_write(e3d.i2m_dst, e3d.i2m_len);
         uint8_t *p = nx_gpu_ptr(e3d.i2m_dst + e3d.i2m_done);
         if (p && e3d.i2m_done < e3d.i2m_len) memcpy(p, &v, e3d.i2m_len - e3d.i2m_done < 4 ? e3d.i2m_len - e3d.i2m_done : 4);
         e3d.i2m_done += 4;
+        break;
+    }
+    case 0x904: case 0x90C: case 0x914: case 0x91C: case 0x924: { // Bind[etapa].Constbuf
+        int s = (m - 0x904) / 8, slot = v >> 4 & 31;
+        if (slot < 18) {
+            e3d.cb_addr[s][slot] = v & 1 ? iova(e3d.regs, 0x8E1) : 0;
+            e3d.cb_size[s][slot] = e3d.regs[0x8E0] & 0x1FFFF;
+        }
         break;
     }
     default:
@@ -367,6 +405,7 @@ static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
     regs[m] = v;
     if (m == 0x07) { // Semaphore
         uint32_t op = v & 31;
+        if (op == 2) nx_gl_flush();
         uint8_t *p = nx_gpu_ptr(iova(regs, 0x04));
         if (op == 2 && p) { // Release
             if (v >> 24 & 1) memcpy(p, &regs[0x06], 4);
@@ -377,6 +416,7 @@ static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
             }
         }
     } else if (m == 0x1D && (v & 1)) { // Syncpoint: incrementar (esperar no hace falta: todo es en orden)
+        nx_gl_flush();
         nx_syncpt_incr(v >> 8 & 0xFF);
     }
 }
@@ -433,11 +473,14 @@ static void run_pushbuffer(uint64_t gpu, uint32_t words) {
 
 void nx_gpu_submit(const uint64_t *entries, uint32_t n) {
     pthread_mutex_lock(&gpu_lock);
+    if (traza_gpu < 0) traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
+    nx_gl_invalidate_all();
     for (uint32_t k = 0; k < n; k++) {
         uint64_t e = entries[k];
         uint64_t gpu = e & 0xFFFFFFFFFCull;
         uint32_t words = (uint32_t)(e >> 42 & 0x1FFFFF);
         if (words) run_pushbuffer(gpu, words);
     }
+    nx_gl_release();
     pthread_mutex_unlock(&gpu_lock);
 }

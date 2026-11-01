@@ -9,8 +9,12 @@ DEVKITPRO ?= /opt/devkitpro
 LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema)
 # Ejemplos oficiales de libnx con pantalla: se compara la huella del cuadro 10 (sin ventana).
 LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
-# deko3d por la GPU: por ahora solo se comprueba el color de limpieza (el triángulo necesita shaders).
+# deko3d por la GPU: el color de limpieza y el triángulo con sus colores interpolados.
 LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic)
+# Shaders de prueba: GLSL → uam (el compilador de deko3d) → código Maxwell → nxshader → GLSL, y la
+# imagen tiene que ser la misma que la del GLSL original en la GPU de esta máquina.
+UAM := $(DEVKITPRO)/tools/bin/uam
+SHADERS := $(if $(wildcard $(UAM)),$(patsubst tests/shaders/%.frag,%,$(wildcard tests/shaders/*.frag)))
 # Mandos: un guion aprieta botones en cuadros fijos y se compara lo que el programa vio.
 LIBNX_MANDOS := $(if $(wildcard $(DEVKITPRO)/libnx),mandos)
 PULSAR := 10:a,20:b+x,30:up,40:zl+r,50:minus,60:plus
@@ -33,11 +37,11 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxgpu.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -58,7 +62,7 @@ $(B)/%_rec/programa.c: $(B)/%.nro $(RECOMP)
 	python3 recomp/nxrecomp.py $< -o $(B)/$*_rec
 
 $(B)/%: $(B)/%_rec/programa.c $(RUNTIME) $(RUNTIME_H)
-	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread $(SDL_LIBS) -o $@
+	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread $(SDL_LIBS) -lEGL -lOpenGL -o $@
 
 # El mismo programa compilado directo para x86_64: su salida es la referencia.
 $(B)/%_ref: guest/%.c guest/mini.h | $(B)
@@ -95,6 +99,13 @@ $(B)/multi_ref: guest/multi/main.c guest/multi/sdk.c guest/multi/ref.c guest/min
 $(M):
 	mkdir -p $@
 
+$(B)/shader_test: tests/shader_test.c runtime/nxshader.c runtime/nxshader.h runtime/mxisa.h | $(B)
+	$(CLANG) -O1 -Iruntime tests/shader_test.c runtime/nxshader.c -lEGL -lOpenGL -o $@
+
+$(B)/shaders/%.dksh: tests/shaders/%.frag
+	@mkdir -p $(B)/shaders
+	$(UAM) -s frag -o $@ $< 2>/dev/null
+
 $(B)/libnx_%: guest/libnx/%/source/main.c $(RECOMP) $(RUNTIME) $(RUNTIME_H) | $(B)
 	DEVKITPRO=$(DEVKITPRO) $(MAKE) -s -C guest/libnx/$* >/dev/null
 	python3 recomp/nxrecomp.py guest/libnx/$*/$*.nro -o $(B)/libnx_$*_rec >/dev/null
@@ -118,10 +129,16 @@ test: all
 		if [ "$$(sha256sum < $(B)/$$p.ppm | cut -d' ' -f1)" = "$$(cat guest/esperado/$$p.sha256)" ]; then \
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
+	if [ -n "$(SHADERS)" ]; then \
+		if $(B)/shader_test --comparar $(foreach s,$(SHADERS),tests/shaders/$(s).frag $(B)/shaders/$(s).dksh); then \
+			echo "OK: los $(words $(SHADERS)) shaders de prueba traducidos dibujan lo mismo que su GLSL original"; \
+		else echo "MAL: algún shader traducido dibuja otra cosa"; ok=0; fi; \
+	fi; \
 	for p in $(LIBNX_GPU); do \
 		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/$$p.ppm NX_CAPTURA_CUADRO=5 timeout 60 $(B)/libnx_$$p >/dev/null; \
-		if python3 tools/pixel.py $(B)/$$p.ppm 0 0 32,75,122; then \
-			echo "OK: $$p (deko3d, GPU) limpió la pantalla con su color"; else echo "MAL: $$p no limpió la pantalla"; ok=0; fi; \
+		if python3 tools/pixel.py $(B)/$$p.ppm 0 0 32,75,122 1270 10 32,75,122 640 360 127,64,64 640 20 248,3,4 \
+			100 700 7,231,17 1180 700 7,16,232; then \
+			echo "OK: $$p (deko3d, GPU) dibujó el triángulo"; else echo "MAL: $$p dibujó otra cosa"; ok=0; fi; \
 	done; \
 	for p in $(LIBNX_MANDOS); do \
 		NX_SIN_VENTANA=1 NX_PULSAR="$(PULSAR)" timeout 60 $(B)/libnx_$$p > $(B)/$$p.salida.txt; \

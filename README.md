@@ -52,7 +52,7 @@ Hay dos ejemplos de audio:
 - `playtone` (`audout`) toca 220, 440 y 1760 Hz con A, B y X, y se compara el WAV.
 - `audren-simple` (el renderizador) tiene que sacar su `sample.bin` intacto, muestra por muestra, en los dos canales.
 
-Y uno de la GPU: `deko_basic` (deko3d, el driver de bajo nivel de los homebrew modernos) arranca el dispositivo, crea las colas y manda sus comandos a la GPU. `make test` comprueba que la pantalla quede limpia con su color (32, 75, 122); el triángulo todavía no se dibuja porque falta traducir los shaders.
+Y uno de la GPU: `deko_basic` (deko3d, el driver de bajo nivel de los homebrew modernos) arranca el dispositivo, crea las colas, sube sus shaders y dibuja su triángulo de colores. `make test` comprueba el color de limpieza y varios píxeles del triángulo.
 
 Para probar uno nuevo: `tools/probar_libnx.sh <nombre>` lo compila, lo recompila con `--traza` y lo corre. Para depurar:
 - Con `NX_TRAZA_SVC=1` se ven las llamadas al kernel.
@@ -89,7 +89,11 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
   - La GPU, en `runtime/nxgpu.c`, con sus dispositivos de `nvdrv` (`nvhost-ctrl`, `nvhost-ctrl-gpu`, `nvhost-as-gpu`, `nvhost-gpu`) en `nxsvc_vi.c`:
     - Espacio de direcciones de la GPU (las direcciones de GPU apuntan a la memoria del juego), syncpoints con esperas reales, y el GPFIFO: cada `SubmitGpfifo`/`KickoffPb` ejecuta el pushbuffer en el momento.
     - Motor 3D Maxwell (`B197`): el intérprete de macros MME completo (los drivers suben sus macros y las llaman), `ClearBuffers` sobre render targets lineales o "block linear", semáforos de reporte, carga en línea (`I2M`) y carga de constbufs.
-    - Falta lo grande: traducir los shaders de Maxwell a SPIR-V y dibujar con Vulkan; los motores 2D, de cómputo y de copia; y las texturas.
+    - Shaders: `runtime/nxshader.c` traduce el código de máquina Maxwell a GLSL 4.60. La codificación de las 293 instrucciones (`runtime/mxisa.h`) se genera con `tools/gen_maxwell.py` desde las tablas del traductor de Ryujinx (MIT, `third_party/LICENSE.ryujinx`); la semántica está escrita aquí. Ya traduce atributos, constbufs, aritmética de punto flotante y entera (incluida XMAD), bits, conversiones, predicados, memoria local, `discard` y el flujo de control (saltos, SSY/SYNC, PBK/BRK, PCNT/CONT, CAL/RET, como un `switch` dentro de un bucle). `tools/mxdis.py` desensambla.
+    - Dibujo: `runtime/nxgl.c` sobre OpenGL 4.6 sin ventana (EGL), en la GPU de la máquina. Cada draw arma el estado de OpenGL desde los registros (shaders traducidos y cacheados, constbufs, atributos de vértice, índices, viewport, scissor, caras, profundidad, blending, máscaras) y dibuja en texturas que reflejan los render targets del juego: se cargan desde su memoria cuando la CPU pudo cambiarla y se escriben de vuelta (con su "block linear") antes de cada syncpoint o semáforo.
+    - `NX_TRAZA_GL=1` muestra los shaders traducidos y cada draw; `NX_TRAZA_GPU=1`, cada método del motor 3D; `NX_SIN_GPU=1` no dibuja.
+    - Cómo se verifica: `make test` compila los GLSL de `tests/shaders` con `uam` (el compilador de deko3d) a código Maxwell, los traduce de vuelta y compara, píxel por píxel en float32, contra el GLSL original en la misma GPU.
+    - Falta: texturas y samplers, half floats, motores 2D, de cómputo y de copia, profundidad sincronizada con la memoria, geometría y teselación, y un backend Vulkan.
 
   Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.
 
@@ -122,7 +126,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 - **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
 - **Audio**: el ADPCM, el remuestreo con tono distinto de 1 y las submezclas están escritos, pero ningún ejemplo los prueba todavía. Faltan los efectos (reverb, delay...) y los formatos de revisión más nuevos que usa el SDK de Nintendo.
-- **Servicios**: de la GPU solo está la base (comandos, macros y limpieza de pantalla; falta dibujar con shaders sobre Vulkan, la parte más grande), y faltan `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
+- **Servicios**: la GPU ya dibuja con shaders traducidos sobre OpenGL, pero sin texturas todavía (ver arriba), y faltan `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
 - **Excepciones de C++ y `longjmp`**: un RET a una dirección que no es inicio de función (el destino de un `longjmp`, o una plataforma de aterrizaje de una excepción) todavía no se resuelve.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.
 - **Velocidad**: el código traducido es entre 2 y 4,5 veces más lento que el nativo. Los registros viven en memoria y todavía no hay optimizaciones.
@@ -136,7 +140,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 4. ~~Formato NSO y NSP~~: hecho (extracción, NSO con LZ4, enlace entre módulos, NPDM).
 5. **Hilos y sincronización de Horizon**: mapear los hilos del juego a hilos de Linux, con atómicos de verdad.
 6. **Servicios del SDK** (`sm`, `fs`, `hid`, `vi`, `nvdrv`, audio). nxnative tiene muchos en C portable bajo `dm/host`.
-7. **Gráficos**: NVN sobre Vulkan para la RTX/Radeon, en lugar de Metal. Hecha la primera etapa: los comandos de la GPU llegan, las macros corren y la pantalla se limpia. Siguen los shaders.
+7. **Gráficos**: NVN sobre Vulkan para la RTX/Radeon, en lugar de Metal. Hechas las dos primeras etapas: los comandos de la GPU llegan, las macros corren, los shaders se traducen y se dibuja con OpenGL. Siguen las texturas.
 8. **Integración con Omarchy**: un lanzador `.desktop`, mandos con SDL y ventana en Hyprland.
 
 Los juegos y las llaves tienen que ser tuyos, sacados de tu propia consola. Este repositorio no incluye nada de ningún juego.
