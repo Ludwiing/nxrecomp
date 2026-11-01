@@ -19,8 +19,10 @@ Se marca [x] lo hecho.
 4. [~] Reportes: hecho el tipo de contador (consultas de OpenGL), CounterReset y las marcas de
    tiempo en ticks de 614,4 MHz. [x] Renderizado condicional (RenderEnable, sin prueba: deko3d no lo expone). Antes: tipo de contador (oclusión, primitivas, transform feedback) y marcas de tiempo en
    ticks de la GPU (ns × 384 / 625). Renderizado condicional (RenderEnable).
-5. [ ] Caché de texturas que resuelve el solapamiento render target / textura por formato, nivel y
-   capa; `glTextureBarrier` al leer un render target enlazado.
+5. [~] Render target leído como textura: [x] vistas de OpenGL con otro formato del mismo tamaño,
+   como arreglo o con swizzle; [x] glTextureBarrier al leer render targets; si no se puede ver así,
+   se escribe a memoria y se lee de ahí. Falta: niveles de mipmap, caras de cubo y capas dibujados
+   y leídos en el mismo envío; codificadores BC que dibujan sobre la memoria de la textura (agl).
 6. [x] Handles de textura y sampler separados (OR de dos palabras de constbuf, LopR/LopC/Lop3);
    texturas de buffer (descriptor tipo 6 → samplerBuffer, sin filtro y con ancho de 32 bits).
 7. [~] Estado fijo que va dentro del shader: [x] alpha test, [x] posición invariante, [x] atributos

@@ -249,7 +249,18 @@ typedef struct {
     GLuint tex;
     int stale, dirty;
     uint32_t sx, sy; // muestras por píxel en x e y: en memoria cada píxel ocupa sx × sy
+    struct {         // vistas para leerlo como textura con otro formato compatible, tipo o swizzle
+        GLuint tex;
+        GLenum internal, target;
+        uint32_t swz;
+    } vistas[4];
 } Rt;
+
+static void rt_borrar(Rt *r) {
+    glDeleteTextures(1, &r->tex);
+    for (int v = 0; v < 4; v++)
+        if (r->vistas[v].tex) glDeleteTextures(1, &r->vistas[v].tex);
+}
 
 // Muestras de cada modo de MultisampleMode (maxwell::MsaaMode).
 static void msaa(uint32_t mode, uint32_t *sx, uint32_t *sy) {
@@ -368,17 +379,17 @@ static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32
     for (int i = 0; i < nrts; i++)
         if (rts[i].addr == addr) {
             if (rts[i].dirty) rt_escribir(&rts[i]);
-            glDeleteTextures(1, &rts[i].tex);
+            rt_borrar(&rts[i]);
             rts[i] = rts[--nrts];
             break;
         }
     if (nrts == 64) {
         if (rts[0].dirty) rt_escribir(&rts[0]);
-        glDeleteTextures(1, &rts[0].tex);
+        rt_borrar(&rts[0]);
         rts[0] = rts[--nrts];
     }
     Rt *r = &rts[nrts++];
-    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy};
+    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, {{0}}};
     glCreateTextures(GL_TEXTURE_2D, 1, &r->tex);
     glTextureStorage2D(r->tex, 1, f->internal, w, h);
     glTextureParameteri(r->tex, GL_TEXTURE_MAX_LEVEL, 0); // un solo nivel: completa aunque se lea sin sampler
@@ -703,16 +714,62 @@ static void tex_subir(Tex *x, const Tic *t, const TexFmt *f, const uint8_t *mem,
 static Tex *ultima_tex;  // la entrada de la caché que devolvió textura() (NULL si fue un render target)
 static Rt *ultimo_rt;
 
+static int rt_leido; // el draw lee un render target: puede ser uno de los que dibuja (barrera)
+
+static GLuint rt_vista(Rt *r, const Tic *t, int tipo) {
+    const TexFmt *f = tex_fmt(t->fmt, t->comp);
+    GLenum want = f ? (t->srgb && f->srgb ? f->srgb : f->internal) : r->f->internal;
+    uint32_t swz = 0;
+    for (int i = 0; i < 4; i++) swz |= t->swz[i] << (i * 3);
+    int identidad = swz == (2u | 3u << 3 | 4u << 6 | 5u << 9) || r->f->depth;
+    GLenum target = tipo == NX_TEX_2D_ARRAY ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    if (want == r->f->internal && target == GL_TEXTURE_2D && identidad) return r->tex;
+    if (!f || f->bw != 1 || f->astc || (f->depth != 0) != (r->f->depth != 0) || f->bpb != r->f->bpp) return 0;
+    if (r->f->depth && want != r->f->internal) return 0;
+    for (int v = 0; v < 4; v++)
+        if (r->vistas[v].tex && r->vistas[v].internal == want && r->vistas[v].target == target && r->vistas[v].swz == swz)
+            return r->vistas[v].tex;
+    int v = 0;
+    while (v < 3 && r->vistas[v].tex) v++;
+    if (r->vistas[v].tex) glDeleteTextures(1, &r->vistas[v].tex);
+    GLuint tex;
+    glGenTextures(1, &tex); // una vista necesita un nombre sin usar
+    glGetError();
+    glTextureView(tex, target, r->tex, want, 0, 1, 0, 1);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteTextures(1, &tex);
+        return 0;
+    }
+    if (!r->f->depth) {
+        GLint sw[4];
+        for (int i = 0; i < 4; i++) {
+            uint32_t s = t->swz[i];
+            sw[i] = s == 2 ? GL_RED : s == 3 ? GL_GREEN : s == 4 ? GL_BLUE : s == 5 ? GL_ALPHA : s >= 6 ? GL_ONE : GL_ZERO;
+        }
+        glTextureParameteriv(tex, GL_TEXTURE_SWIZZLE_RGBA, sw);
+    }
+    r->vistas[v].tex = tex, r->vistas[v].internal = want, r->vistas[v].target = target, r->vistas[v].swz = swz;
+    return tex;
+}
+
 static GLuint textura(const uint32_t *tic_words, int shader_type) {
     Tic t;
     tic_leer(tic_words, &t);
     ultima_tex = NULL, ultimo_rt = NULL;
-    // Una textura que es un render target se lee directo de la GPU.
+    // Una textura que es un render target se lee directo de la GPU: tal cual, o con una vista si el
+    // descriptor pide otro formato del mismo tamaño, un arreglo de una capa o un swizzle.
     for (int i = 0; i < nrts; i++)
-        if (rts[i].addr == t.addr && (shader_type & 15) == NX_TEX_2D) {
-            if (rts[i].stale) rt_cargar(&rts[i]);
-            ultimo_rt = &rts[i];
-            return rts[i].tex;
+        if (rts[i].addr == t.addr && ((shader_type & 15) == NX_TEX_2D || (shader_type & 15) == NX_TEX_2D_ARRAY)) {
+            Rt *r = &rts[i];
+            GLuint v = rt_vista(r, &t, shader_type & 15);
+            if (!v) { // no se puede ver así: que la textura salga de la memoria, con lo último dibujado
+                if (r->dirty) rt_escribir(r);
+                break;
+            }
+            if (r->stale) rt_cargar(r);
+            ultimo_rt = r;
+            rt_leido = 1;
+            return v;
         }
     GLenum target;
     switch (shader_type & 15) {
@@ -1569,6 +1626,7 @@ int nx_gl_draw(const NxDraw *d) {
     if (!vertices(R, &vs->info, d)) return 1;
     if (vs->info.uses_instance) glProgramUniform1ui(vs->prog, 0, d->instance);
     int nsb = 0;
+    rt_leido = 0;
     for (int e = 0; e < 5; e++)
         if (st[e]) {
             constbufs(d->cb_addr[e], d->cb_size[e], e, &st[e]->info, e * 16);
@@ -1576,6 +1634,9 @@ int nx_gl_draw(const NxDraw *d) {
             imagenes(R, d->cb_addr[e], &st[e]->info, st[e]->key.img_binding);
             nsb = ssbos(d->cb_addr[e], &st[e]->info, e * 16, nsb);
         }
+    // Leer lo que dibujaron los draws anteriores en un render target (quizá el mismo que este
+    // dibuja): sin barrera, OpenGL puede dar datos viejos (los bloques magenta de nxnative).
+    if (rt_leido) glTextureBarrier();
 
     GLenum mode = d->topology <= 6 || (d->topology >= 10 && d->topology <= 13) ? d->topology : GL_TRIANGLES;
     if (d->topology == 14) { // parches: los vértices por parche los dice TessellationPatchSize
