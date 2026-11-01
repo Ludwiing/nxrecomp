@@ -256,6 +256,7 @@ uint32_t nx_fsp(ServiceObject *self, NxRequest *r) {
     case 200: { // OpenDataStorageByCurrentProcess: el RomFS del juego
         const char *path = getenv("NX_ROMFS");
         FILE *f = path ? fopen(path, "rb") : NULL;
+        if (!f && nx_romfs_size) f = fmemopen((void *)nx_romfs_data, nx_romfs_size, "rb"); // el del NRO
         if (!f) {
             fprintf(stderr, "[RED] el juego abrió su RomFS, pero no hay imagen: define NX_ROMFS=<RomFS.img>\n");
             return 0x7D402u;

@@ -9,6 +9,8 @@ DEVKITPRO ?= /opt/devkitpro
 LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema)
 # Ejemplos oficiales de libnx con pantalla: se compara la huella del cuadro 10 (sin ventana).
 LIBNX_PANTALLA := $(if $(wildcard $(DEVKITPRO)/libnx),hola_mundo simplegfx)
+# deko3d por la GPU: por ahora solo se comprueba el color de limpieza (el triángulo necesita shaders).
+LIBNX_GPU := $(if $(wildcard $(DEVKITPRO)/libnx),deko_basic)
 # Mandos: un guion aprieta botones en cuadros fijos y se compara lo que el programa vio.
 LIBNX_MANDOS := $(if $(wildcard $(DEVKITPRO)/libnx),mandos)
 PULSAR := 10:a,20:b+x,30:up,40:zl+r,50:minus,60:plus
@@ -31,11 +33,11 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxgpu.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -115,6 +117,11 @@ test: all
 		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/$$p.ppm NX_CAPTURA_CUADRO=10 timeout 60 $(B)/libnx_$$p >/dev/null; \
 		if [ "$$(sha256sum < $(B)/$$p.ppm | cut -d' ' -f1)" = "$$(cat guest/esperado/$$p.sha256)" ]; then \
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
+	done; \
+	for p in $(LIBNX_GPU); do \
+		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/$$p.ppm NX_CAPTURA_CUADRO=5 timeout 60 $(B)/libnx_$$p >/dev/null; \
+		if python3 tools/pixel.py $(B)/$$p.ppm 0 0 32,75,122; then \
+			echo "OK: $$p (deko3d, GPU) limpió la pantalla con su color"; else echo "MAL: $$p no limpió la pantalla"; ok=0; fi; \
 	done; \
 	for p in $(LIBNX_MANDOS); do \
 		NX_SIN_VENTANA=1 NX_PULSAR="$(PULSAR)" timeout 60 $(B)/libnx_$$p > $(B)/$$p.salida.txt; \

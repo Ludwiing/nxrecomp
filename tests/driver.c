@@ -29,6 +29,8 @@ const char *const nx_imports[] = {0};
 const int nx_nimports = 0;
 const NxSymbol nx_symbols[] = {{0, 0}};
 const int nx_nsymbols = 0;
+const unsigned char nx_romfs_data[1];
+const uint64_t nx_romfs_size = 0;
 
 static uint32_t crc_table[256];
 static volatile int current = -1;

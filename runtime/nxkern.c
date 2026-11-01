@@ -439,6 +439,17 @@ static void reserve(uint64_t addr, uint64_t size, const char *what) {
     }
 }
 
+// La región de pilas está reservada en el host, pero para Horizon lo que no se usa ahí sigue
+// libre: libnx puede elegir esas direcciones (virtmemFindAslr no la evita) para memoria compartida.
+static int in_stack_region(uint64_t addr, uint64_t size) {
+    return addr >= NX_STACK_BASE && addr + size <= NX_STACK_BASE + NX_STACK_SIZE;
+}
+static int range_free(uint64_t addr, uint64_t size) {
+    for (int k = 0; k < nregions; k++)
+        if (regions[k].addr < addr + size && addr < regions[k].addr + regions[k].size) return 0;
+    return 1;
+}
+
 void nx_memory_init(void) {
     reserve(NX_HEAP_BASE, NX_HEAP_MAX, "el heap");
     reserve(NX_ALIAS_BASE, NX_ALIAS_SIZE, "la región alias");
@@ -654,9 +665,14 @@ void nx_svc(Ctx *c, uint32_t imm) {
             x[0] = s ? R_INVALID_SIZE : R_INVALID_HANDLE;
             return;
         }
-        void *p = mmap((void *)(uintptr_t)x[1], x[2], PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, s->fd, 0);
+        int fixed = in_stack_region(x[1], x[2]) && range_free(x[1], x[2]); // sobre la reserva
+        void *p = mmap((void *)(uintptr_t)x[1], x[2], PROT_READ | PROT_WRITE,
+                       MAP_SHARED | (fixed ? MAP_FIXED : MAP_FIXED_NOREPLACE), s->fd, 0);
         if (p != (void *)(uintptr_t)x[1]) {
             pthread_mutex_unlock(&G);
+            fprintf(stderr, "[nxkern] MapSharedMemory en 0x%llx (0x%llx bytes) falló: %s\n",
+                    (unsigned long long)x[1], (unsigned long long)x[2], strerror(errno));
+            if (p != MAP_FAILED) munmap(p, x[2]);
             x[0] = R_INVALID_ADDR;
             return;
         }
@@ -667,7 +683,10 @@ void nx_svc(Ctx *c, uint32_t imm) {
     }
     case 0x14: { // UnmapSharedMemory(handle, addr, size)
         pthread_mutex_lock(&G);
-        munmap((void *)(uintptr_t)x[1], x[2]);
+        if (in_stack_region(x[1], x[2])) // devolver el hueco a la reserva
+            mmap((void *)(uintptr_t)x[1], x[2], PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        else
+            munmap((void *)(uintptr_t)x[1], x[2]);
         region_remove(x[1]);
         pthread_mutex_unlock(&G);
         x[0] = R_OK_;

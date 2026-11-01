@@ -170,7 +170,13 @@ def load_nro(raw, name="main"):
     size = struct.unpack_from("<I", raw, 0x18)[0]
     s = struct.unpack_from("<6I", raw, 0x20)
     bss = struct.unpack_from("<I", raw, 0x38)[0]
-    return Image(name, raw[:size], (s[0], s[1]), (s[2], s[3]), (s[4], s[5]), bss, raw[0x40:0x60], kind="nro")
+    img = Image(name, raw[:size], (s[0], s[1]), (s[2], s[3]), (s[4], s[5]), bss, raw[0x40:0x60], kind="nro")
+    # Los homebrew traen después del código una sección ASET: ícono, NACP y RomFS.
+    img.romfs = b""
+    if raw[size:size + 4] == b"ASET" and len(raw) >= size + 0x38:
+        off, rsize = struct.unpack_from("<QQ", raw, size + 0x28)
+        img.romfs = bytes(raw[size + off:size + off + rsize])
+    return img
 
 
 def load_module(raw, name):

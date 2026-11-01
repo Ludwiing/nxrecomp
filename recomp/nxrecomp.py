@@ -259,6 +259,16 @@ def main():
         asm = f'.section .rodata\n.balign 16\n.global nx_mod{k}\nnx_mod{k}:\n.incbin "{path}"\n.previous\n'
         out.append(f"__asm__({c_string(asm)});")
         out.append(f"extern const unsigned char nx_mod{k}[];")
+    romfs = next((getattr(m.img, "romfs", b"") for m in prog.modules if getattr(m.img, "romfs", b"")), b"")
+    if romfs:
+        path = os.path.abspath(os.path.join(args.output, "romfs.bin"))
+        open(path, "wb").write(romfs)
+        asm = f'.section .rodata\n.balign 16\n.global nx_romfs_data\nnx_romfs_data:\n.incbin "{path}"\n.previous\n'
+        out.append(f"__asm__({c_string(asm)});")
+        out.append("extern const unsigned char nx_romfs_data[];")
+    else:
+        out.append("const unsigned char nx_romfs_data[1];")
+    out.append(f"const uint64_t nx_romfs_size = {len(romfs)};")
     out.append("const NxModule nx_modules[] = {")
     for k, m in enumerate(prog.modules):
         out.append(f"    {{ {c_string(m.name)}, 0x{m.base:x}ull, 0x{m.img.size:x}ull, 0x{m.img.bss:x}ull, nx_mod{k} }},")

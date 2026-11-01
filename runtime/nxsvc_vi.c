@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "nxdisplay.h"
+#include "nxgpu.h"
 #include "nxkern.h"
 #include "nxsvc.h"
 
@@ -359,6 +360,111 @@ static uint32_t nvmap_ioctl(uint32_t nr, uint8_t *io) {
     return 1; // NvError_NotImplemented
 }
 
+// ---------- dispositivos de la GPU ----------
+static void io32(uint8_t *io, uint32_t off, uint32_t v) { memcpy(io + off, &v, 4); }
+static void io64(uint8_t *io, uint32_t off, uint64_t v) { memcpy(io + off, &v, 8); }
+static uint64_t get64(const uint8_t *io, uint32_t off) { uint64_t v; memcpy(&v, io + off, 8); return v; }
+
+static uint32_t ctrl_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-ctrl: syncpoints
+    uint32_t id = u32at(io);
+    switch (nr) {
+    case 0x14: io32(io, 4, nx_syncpt_read(id)); return 0;                // SyncptRead
+    case 0x15: nx_syncpt_incr(id); return 0;                              // SyncptIncr
+    case 0x16: return nx_syncpt_wait(id, u32at(io + 4), (int32_t)u32at(io + 8) * 1000) ? 0 : 5; // SyncptWait
+    case 0x1D: case 0x1E: { // EventWait / EventWaitAsync: con todo en orden, el valor ya llegó
+        int ok = nx_syncpt_wait(id, u32at(io + 4), nr == 0x1E ? 0 : (int32_t)u32at(io + 8));
+        io32(io, 12, nx_syncpt_read(id));
+        return ok ? 0 : 5; // NvError_Timeout
+    }
+    case 0x1C: case 0x1F: case 0x20: return 0; // EventSignal / EventRegister / EventUnregister
+    }
+    return 1;
+}
+
+static uint32_t ctrl_gpu_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-ctrl-gpu: cómo es la GPU
+    switch (nr) {
+    case 0x01: io32(io, 0, 0x7A000); return 0; // ZCullGetCtxSize
+    case 0x02: { // ZCullGetInfo
+        uint32_t z[10] = {0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xC0, 0x20, 0x40, 0x10};
+        memcpy(io, z, sizeof z);
+        return 0;
+    }
+    case 0x03: case 0x04: return 0; // ZbcSetTable / ZbcQueryTable
+    case 0x05: { // GetCharacteristics: los valores reales del Tegra X1 (GM20B)
+        uint8_t *g = io + 16;
+        memset(g, 0, 0xA0);
+        io64(io, 0, 0xA0);
+        uint32_t a[] = {0x120, 0xB, 0xA1, 1};
+        memcpy(g, a, 16);
+        io64(g, 0x10, 0x40000);
+        uint32_t b[] = {2, 0x20, 0x20000, 0x20000, 0x1B, 0x30000, 1, 0x503, 0x503, 0x80, 0x28, 0};
+        memcpy(g + 0x20, b, sizeof b);
+        io64(g, 0x50, 0x55);
+        uint32_t c[] = {0x902D, 0xB197, 0xB1C0, 0xB06F, 0xA140, 0xB0B5, 1, 0, 2, 1, 0, 1, 0x21D70, 0};
+        memcpy(g + 0x58, c, sizeof c);
+        io64(g, 0x90, 0x6230326D67ull); // "gm20b"
+        return 0;
+    }
+    case 0x06: io[16] = 3; return 0;                                   // GetTpcMasks: 2 TPC
+    case 0x14: io32(io, 0, 7); io32(io, 4, 0); return 0;             // ZbcGetActiveSlotMask
+    case 0x1C: io64(io, 0, nx_now_ns()); return 0;                    // GetGpuTime
+    }
+    return 1;
+}
+
+static uint32_t as_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-as-gpu: el espacio de direcciones
+    switch (nr) {
+    case 0x01: case 0x03: case 0x09: return 0; // BindChannel / FreeSpace / InitializeEx
+    case 0x02: { // AllocSpace(páginas, tamaño de página, banderas, offset o alineación)
+        uint64_t size = (uint64_t)u32at(io) * u32at(io + 4);
+        if (!(u32at(io + 8) & 1)) io64(io, 16, nx_gpu_alloc_va(size, get64(io, 16)));
+        return 0;
+    }
+    case 0x05: nx_gpu_unmap(get64(io, 0)); return 0; // UnmapBuffer
+    case 0x06: { // MapBufferEx(banderas, kind, handle, página, offset en el buffer, tamaño, dirección)
+        if (u32at(io) & 0x100) return 0; // "modificar": cambia el kind (compresión) de un mapeo que ya existe
+        NvMapObj *m = nvmap_by_handle(u32at(io + 8));
+        if (!m) return 4;
+        uint64_t off = get64(io, 16), size = get64(io, 24);
+        if (!size) size = m->size - off;
+        uint64_t va = (u32at(io) & 1) ? get64(io, 32) : nx_gpu_alloc_va(size, 0x20000);
+        nx_gpu_map(va, size, m->addr + off);
+        io64(io, 32, va);
+        return 0;
+    }
+    case 0x08: { // GetVARegions: páginas chicas y grandes
+        io32(io, 8, 0x30);
+        uint64_t r0[3] = {0x04000000, 0x1000, 0x3FBFFF}, r1[3] = {0x400000000ull, 0x20000, 0x1BFFF};
+        memcpy(io + 16, r0, 24);
+        memcpy(io + 40, r1, 24);
+        return 0;
+    }
+    }
+    return 1;
+}
+
+static uint32_t chan_syncpt = 18; // el syncpoint del canal de la GPU
+
+static uint32_t gpu_ioctl(uint32_t type, uint32_t nr, uint8_t *io, const uint8_t *extra, uint64_t extra_size) {
+    if (type == 0x47) return 0; // SetUserData
+    switch (nr) {
+    case 0x01: case 0x03: case 0x0B: case 0x0C: case 0x0D: return 0; // nvmap fd, timeout, zcull, notificador, prioridad
+    case 0x09: io64(io, 8, 1); return 0;                             // AllocObjCtx
+    case 0x16: case 0x17: memset(io, 0, 16); return 0;                 // errores: ninguno
+    case 0x1A: io32(io, 12, chan_syncpt); io32(io, 16, nx_syncpt_read(chan_syncpt)); return 0; // AllocGpfifoEx2
+    case 0x08: case 0x1B: { // SubmitGpfifo (entradas en el mismo buffer) / KickoffPb (en el segundo)
+        uint32_t n = u32at(io + 8);
+        const uint8_t *e = nr == 0x08 ? io + 24 : extra;
+        if (!e || (nr == 0x1B && extra_size < (uint64_t)n * 8)) return 4;
+        nx_gpu_submit((const uint64_t *)e, n);
+        io32(io, 16, chan_syncpt);
+        io32(io, 20, nx_syncpt_read(chan_syncpt));
+        return 0;
+    }
+    }
+    return 1;
+}
+
 uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
@@ -388,17 +494,31 @@ uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
         uint32_t fd = nx_in32(r, 0), req = nx_in32(r, 4);
         uint32_t size = req >> 16 & 0x3FFF, type = req >> 8 & 0xFF, nr = req & 0xFF;
         NxBuffer *in = nx_in_buffer(r, 0), *out = nx_out_buffer(r, r->cmd == 12 ? 0 : 0);
-        uint8_t io[0x400] = {0};
+        static __thread uint8_t io[0x4000];
+        memset(io, 0, sizeof io);
         if (size > sizeof io) size = sizeof io;
         if (in && in->size) memcpy(io, (const void *)(uintptr_t)in->addr, in->size < size ? in->size : size);
         uint32_t err = 1;
         pthread_mutex_lock(&nv_lock);
         int dev = fd < 64 ? fds[fd].dev : DEV_NONE;
         if (dev == DEV_NVMAP && type == 0x01) err = nvmap_ioctl(nr, io);
-        else if (dev == DEV_CTRL) err = 0; // sin cercas que esperar: no hay GPU todavía
         pthread_mutex_unlock(&nv_lock);
+        if (dev == DEV_CTRL) err = ctrl_ioctl(nr, io);
+        else if (dev == DEV_CTRL_GPU) err = ctrl_gpu_ioctl(nr, io);
+        else if (dev == DEV_AS_GPU) err = as_ioctl(nr, io);
+        else if (dev == DEV_GPU) {
+            NxBuffer *x = r->cmd == 11 ? nx_in_buffer(r, 1) : NULL;
+            err = gpu_ioctl(type, nr, io, x ? (const uint8_t *)(uintptr_t)x->addr : NULL, x ? x->size : 0);
+        }
         if (err == 1)
             fprintf(stderr, "[RED] nvdrv: ioctl 0x%08x en %s no implementado\n", req, fd < 64 ? fds[fd].name : "?");
+        static int trace = -1;
+        if (trace < 0) trace = getenv("NX_TRAZA_NV") != NULL;
+        if (trace) {
+            fprintf(stderr, "[nv] %s ioctl 0x%08x → %u:", fd < 64 ? fds[fd].name : "?", req, err);
+            for (uint32_t k = 0; k < size && k < 32; k += 4) fprintf(stderr, " %08x", u32at(io + k));
+            fprintf(stderr, "\n");
+        }
         if (out && out->size) memcpy((void *)(uintptr_t)out->addr, io, out->size < size ? out->size : size);
         nx_out32(r, err);
         return OK;

@@ -52,6 +52,8 @@ Hay dos ejemplos de audio:
 - `playtone` (`audout`) toca 220, 440 y 1760 Hz con A, B y X, y se compara el WAV.
 - `audren-simple` (el renderizador) tiene que sacar su `sample.bin` intacto, muestra por muestra, en los dos canales.
 
+Y uno de la GPU: `deko_basic` (deko3d, el driver de bajo nivel de los homebrew modernos) arranca el dispositivo, crea las colas y manda sus comandos a la GPU. `make test` comprueba que la pantalla quede limpia con su color (32, 75, 122); el triángulo todavía no se dibuja porque falta traducir los shaders.
+
 Para probar uno nuevo: `tools/probar_libnx.sh <nombre>` lo compila, lo recompila con `--traza` y lo corre. Para depurar:
 - Con `NX_TRAZA_SVC=1` se ven las llamadas al kernel.
 - Con `NX_TRAZA_FUNC=1`, cada función que se ejecuta. `aarch64-none-elf-addr2line` traduce la dirección a función y línea.
@@ -84,6 +86,11 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
     - `NX_SIN_AUDIO=1` no abre el dispositivo.
     - `NX_AUDIO_WAV=f.wav` graba lo que suena.
 
+  - La GPU, en `runtime/nxgpu.c`, con sus dispositivos de `nvdrv` (`nvhost-ctrl`, `nvhost-ctrl-gpu`, `nvhost-as-gpu`, `nvhost-gpu`) en `nxsvc_vi.c`:
+    - Espacio de direcciones de la GPU (las direcciones de GPU apuntan a la memoria del juego), syncpoints con esperas reales, y el GPFIFO: cada `SubmitGpfifo`/`KickoffPb` ejecuta el pushbuffer en el momento.
+    - Motor 3D Maxwell (`B197`): el intérprete de macros MME completo (los drivers suben sus macros y las llaman), `ClearBuffers` sobre render targets lineales o "block linear", semáforos de reporte, carga en línea (`I2M`) y carga de constbufs.
+    - Falta lo grande: traducir los shaders de Maxwell a SPIR-V y dibujar con Vulkan; los motores 2D, de cómputo y de copia; y las texturas.
+
   Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.
 
 ## El conjunto de instrucciones: completo para la CPU de la Switch
@@ -115,7 +122,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 - **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
 - **Audio**: el ADPCM, el remuestreo con tono distinto de 1 y las submezclas están escritos, pero ningún ejemplo los prueba todavía. Faltan los efectos (reverb, delay...) y los formatos de revisión más nuevos que usa el SDK de Nintendo.
-- **Servicios**: falta la GPU (NVN sobre Vulkan, la parte más grande; hoy solo se muestran cuadros dibujados por la CPU), `audren`/`audout`, `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
+- **Servicios**: de la GPU solo está la base (comandos, macros y limpieza de pantalla; falta dibujar con shaders sobre Vulkan, la parte más grande), y faltan `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
 - **Excepciones de C++ y `longjmp`**: un RET a una dirección que no es inicio de función (el destino de un `longjmp`, o una plataforma de aterrizaje de una excepción) todavía no se resuelve.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.
 - **Velocidad**: el código traducido es entre 2 y 4,5 veces más lento que el nativo. Los registros viven en memoria y todavía no hay optimizaciones.
@@ -129,7 +136,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 4. ~~Formato NSO y NSP~~: hecho (extracción, NSO con LZ4, enlace entre módulos, NPDM).
 5. **Hilos y sincronización de Horizon**: mapear los hilos del juego a hilos de Linux, con atómicos de verdad.
 6. **Servicios del SDK** (`sm`, `fs`, `hid`, `vi`, `nvdrv`, audio). nxnative tiene muchos en C portable bajo `dm/host`.
-7. **Gráficos**: NVN sobre Vulkan para la RTX/Radeon, en lugar de Metal.
+7. **Gráficos**: NVN sobre Vulkan para la RTX/Radeon, en lugar de Metal. Hecha la primera etapa: los comandos de la GPU llegan, las macros corren y la pantalla se limpia. Siguen los shaders.
 8. **Integración con Omarchy**: un lanzador `.desktop`, mandos con SDL y ventana en Hyprland.
 
 Los juegos y las llaves tienen que ser tuyos, sacados de tu propia consola. Este repositorio no incluye nada de ningún juego.
