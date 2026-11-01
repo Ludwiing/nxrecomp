@@ -31,9 +31,10 @@ Se marca [x] lo hecho.
    alpha-to-coverage.
 8. [ ] Render targets en capas (gl_Layer), limpieza por capa.
 9. [ ] Transform feedback.
-10. [ ] Raster y samplers: ([x] logic op, [x] alpha test), blend avanzado, depth clamp, viewport swizzle, cubos sin
-    costuras, reducción min/max, nivel base/máximo y LOD mínimo, coordenadas sin normalizar,
-    texturas multisample y PIXLD, lectura de stencil.
+10. [~] Raster y samplers: [x] logic op, [x] alpha test, [x] depth clamp (ViewVolumeClipControl),
+    [x] cubos sin costuras, [x] reducción min/max (TSC palabra 1, bits 10-11, confirmado con
+    deko3d). Falta: blend avanzado, viewport swizzle, coordenadas sin normalizar, texturas
+    multisample y PIXLD, lectura de stencil.
 11. [ ] Origen abajo-izquierda completo (gl_FragCoord.y, scissor, SR_Y_DIRECTION).
 12. [ ] Etapas y registros: geometría *passthrough*, VertexA, primitive ID, máscaras de hilos.
 13. [ ] Estado por canal (cada cola de NVN es un canal), espacio de direcciones con sparse y Remap,

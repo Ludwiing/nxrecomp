@@ -92,6 +92,7 @@ static int iniciar(void) {
     glNamedBufferData(ibo_ring, RING, NULL, GL_STREAM_DRAW);
     glVertexArrayElementBuffer(vao, ibo_ring);
     glEnable(GL_FRAMEBUFFER_SRGB); // como la GPU: los render targets sRGB convierten al escribir
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS); // los cubos de Maxwell filtran entre caras
     contadores_empezar();
     estado = 1;
     return 1;
@@ -846,7 +847,7 @@ static GLuint sampler(const uint32_t *tsc) {
     for (int i = 0; i < nsamplers; i++)
         if (!memcmp(samplers_tsc[i], tsc, 32)) return samplers_obj[i];
     if (nsamplers == 256) {
-        glDeleteSamplers(1, &samplers_obj[0]);
+        glDeleteSamplers(nsamplers, samplers_obj);
         nsamplers = 0;
     }
     GLuint s;
@@ -869,6 +870,10 @@ static GLuint sampler(const uint32_t *tsc) {
     glSamplerParameterf(s, GL_TEXTURE_LOD_BIAS, bias / 256.0f);
     glSamplerParameterf(s, GL_TEXTURE_MIN_LOD, (tsc[2] & 0xFFF) / 256.0f);
     glSamplerParameterf(s, GL_TEXTURE_MAX_LOD, (tsc[2] >> 12 & 0xFFF) / 256.0f);
+    // Reducción (palabra 1, bits 10-11): promedio, mínimo o máximo de los texels (pirámides de
+    // profundidad, como la de Pokémon Z-A).
+    uint32_t red = tsc[1] >> 10 & 3;
+    if (red) glSamplerParameteri(s, 0x9366 /* GL_TEXTURE_REDUCTION_MODE_ARB */, red == 1 ? GL_MIN : GL_MAX);
     static const float aniso[] = {1, 2, 4, 6, 8, 10, 12, 16};
     glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY, aniso[tsc[0] >> 20 & 7]);
     float border[4];
@@ -1169,6 +1174,9 @@ static float f32(uint32_t v) {
 }
 
 static void estado_raster(const uint32_t *R) {
+    // ViewVolumeClipControl (0x64F), bits 11-13: 3 recorta en x, y y z; 2 solo en x e y = depth clamp.
+    if ((R[0x64F] >> 11 & 7) == 2) glEnable(GL_DEPTH_CLAMP);
+    else glDisable(GL_DEPTH_CLAMP);
     // Viewport 0: la GPU hace x = sx * ndc + tx; OpenGL necesita origen, tamaño y hacia dónde va y.
     float sx = f32(R[0x280]), sy = f32(R[0x281]), sz = f32(R[0x282]);
     float tx = f32(R[0x283]), ty = f32(R[0x284]), tz = f32(R[0x285]);
