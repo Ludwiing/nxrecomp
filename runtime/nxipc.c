@@ -135,8 +135,7 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
             nx_out32(&r, 1);
             result = R_OK_;
         } else if (r.cmd == 2 || r.cmd == 4) { // CloneCurrentObject(Ex)
-            r.out_handles[r.nout_handles++] = session_handle(s->obj);
-            r.out_handles_move = 1;
+            r.out_move[r.nout_move++] = session_handle(s->obj);
             result = R_OK_;
         } else if (r.cmd == 3) { // QueryPointerBufferSize
             nx_out32(&r, 0x8000);
@@ -167,19 +166,19 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
                     break;
                 }
         } else {
-            r.out_handles[r.nout_handles++] = session_handle(r.out_objects[k]);
-            r.out_handles_move = 1;
+            r.out_move[r.nout_move++] = session_handle(r.out_objects[k]);
         }
     }
 
     // Respuesta
     memset(tls, 0, 0x100);
     uint32_t q = 8;
-    int special = r.nout_handles > 0;
+    int special = r.nout_copy + r.nout_move > 0;
     if (special) {
-        wr32(tls + q, r.out_handles_move ? (uint32_t)r.nout_handles << 5 : (uint32_t)r.nout_handles << 1);
+        wr32(tls + q, (uint32_t)r.nout_copy << 1 | (uint32_t)r.nout_move << 5);
         q += 4;
-        for (int k = 0; k < r.nout_handles; k++, q += 4) wr32(tls + q, r.out_handles[k]);
+        for (int k = 0; k < r.nout_copy; k++, q += 4) wr32(tls + q, r.out_copy[k]);
+        for (int k = 0; k < r.nout_move; k++, q += 4) wr32(tls + q, r.out_move[k]);
     }
     uint32_t rraw = (q + 15) & ~15u;
     uint32_t o = rraw;
@@ -209,6 +208,12 @@ void nx_out64(NxRequest *r, uint64_t v) {
     r->out_size += 8;
 }
 void nx_out_object(NxRequest *r, ServiceObject *o) { r->out_objects[r->nout_objects++] = o; }
+void nx_out_copy_handle(NxRequest *r, uint32_t h) { r->out_copy[r->nout_copy++] = h; }
+void nx_out_bytes(NxRequest *r, const void *p, uint32_t n) {
+    memcpy(r->out + r->out_size, p, n);
+    r->out_size += n;
+}
+void nx_out8(NxRequest *r, uint8_t v) { r->out[r->out_size++] = v; }
 
 uint64_t nx_in64(NxRequest *r, uint32_t off) {
     uint64_t v = 0;

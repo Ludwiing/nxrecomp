@@ -319,7 +319,7 @@ def branch_sys(i, x):
         elif opc == 1:
             i.kind, i.reg = "blr", R(rn)
         elif opc == 2:
-            i.kind = "ret"
+            i.kind, i.reg = "ret", R(rn)
         else:
             raise Unsupported("salto a registro no soportado")
     else:

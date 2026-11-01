@@ -1,0 +1,15 @@
+Homebrew con libnx: hilos, idioma, relojes, SD, mandos y memoria.
+sistema: 18.1.0
+4 hilos de libnx × 50000 con Mutex: 200000
+CondVar: llegó 2026
+idioma: es-419 (SetLanguage 14), rc 0x0
+reloj: rc 0x0, hora válida: sí; calendario: rc 0x0, año válido: sí
+SD: crear archivo: sí
+SD: leído: Escrito por un homebrew de Switch recompilado a Linux.
+SD: tamaño 55 bytes
+SD: en la carpeta: chao.txt
+SD: borrado, la carpeta existe: no
+mandos: botones apretados 0x0
+appletMainLoop: sigue
+malloc de 64 MiB: sí, suma 2088960
+Fin.

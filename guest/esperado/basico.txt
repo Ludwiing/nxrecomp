@@ -1,0 +1,1 @@
+Hola desde libnx 4.12, recompilado a x86_64.

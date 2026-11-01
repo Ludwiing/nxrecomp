@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -125,6 +126,10 @@ KThread *nx_current_thread(void) { return cur; }
 static void *thread_main(void *arg) {
     KThread *t = arg;
     cur = t;
+    nx_set_crash_ctx(t->ctx);
+    static __thread char altstack[64 * 1024];
+    stack_t ss = {.ss_sp = altstack, .ss_size = sizeof altstack};
+    sigaltstack(&ss, NULL);
     nx_dispatch(t->ctx, t->entry);
     nx_exit_thread();
     return NULL;
@@ -538,6 +543,7 @@ static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
     case 18: *out = 0x0100000000001000ull; return R_OK_;     // id de programa
     case 20: *out = 0; return R_OK_;                         // contexto de excepción
     case 23: *out = 1; return R_OK_;                         // es una aplicación
+    case 28: *out = 0; return R_OK_;                         // tamaño extra de la región alias
     case 24: *out = 256; return R_OK_;                       // hilos libres
     case 0xF0000002u: *out = nx_now_ns() * 12 / 625; return R_OK_; // ticks del hilo
     }
@@ -549,6 +555,11 @@ static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
 // ---------- la tabla de SVC ----------
 void nx_svc(Ctx *c, uint32_t imm) {
     uint64_t *x = c->x, out = 0;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("NX_TRAZA_SVC") != NULL;
+    if (trace)
+        fprintf(stderr, "[svc] hilo %llu: 0x%02x x0=%llx x1=%llx x2=%llx\n", (unsigned long long)(cur ? cur->id : 0), imm,
+                (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2]);
     switch (imm) {
     case 0x01: x[0] = set_heap_size(x[1], &out); x[1] = out; return;
     case 0x02: case 0x03: x[0] = R_OK_; return;          // permisos y atributos de memoria
@@ -626,6 +637,43 @@ void nx_svc(Ctx *c, uint32_t imm) {
         pthread_mutex_unlock(&G);
         return;
     }
+    case 0x13: { // MapSharedMemory(handle, addr, size, perm)
+        pthread_mutex_lock(&G);
+        KShmem *s = nx_handle_get((uint32_t)x[0], KO_SHMEM);
+        if (!s || x[2] > s->size || (x[1] & 0xFFF)) {
+            pthread_mutex_unlock(&G);
+            x[0] = s ? R_INVALID_SIZE : R_INVALID_HANDLE;
+            return;
+        }
+        void *p = mmap((void *)(uintptr_t)x[1], x[2], PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, s->fd, 0);
+        if (p != (void *)(uintptr_t)x[1]) {
+            pthread_mutex_unlock(&G);
+            x[0] = R_INVALID_ADDR;
+            return;
+        }
+        region_add(x[1], x[2], 0x06, (uint32_t)x[3]);
+        pthread_mutex_unlock(&G);
+        x[0] = R_OK_;
+        return;
+    }
+    case 0x14: { // UnmapSharedMemory(handle, addr, size)
+        pthread_mutex_lock(&G);
+        munmap((void *)(uintptr_t)x[1], x[2]);
+        region_remove(x[1]);
+        pthread_mutex_unlock(&G);
+        x[0] = R_OK_;
+        return;
+    }
+    case 0x15: { // CreateTransferMemory(addr, size, perm) → handle
+        pthread_mutex_lock(&G);
+        KTmem *m = calloc(1, sizeof *m);
+        m->addr = x[1];
+        m->size = x[2];
+        x[1] = nx_handle_new(KO_TMEM, m, 1);
+        pthread_mutex_unlock(&G);
+        x[0] = R_OK_;
+        return;
+    }
     case 0x16: { // CloseHandle
         pthread_mutex_lock(&G);
         HandleEntry *e = handle_entry((uint32_t)x[0]);
@@ -659,8 +707,13 @@ void nx_svc(Ctx *c, uint32_t imm) {
     case 0x25: { KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? t->id : 0; return; }
     case 0x26:
         fflush(stdout);
-        fprintf(stderr, "[nxrt] svcBreak(0x%llx, 0x%llx, 0x%llx)\n", (unsigned long long)x[0], (unsigned long long)x[1],
+        fprintf(stderr, "[nxrt] svcBreak(0x%llx, 0x%llx, 0x%llx)", (unsigned long long)x[0], (unsigned long long)x[1],
                 (unsigned long long)x[2]);
+        if (x[2] == 4 && x[1]) { // diagAbortWithResult: el resultado va en el buffer
+            uint32_t rc = *(uint32_t *)(uintptr_t)x[1];
+            fprintf(stderr, ": resultado 0x%x (%04u-%04u)", rc, 2000 + (rc & 0x1FF), rc >> 9 & 0x1FFF);
+        }
+        fprintf(stderr, "\n");
         _exit(1);
     case 0x27:
         fwrite((const void *)(uintptr_t)x[0], 1, x[1], stdout);
@@ -691,3 +744,32 @@ void nx_svc(Ctx *c, uint32_t imm) {
 // Lo que toca la tabla de handles desde fuera (servicios) lo hace con G tomado.
 void nx_kernel_lock(void) { pthread_mutex_lock(&G); }
 void nx_kernel_unlock(void) { pthread_mutex_unlock(&G); }
+
+uint32_t nx_event_new(KEvent **out) {
+    pthread_mutex_lock(&G);
+    KEvent *ev = calloc(1, sizeof *ev);
+    uint32_t h = nx_handle_new(KO_EVENT, ev, 0);
+    pthread_mutex_unlock(&G);
+    *out = ev;
+    return h;
+}
+
+void nx_event_signal(KEvent *ev) {
+    pthread_mutex_lock(&G);
+    ev->signaled = 1;
+    pthread_cond_broadcast(&sync_cv);
+    pthread_mutex_unlock(&G);
+}
+
+uint32_t nx_shmem_new(uint64_t size, KShmem **out) {
+    KShmem *s = calloc(1, sizeof *s);
+    s->fd = memfd_create("nx-shmem", 0);
+    s->size = size;
+    if (s->fd < 0 || ftruncate(s->fd, (off_t)size)) return 0;
+    s->host = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
+    pthread_mutex_lock(&G);
+    uint32_t h = nx_handle_new(KO_SHMEM, s, 1);
+    pthread_mutex_unlock(&G);
+    *out = s;
+    return h;
+}

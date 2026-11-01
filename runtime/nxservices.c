@@ -1,5 +1,5 @@
-// Los servicios: sm: (el administrador), set (idioma del sistema) y fsp-srv (por ahora,
-// el RomFS del juego como IStorage). Lo que no está implementado se avisa con [RED] y su nombre.
+// sm: (el administrador de servicios) y los servicios pequeños: set, set:sys y apm.
+// Los grandes van en nxsvc_*.c. Lo que no está implementado se avisa con [RED] y su nombre.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +8,7 @@
 #include "nxkern.h"
 #include "nxsvc.h"
 
-static ServiceObject *object(const char *name, uint32_t (*fn)(ServiceObject *, NxRequest *), void *state) {
+ServiceObject *nx_object(const char *name, uint32_t (*fn)(ServiceObject *, NxRequest *), void *state) {
     ServiceObject *o = calloc(1, sizeof *o);
     o->name = name;
     o->handle = fn;
@@ -16,7 +16,7 @@ static ServiceObject *object(const char *name, uint32_t (*fn)(ServiceObject *, N
     return o;
 }
 
-static uint64_t lang(const char *s) {
+uint64_t nx_lang_code(const char *s) {
     uint64_t v = 0;
     memcpy(&v, s, strlen(s) < 8 ? strlen(s) : 8);
     return v;
@@ -31,14 +31,14 @@ static uint32_t set_handle(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
     case 0: // GetLanguageCode
-        nx_out64(r, lang(getenv("NX_IDIOMA") ? getenv("NX_IDIOMA") : "es-419"));
+        nx_out64(r, nx_lang_code(getenv("NX_IDIOMA") ? getenv("NX_IDIOMA") : "es-419"));
         return 0;
     case 1: case 5: { // GetAvailableLanguageCodes(2): lista en el buffer de salida
         NxBuffer *b = r->nb ? &r->b[0] : r->nc ? &r->c[0] : NULL;
         int n = 0;
         if (b)
             for (; n < NLANG && (uint64_t)(n + 1) * 8 <= b->size; n++) {
-                uint64_t v = lang(languages[n]);
+                uint64_t v = nx_lang_code(languages[n]);
                 memcpy((void *)(uintptr_t)(b->addr + 8 * (uint64_t)n), &v, 8);
             }
         nx_out32(r, (uint32_t)n);
@@ -51,48 +51,45 @@ static uint32_t set_handle(ServiceObject *self, NxRequest *r) {
     return NX_R_UNKNOWN_CMD;
 }
 
-// ---------- fsp-srv: el RomFS como IStorage ----------
-typedef struct {
-    FILE *f;
-    uint64_t size;
-} Storage;
+// ---------- set:sys: versión del sistema ----------
+#define FW_MAJOR 18
+#define FW_MINOR 1
+#define FW_MICRO 0
 
-static uint32_t storage_handle(ServiceObject *self, NxRequest *r) {
-    Storage *s = self->state;
+static uint32_t setsys_handle(ServiceObject *self, NxRequest *r) {
+    (void)self;
     switch (r->cmd) {
-    case 0: { // Read(offset, size) → buffer B
-        uint64_t off = nx_in64(r, 0), size = nx_in64(r, 8);
-        if (!r->nb || size > r->b[0].size) return 0x2EE202u; // fs: tamaño fuera de rango
-        if (off > s->size || size > s->size - off) return 0x2EE202u;
-        fseeko(s->f, (off_t)off, SEEK_SET);
-        if (fread((void *)(uintptr_t)r->b[0].addr, 1, size, s->f) != size) return 0x2EE202u;
+    case 3: case 4: { // GetFirmwareVersion(2): estructura de 0x100 bytes en el buffer de salida
+        NxBuffer *b = r->nc ? &r->c[0] : r->nb ? &r->b[0] : NULL;
+        if (!b || b->size < 0x100) return 0x7F4u; // buffer inválido
+        uint8_t *v = (uint8_t *)(uintptr_t)b->addr;
+        memset(v, 0, 0x100);
+        v[0] = FW_MAJOR, v[1] = FW_MINOR, v[2] = FW_MICRO, v[4] = 1;
+        strcpy((char *)v + 0x08, "NX");
+        strcpy((char *)v + 0x28, "0000000000000000000000000000000000000000");
+        strcpy((char *)v + 0x68, "18.1.0");
+        strcpy((char *)v + 0x80, "NintendoSDK Firmware for NX 18.1.0-1.0");
         return 0;
     }
-    case 4: // GetSize
-        nx_out64(r, s->size);
-        return 0;
     }
     return NX_R_UNKNOWN_CMD;
 }
 
-static uint32_t fsp_handle(ServiceObject *self, NxRequest *r) {
+// ---------- apm: modo de rendimiento ----------
+static uint32_t apm_session_handle(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
-    case 1: case 1003: return 0; // SetCurrentProcess, DisableAutoSaveDataCreation
-    case 200: { // OpenDataStorageByCurrentProcess: el RomFS del juego
-        const char *path = getenv("NX_ROMFS");
-        FILE *f = path ? fopen(path, "rb") : NULL;
-        if (!f) {
-            fprintf(stderr, "[RED] el juego abrió su RomFS, pero no hay imagen: define NX_ROMFS=<RomFS.img>\n");
-            return 0x7D402u; // fs: no encontrado
-        }
-        Storage *s = calloc(1, sizeof *s);
-        s->f = f;
-        fseeko(f, 0, SEEK_END);
-        s->size = (uint64_t)ftello(f);
-        nx_out_object(r, object("IStorage (RomFS)", storage_handle, s));
-        return 0;
+    case 0: return 0;                         // SetPerformanceConfiguration
+    case 1: nx_out32(r, 0x00010000); return 0; // GetPerformanceConfiguration: CPU 1020 MHz, GPU 384 MHz
     }
+    return NX_R_UNKNOWN_CMD;
+}
+static uint32_t apm_handle(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    switch (r->cmd) {
+    case 0: nx_out_object(r, nx_object("apm ISession", apm_session_handle, NULL)); return 0; // OpenSession
+    case 1: nx_out32(r, 0); return 0;          // GetPerformanceMode: 0 = portátil
+    case 6: nx_out8(r, 0); return 0;           // IsEnabledSustainedPerformanceMode
     }
     return NX_R_UNKNOWN_CMD;
 }
@@ -104,7 +101,15 @@ static const struct {
     uint32_t (*fn)(ServiceObject *, NxRequest *);
 } registry[] = {
     {"set", "set", set_handle},
-    {"fsp-srv", "fsp-srv", fsp_handle},
+    {"fsp-srv", "fsp-srv", nx_fsp},
+    {"set:sys", "set:sys", setsys_handle},
+    {"apm", "apm", apm_handle},
+    {"appletOE", "appletOE", nx_am_oe},
+    {"appletAE", "appletAE", nx_am_oe},
+    {"hid", "hid", nx_hid},
+    {"time:u", "time:u", nx_time},
+    {"time:a", "time:a", nx_time},
+    {"time:s", "time:s", nx_time},
 };
 
 static uint32_t sm_handle(ServiceObject *self, NxRequest *r) {
@@ -116,7 +121,7 @@ static uint32_t sm_handle(ServiceObject *self, NxRequest *r) {
         memcpy(name, r->in, r->in_size < 8 ? r->in_size : 8);
         for (size_t k = 0; k < sizeof registry / sizeof *registry; k++)
             if (!strcmp(registry[k].name, name)) {
-                nx_out_object(r, object(registry[k].label, registry[k].fn, NULL));
+                nx_out_object(r, nx_object(registry[k].label, registry[k].fn, NULL));
                 return 0;
             }
         fprintf(stderr, "[RED] servicio no implementado: %s\n", name);
@@ -126,4 +131,4 @@ static uint32_t sm_handle(ServiceObject *self, NxRequest *r) {
     return NX_R_UNKNOWN_CMD;
 }
 
-ServiceObject *nx_service_sm(void) { return object("sm:", sm_handle, NULL); }
+ServiceObject *nx_service_sm(void) { return nx_object("sm:", sm_handle, NULL); }

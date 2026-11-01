@@ -4,6 +4,10 @@ B := build
 PROGS := hola neon vm multi
 # programas que hablan con el kernel o los servicios: su salida se compara con guest/esperado/
 PROGS_ESPERADO := hilos servicios
+# Homebrew hechos con libnx (devkitPro): se compilan con su toolchain si está instalado.
+DEVKITPRO ?= /opt/devkitpro
+LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema)
+
 
 OPT ?= -O2
 # -ffp-contract=off en las dos versiones: ningún compilador fusiona a*b+c por su cuenta.
@@ -16,11 +20,11 @@ CFLAGS_servicios := -mgeneral-regs-only
 CFLAGS_neon := -O3
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -78,12 +82,22 @@ $(B)/multi_ref: guest/multi/main.c guest/multi/sdk.c guest/multi/ref.c guest/min
 $(M):
 	mkdir -p $@
 
+$(B)/libnx_%: guest/libnx/%/source/main.c $(RECOMP) $(RUNTIME) $(RUNTIME_H) | $(B)
+	DEVKITPRO=$(DEVKITPRO) $(MAKE) -s -C guest/libnx/$* >/dev/null
+	python3 recomp/nxrecomp.py guest/libnx/$*/$*.nro -o $(B)/libnx_$*_rec >/dev/null
+	python3 tools/compilar.py $(B)/libnx_$*_rec -o $@ >/dev/null
+
 test: all
 	@ok=1; for p in $(PROGS) $(PROGS_ESPERADO); do \
 		NX_ROMFS=$(B)/romfs_prueba.img $(B)/$$p > $(B)/$$p.salida.txt; \
 		if [ -f guest/esperado/$$p.txt ]; then cp guest/esperado/$$p.txt $(B)/$$p.referencia.txt; \
 		else $(B)/$${p}_ref > $(B)/$$p.referencia.txt; fi; \
 		if diff -u $(B)/$$p.referencia.txt $(B)/$$p.salida.txt; then echo "OK: $$p es idéntico a la referencia"; \
+		else ok=0; fi; \
+	done; \
+	for p in $(LIBNX_PROGS); do \
+		mkdir -p $(B)/sdmc; NX_SDMC=$(B)/sdmc $(B)/libnx_$$p > $(B)/$$p.salida.txt; \
+		if diff -u guest/esperado/$$p.txt $(B)/$$p.salida.txt; then echo "OK: $$p (libnx) es idéntico a lo esperado"; \
 		else ok=0; fi; \
 	done; test $$ok = 1
 

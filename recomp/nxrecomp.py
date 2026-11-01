@@ -21,7 +21,8 @@ import jumptable
 from a64 import bits, decode
 from program import IMPORT_BASE, load_program
 
-LINES_PER_FILE = 150000  # el C se reparte en varios archivos para compilarlo en paralelo
+LINES_PER_FILE = 150000
+TRACE = False  # --traza: cada instrucción guarda su dirección en c->pc (para depurar)  # el C se reparte en varios archivos para compilarlo en paralelo
 
 
 def pointer_candidates(prog):
@@ -136,6 +137,11 @@ def emit_function(mod, f, strong, out, stats):
         if i.kind == "br":
             stats["br_tabla" if i.targets else "br_indirecto"].add(i.pc)
     out.append(f"void {fname(f)}(Ctx *c) {{")
+    # Dirección de retorno con la que se entró: un RET con otra (código que escribe x30 a mano,
+    # como el crt0 de libnx que pone exit en x30 y salta a main) continúa en esa dirección.
+    out.append("    const uint64_t lr0 = c->x[30];")
+    if TRACE:
+        out.append(f"    nx_trace_func(c, 0x{f:x}ull);")
     order = sorted(body)
     if order[0] != f:
         out.append(f"    goto L_{f:x};")
@@ -143,6 +149,8 @@ def emit_function(mod, f, strong, out, stats):
         i = body[pc]
         nxt = order[idx + 1] if idx + 1 < len(order) else None
         out.append(f"L_{pc:x}: /* {i.word:08x} */")
+        if TRACE:
+            out.append(f"    c->pc = 0x{pc:x}ull;")
         k = i.kind
 
         def jump(t):
@@ -182,6 +190,7 @@ def emit_function(mod, f, strong, out, stats):
                 out.append(f"    nx_dispatch(c, {i.reg}); return;")
             continue
         elif k == "ret":
+            out.append(f"    if ({i.reg} != lr0) nx_dispatch(c, {i.reg});")
             out.append("    return;")
             continue
         if nxt != pc + 4:  # la siguiente instrucción no está justo después: salto explícito
@@ -201,7 +210,10 @@ def main():
     ap.add_argument("-o", "--output", required=True, help="carpeta donde se escribe el C")
     ap.add_argument("--base", type=lambda s: int(s, 0), default=0x08000000,
                     help="dirección del primer módulo (por defecto 0x08000000)")
+    ap.add_argument("--traza", action="store_true", help="guardar en c->pc la dirección de cada instrucción")
     args = ap.parse_args()
+    global TRACE
+    TRACE = args.traza
 
     prog = load_program(args.modulos, args.base)
     print("módulos:")
@@ -241,7 +253,9 @@ def main():
     out = ['#include "nxgame.h"', ""]
     for k, m in enumerate(prog.modules):
         path = os.path.abspath(os.path.join(args.output, f"modulo_{k}_{m.name}.bin"))
-        open(path, "wb").write(m.img.data)
+        # Un NSO se entrega reubicado (nxrecomp hace de rtld); un NRO se reubica solo al arrancar,
+        # así que va con sus bytes originales: aplicar dos veces RELR sumaría la base dos veces.
+        open(path, "wb").write(m.img.original if m.img.kind == "nro" else m.img.data)
         asm = f'.section .rodata\n.balign 16\n.global nx_mod{k}\nnx_mod{k}:\n.incbin "{path}"\n.previous\n'
         out.append(f"__asm__({c_string(asm)});")
         out.append(f"extern const unsigned char nx_mod{k}[];")

@@ -22,8 +22,8 @@ typedef struct NxRequest {
     int na, nb, nx, nc;
     uint8_t out[0x80];
     uint32_t out_size;
-    uint32_t out_handles[8];
-    int nout_handles, out_handles_move;
+    uint32_t out_copy[8], out_move[8]; // handles de salida: copiados (eventos) y movidos (sesiones)
+    int nout_copy, nout_move;
     struct ServiceObject *out_objects[8];
     int nout_objects;
     int session_is_domain;
@@ -40,7 +40,18 @@ typedef struct ServiceObject {
 void nx_out32(NxRequest *r, uint32_t v);
 void nx_out64(NxRequest *r, uint64_t v);
 void nx_out_object(NxRequest *r, ServiceObject *o);
+void nx_out_copy_handle(NxRequest *r, uint32_t h);
+void nx_out_bytes(NxRequest *r, const void *p, uint32_t n);
+void nx_out8(NxRequest *r, uint8_t v);
 uint32_t nx_in32(NxRequest *r, uint32_t off);
 uint64_t nx_in64(NxRequest *r, uint32_t off);
 
 ServiceObject *nx_service_sm(void);
+ServiceObject *nx_object(const char *name, uint32_t (*fn)(ServiceObject *, NxRequest *), void *state);
+uint64_t nx_lang_code(const char *s);
+
+// Servicios por archivo
+uint32_t nx_am_oe(ServiceObject *self, NxRequest *r);
+uint32_t nx_hid(ServiceObject *self, NxRequest *r);
+uint32_t nx_time(ServiceObject *self, NxRequest *r);
+uint32_t nx_fsp(ServiceObject *self, NxRequest *r);

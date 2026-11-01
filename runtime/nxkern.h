@@ -14,7 +14,7 @@
 #define NX_TLS_BASE 0x3F000000ull       // 0x200 bytes por hilo; los primeros 0x100 son el buffer de IPC
 #define NX_TLS_SIZE 0x100000ull
 
-enum { KO_THREAD = 1, KO_EVENT, KO_SESSION };
+enum { KO_THREAD = 1, KO_EVENT, KO_SESSION, KO_SHMEM, KO_TMEM };
 enum { TS_CREATED = 1, TS_RUNNING, TS_EXITED };
 enum { W_NONE, W_MUTEX, W_CONDVAR, W_ADDRESS, W_SYNC };
 
@@ -38,6 +38,16 @@ typedef struct KEvent {
 
 typedef struct KSession KSession;
 
+typedef struct KShmem {    // memoria compartida: un memfd que el runtime y el juego mapean
+    int fd;
+    uint64_t size;
+    uint8_t *host;
+} KShmem;
+
+typedef struct KTmem {     // memoria de transferencia: el juego le presta una zona a un servicio
+    uint64_t addr, size;
+} KTmem;
+
 KThread *nx_kernel_main_thread(void);
 KThread *nx_current_thread(void);
 __attribute__((noreturn)) void nx_exit_thread(void);
@@ -47,6 +57,11 @@ uint32_t nx_handle_new(int type, void *obj, int writable);
 void *nx_handle_get(uint32_t h, int type);
 void nx_kernel_lock(void);
 void nx_kernel_unlock(void);
+
+// Para los servicios: eventos que señala el sistema y memoria compartida.
+uint32_t nx_event_new(KEvent **out);              // devuelve el handle de lectura
+void nx_event_signal(KEvent *ev);
+uint32_t nx_shmem_new(uint64_t size, KShmem **out); // devuelve un handle para copiar al juego
 
 // IPC (nxipc.c)
 uint32_t nx_connect_named_port(const char *name, uint64_t *handle);

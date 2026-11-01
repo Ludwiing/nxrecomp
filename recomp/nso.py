@@ -119,9 +119,11 @@ def lz4_compress(data):
 class Image:
     """Imagen de un módulo: bytes de text+ro+data con sus offsets, y el tamaño del bss."""
 
-    def __init__(self, name, data, text, ro, rw, bss, build_id=b""):
+    def __init__(self, name, data, text, ro, rw, bss, build_id=b"", kind="nso"):
         self.name = name
+        self.kind = kind                # "nso": lo reubica rtld; "nro": se reubica solo (crt0 de libnx)
         self.data = bytearray(data)
+        self.original = bytes(data)     # antes de aplicar reubicaciones
         self.text, self.ro, self.rw = text, ro, rw  # (offset, tamaño) dentro de la imagen
         self.bss = bss
         self.build_id = build_id
@@ -168,7 +170,7 @@ def load_nro(raw, name="main"):
     size = struct.unpack_from("<I", raw, 0x18)[0]
     s = struct.unpack_from("<6I", raw, 0x20)
     bss = struct.unpack_from("<I", raw, 0x38)[0]
-    return Image(name, raw[:size], (s[0], s[1]), (s[2], s[3]), (s[4], s[5]), bss, raw[0x40:0x60])
+    return Image(name, raw[:size], (s[0], s[1]), (s[2], s[3]), (s[4], s[5]), bss, raw[0x40:0x60], kind="nro")
 
 
 def load_module(raw, name):

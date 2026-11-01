@@ -33,6 +33,7 @@ typedef struct Ctx {
     uint8_t n, z, c, v;
     uint64_t tpidr, tpidrro;
     uint64_t fpcr, fpsr;
+    uint64_t pc;                   // última instrucción ejecutada (solo con nxrecomp --traza)
     uint64_t excl_addr;            // monitor exclusivo: dirección y valor que leyó LDXR/LDXP
     uint64_t excl_val, excl_val2;
 } Ctx;
@@ -86,6 +87,9 @@ __attribute__((noreturn)) void nx_trap(Ctx *c, uint64_t pc, uint32_t word, const
 __attribute__((noreturn)) void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to);
 __attribute__((noreturn)) void nx_import_call(Ctx *c, int index);
 uint64_t nx_symbol(const char *name);
+void nx_install_crash_handler(void);
+void nx_trace_func(Ctx *c, uint64_t addr);
+void nx_set_crash_ctx(Ctx *c);
 
 // ---------- memoria (ARM permite accesos desalineados, x86 también) ----------
 #define NX_LD(bits)                                                                 \

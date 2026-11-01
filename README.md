@@ -40,13 +40,31 @@ python3 tools/compilar.py ~/Juegos/juego/c -o ~/Juegos/juego/juego
 - **Enlace** (`recomp/program.py`): hace el trabajo de `rtld`, pero antes de traducir. Ubica `rtld`, `main`, `subsdk*` y `sdk` uno detrás de otro, aplica las reubicaciones (RELA, JMPREL y RELR empaquetadas) y resuelve los símbolos entre módulos con las reglas de Horizon. Así el traductor ve las direcciones finales de las vtables y de la GOT. Lo que ningún módulo define queda como un stub que dice su nombre si alguien lo llama.
 - **Salida**: el C se reparte en varios archivos y la imagen de cada módulo se incluye con `.incbin`, sin copiarla al C. `tools/compilar.py` los compila en paralelo.
 
+## Homebrew reales con libnx
+
+Con devkitPro instalado (`tools/instalar-devkitpro.sh`, que necesita sudo y se corre después de `omarchy update`), `make test` también compila y prueba dos homebrew hechos con libnx 4.12 sin tocar:
+- `guest/libnx/basico`: el arranque completo de libnx (`crt0`, reubicación, heap, `sm`, `set:sys`, `appletOE`, `hid`, `time`, `fs`), `main` y la salida por `ISelfController::Exit`.
+- `guest/libnx/sistema`: las API de libnx como las usa cualquier homebrew: hilos con `Mutex` y `CondVar`, idioma, versión del sistema, relojes y calendario, archivos y carpetas en la SD con `fopen`/`opendir`, mandos con `padUpdate` y `malloc` de 64 MiB.
+
+Para probar uno nuevo: `tools/probar_libnx.sh <nombre>` lo compila, lo recompila con `--traza` y lo corre. Para depurar:
+- Con `NX_TRAZA_SVC=1` se ven las llamadas al kernel.
+- Con `NX_TRAZA_FUNC=1`, cada función que se ejecuta. `aarch64-none-elf-addr2line` traduce la dirección a función y línea.
+- Si el programa falla con una violación de segmento, el runtime muestra la dirección que falló, la última instrucción ARM y los registros.
+
 ## El kernel y los servicios
 
 Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido tal cual. Lo que se reemplaza es lo que está debajo: el kernel de Horizon y los servicios del sistema.
 
 - **Kernel** (`runtime/nxkern.c`): cada hilo del juego es un hilo de Linux. Sigue la semántica del kernel de Atmosphère (mesosphère) para hilos, mutex (`ArbitrateLock`/`Unlock`), variables de condición, árbitro de direcciones, eventos, esperas, heap, `MapMemory`, memoria física de la región alias, `QueryMemory` y `GetInfo`. Las instrucciones LDXR/STXR son compare-and-swap de verdad, así que los atómicos del juego funcionan con varios hilos.
 - **IPC** (`runtime/nxipc.c`): mensajes CMIF con cabecera especial, handles, buffers A/B/X/C, comandos de control y dominios.
-- **Servicios** (`runtime/nxservices.c`): `sm:`, `set` (idioma, `es-419` por defecto, o `NX_IDIOMA`) y `fsp-srv` con el RomFS del juego como IStorage (`NX_ROMFS=<RomFS.img>`). Si un juego pide un servicio o comando que falta, se avisa con `[RED]` y su nombre. Esa es la lista de lo que hay que implementar.
+- **Servicios**:
+  - `sm:`, `set` (idioma: `es-419` por defecto, o `NX_IDIOMA`), `set:sys` (sistema 18.1.0) y `apm`, en `runtime/nxservices.c`.
+  - `appletOE`/`appletAE`, en `nxsvc_am.c`. La consola está en la base, a 1080p y con el foco.
+  - `hid`, con su memoria compartida, en `nxsvc_hid.c`. Por ahora sin mandos conectados.
+  - `time:u/a/s`, con la memoria compartida de los relojes, la hora real y la zona horaria del anfitrión, en `nxsvc_time.c`.
+  - `fsp-srv`, en `nxsvc_fs.c`. La SD es una carpeta: `NX_SDMC`, por defecto `~/.local/share/nxrecomp/sdmc`. El RomFS es una imagen (`NX_ROMFS`).
+
+  Si un programa pide un servicio o comando que falta, se avisa con `[RED]` y su nombre.
 
 ## El conjunto de instrucciones: completo para la CPU de la Switch
 
@@ -76,7 +94,8 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 - **Arranque de un juego real**: después de los constructores se salta directo a `nnMain`. Un juego con el SDK de Nintendo necesita antes la secuencia de `nn::init::Start` (`nnosInitialize`, `nninitStartup`...), y esa secuencia necesita hilos, SVC y servicios de Horizon. Es el siguiente paso.
 - **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
-- **Servicios**: falta casi todo lo que un juego usa además de `sm:`, `set` y el RomFS: `hid` (controles), `vi`/`nvdrv` (pantalla y GPU), `audren`, `am`/`appletOE`, `time`, `acc`, `apm`, partidas guardadas... Además, el orden de arranque del SDK (`nn::init::Start`) ya está en `runtime/nxmain.c`, pero sin probar con un juego real.
+- **Servicios**: faltan los mandos de verdad (llenar la memoria de `hid` con SDL), `vi`/`nvdrv` (pantalla y GPU, la parte más grande), `audren`/`audout`, `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
+- **Excepciones de C++ y `longjmp`**: un RET a una dirección que no es inicio de función (el destino de un `longjmp`, o una plataforma de aterrizaje de una excepción) todavía no se resuelve.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.
 - **Velocidad**: el código traducido es entre 2 y 4,5 veces más lento que el nativo. Los registros viven en memoria y todavía no hay optimizaciones.
 - **Memoria**: la del juego se mapea en sus mismas direcciones dentro del proceso, sin aislamiento.

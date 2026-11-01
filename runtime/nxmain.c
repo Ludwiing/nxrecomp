@@ -24,6 +24,8 @@ int main(void) {
     }
     KThread *t = nx_kernel_main_thread();
     Ctx *c = t->ctx;
+    nx_install_crash_handler();
+    nx_set_crash_ctx(c);
     uint64_t stack = align_up(nx_main_stack, 0x1000);
     if (mprotect((void *)(uintptr_t)NX_STACK_BASE, stack, PROT_READ | PROT_WRITE)) return 1;
     nx_memory_add_stack(NX_STACK_BASE, stack);
@@ -49,6 +51,7 @@ int main(void) {
     c->x[1] = t->handle;
     nx_dispatch(c, nx_entry_addr);
     fflush(stdout);
-    fprintf(stderr, "[nxrt] el programa volvió de su entrada sin llamar a svcExitProcess\n");
+    fprintf(stderr, "[nxrt] el programa volvió de su entrada sin llamar a svcExitProcess (última instrucción 0x%llx, x30 0x%llx)\n",
+            (unsigned long long)c->pc, (unsigned long long)c->x[30]);
     return 1;
 }
