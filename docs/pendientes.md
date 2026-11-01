@@ -11,13 +11,13 @@ Se marca [x] lo hecho.
 1. [x] Estado del pushbuffer entre entradas del GPFIFO: los draws indirectos de NVN ponen los
    argumentos de la macro en otra entrada. Semáforos completos: acquire (=, >=, and), release y
    reducciones atómicas, en el puller y en el motor 3D. (Falta: esperar syncpoints.)
-2. [ ] Motor de copia y 2D rápidos: búsqueda de direcciones de GPU por tabla de páginas, copias por
-   filas de GOB en vez de byte a byte; el 2D en la GPU, con conversión de formato y profundidad.
+2. [~] Motor de copia y 2D rápidos: [x] tabla de páginas (sin candado ni recorrido), [x] copias por
+   tramos de 16 bytes, [x] mapeos vecinos contiguos, [x] semáforo del LaunchDma; el 2D en la GPU, con conversión de formato y profundidad.
 3. [ ] Coherencia perezosa: protección de páginas para saber qué escribió la CPU, devolver los render
    targets a memoria solo cuando la CPU los lee, caché de buffers en vez de subir todo en cada draw,
    storage buffers de tamaño 0.
 4. [~] Reportes: hecho el tipo de contador (consultas de OpenGL), CounterReset y las marcas de
-   tiempo en ticks de 614,4 MHz. Falta el renderizado condicional. Antes: tipo de contador (oclusión, primitivas, transform feedback) y marcas de tiempo en
+   tiempo en ticks de 614,4 MHz. [x] Renderizado condicional (RenderEnable, sin prueba: deko3d no lo expone). Antes: tipo de contador (oclusión, primitivas, transform feedback) y marcas de tiempo en
    ticks de la GPU (ns × 384 / 625). Renderizado condicional (RenderEnable).
 5. [ ] Caché de texturas que resuelve el solapamiento render target / textura por formato, nivel y
    capa; `glTextureBarrier` al leer un render target enlazado.

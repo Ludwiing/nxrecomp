@@ -1,13 +1,12 @@
-// La GPU de la Switch (Tegra X1, Maxwell GM20B), primera etapa: el procesador de comandos.
-//   - Espacio de direcciones de la GPU: direcciones de GPU → memoria del programa (nvhost-as-gpu).
+// La GPU de la Switch (Tegra X1, Maxwell GM20B): el procesador de comandos.
+//   - Espacio de direcciones de la GPU: direcciones de GPU → memoria del programa (nvhost-as-gpu),
+//     con una tabla de páginas de 4 KiB.
 //   - Syncpoints: los contadores que hacen de cercas; las esperas se bloquean hasta el valor.
 //   - GPFIFO: cada entrada apunta a un pushbuffer; se ejecuta en el momento del envío.
 //   - Pushbuffer: cabeceras de método (creciente, no creciente, en línea, crece una vez) hacia el
 //     objeto de cada subcanal: 3D (0xB197), cómputo (0xB1C0), carga en línea (0xA140), 2D, copia.
-//   - Motor de macros (MME): el intérprete de su conjunto de instrucciones.
-//   - 3D: registros, SyncptAction, semáforos de reporte, carga de constbufs y ClearBuffers.
-// Todavía no dibuja triángulos: eso pide traducir los shaders de Maxwell (siguiente etapa).
-// Nombres y offsets de registros: deko3d (maxwell/engine_*.def) y envytools.
+//   - Motor de macros (MME), semáforos, reportes, motores 2D y de copia. Lo que dibuja va a nxgl.c.
+// Nombres y offsets de registros: deko3d (maxwell/engine_*.def), envytools y Ryujinx.
 #define _GNU_SOURCE
 #include "nxgpu.h"
 
@@ -24,11 +23,19 @@
 #include "nxrt.h"
 
 // ---------- espacio de direcciones ----------
+// Cada mapeo ocupa un lugar en `maps`; la tabla de páginas (dos niveles, páginas de 4 KiB sobre 40
+// bits) dice qué mapeo cubre cada página. Buscar una dirección no recorre la lista ni toma el
+// candado: el motor de copia la consulta por cada fila.
 typedef struct {
     uint64_t gpu, size, cpu;
 } Mapping;
-static Mapping maps[4096];
-static int nmaps;
+#define MAX_MAPS 16384
+#define PAG 12           // páginas de 4 KiB
+#define N2 14            // 2^14 páginas por bloque (64 MiB)
+#define N1 (40 - PAG - N2)
+static Mapping maps[MAX_MAPS];
+static int nmaps, libres[MAX_MAPS], nlibres;
+static uint16_t *tabla[1u << N1]; // índice del mapeo + 1 por página (0 = sin mapear)
 static uint64_t va_next = 0x100000000ull; // asignación de direcciones de GPU (por encima de 4 GiB)
 static pthread_mutex_t as_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -41,53 +48,70 @@ uint64_t nx_gpu_alloc_va(uint64_t size, uint64_t align) {
     return va;
 }
 
+static void paginas(uint64_t gpu, uint64_t size, uint16_t valor) {
+    for (uint64_t pg = gpu >> PAG, fin = (gpu + size + (1u << PAG) - 1) >> PAG; pg < fin; pg++) {
+        uint64_t i1 = pg >> N2;
+        if (i1 >= (1u << N1)) break;
+        if (!tabla[i1]) {
+            if (!valor) continue;
+            tabla[i1] = calloc(1u << N2, sizeof(uint16_t));
+        }
+        tabla[i1][pg & ((1u << N2) - 1)] = valor;
+    }
+}
+
+static int buscar(uint64_t gpu) { // índice del mapeo que cubre `gpu`, o -1
+    uint64_t pg = gpu >> PAG, i1 = pg >> N2;
+    if (i1 >= (1u << N1) || !tabla[i1]) return -1;
+    int k = (int)tabla[i1][pg & ((1u << N2) - 1)] - 1;
+    return k >= 0 && gpu >= maps[k].gpu && gpu - maps[k].gpu < maps[k].size ? k : -1;
+}
+
 void nx_gpu_map(uint64_t gpu, uint64_t size, uint64_t cpu) {
     pthread_mutex_lock(&as_lock);
-    for (int k = 0; k < nmaps; k++)
-        if (maps[k].gpu == gpu) {
-            maps[k] = (Mapping){gpu, size, cpu};
-            pthread_mutex_unlock(&as_lock);
-            return;
-        }
-    if (nmaps < 4096) maps[nmaps++] = (Mapping){gpu, size, cpu};
+    int k = buscar(gpu);
+    if (k < 0 || maps[k].gpu != gpu) k = nlibres ? libres[--nlibres] : nmaps < MAX_MAPS ? nmaps++ : -1;
+    if (k >= 0) {
+        maps[k] = (Mapping){gpu, size, cpu};
+        paginas(gpu, size, (uint16_t)(k + 1));
+    } else {
+        fprintf(stderr, "[RED] GPU: más de %d mapeos\n", MAX_MAPS);
+    }
     if (gpu + size > va_next) va_next = gpu + size;
     pthread_mutex_unlock(&as_lock);
 }
 
 void nx_gpu_unmap(uint64_t gpu) {
     pthread_mutex_lock(&as_lock);
-    for (int k = 0; k < nmaps; k++)
-        if (maps[k].gpu == gpu) {
-            maps[k] = maps[--nmaps];
-            break;
-        }
+    int k = buscar(gpu);
+    if (k >= 0 && maps[k].gpu == gpu) {
+        // Solo las páginas que siguen siendo de este mapeo (otro pudo taparlas después).
+        for (uint64_t a = gpu; a < gpu + maps[k].size; a += 1u << PAG)
+            if (buscar(a) == k) paginas(a, 1, 0);
+        maps[k].size = 0;
+        libres[nlibres++] = k;
+    }
     pthread_mutex_unlock(&as_lock);
 }
 
 void *nx_gpu_ptr(uint64_t gpu) {
-    pthread_mutex_lock(&as_lock);
-    for (int k = 0; k < nmaps; k++)
-        if (gpu >= maps[k].gpu && gpu < maps[k].gpu + maps[k].size) {
-            void *p = (void *)(uintptr_t)(maps[k].cpu + (gpu - maps[k].gpu));
-            pthread_mutex_unlock(&as_lock);
-            return p;
-        }
-    pthread_mutex_unlock(&as_lock);
-    return NULL;
+    int k = buscar(gpu);
+    return k < 0 ? NULL : (void *)(uintptr_t)(maps[k].cpu + (gpu - maps[k].gpu));
 }
 
+// Además dice cuántos bytes siguen contiguos (también a través de mapeos vecinos que siguen en la
+// misma memoria: un juego puede mapear un buffer en varios trozos).
 void *nx_gpu_ptr_n(uint64_t gpu, uint64_t *avail) {
-    pthread_mutex_lock(&as_lock);
-    for (int k = 0; k < nmaps; k++)
-        if (gpu >= maps[k].gpu && gpu < maps[k].gpu + maps[k].size) {
-            void *p = (void *)(uintptr_t)(maps[k].cpu + (gpu - maps[k].gpu));
-            *avail = maps[k].gpu + maps[k].size - gpu;
-            pthread_mutex_unlock(&as_lock);
-            return p;
-        }
-    pthread_mutex_unlock(&as_lock);
-    *avail = 0;
-    return NULL;
+    int k = buscar(gpu);
+    if (k < 0) {
+        *avail = 0;
+        return NULL;
+    }
+    uint64_t cpu = maps[k].cpu + (gpu - maps[k].gpu), fin = maps[k].gpu + maps[k].size;
+    for (int j; (j = buscar(fin)) >= 0 && maps[j].gpu == fin && maps[j].cpu == cpu + (fin - gpu);)
+        fin += maps[j].size;
+    *avail = fin - gpu;
+    return (void *)(uintptr_t)cpu;
 }
 
 // ---------- syncpoints ----------
@@ -372,6 +396,23 @@ static void reducir(uint32_t *p, uint32_t valor, uint32_t op, int con_signo) {
     } while (!__atomic_compare_exchange_n(p, &viejo, nuevo, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
 }
 
+// Renderizado condicional (SetRenderEnableA/B/C, 0x554-0x556): los draws y las limpiezas solo
+// ocurren si se cumple la condición sobre lo que dejó un reporte en memoria (C: 0 nunca, 1 siempre,
+// 2 si el valor de 64 bits no es 0, 3 si los valores en +0 y +16 son iguales, 4 si son distintos).
+static int render_cond_escrito; // hasta que el driver lo escribe, se dibuja siempre
+static int render_enabled(void) {
+    uint32_t *R = e3d.regs, modo = R[0x556] & 7;
+    if (!render_cond_escrito) return 1;
+    if (modo == 1 || modo > 4) return 1;
+    if (modo == 0) return 0;
+    uint64_t avail, a, b;
+    const uint8_t *p = nx_gpu_ptr_n((uint64_t)R[0x554] << 32 | R[0x555], &avail);
+    if (!p || avail < 24) return 1;
+    memcpy(&a, p, 8);
+    memcpy(&b, p + 16, 8);
+    return modo == 2 ? a != 0 : modo == 3 ? a == b : a != b;
+}
+
 // SetReportSemaphore (0x6C3): bits 0-1 operación (0 Release, 1 Acquire, 2 contador), 23-27 tipo de
 // contador, 28 reporte corto.
 static void report_semaphore(uint32_t v) {
@@ -437,6 +478,7 @@ static void method_3d(uint32_t m, uint32_t v) {
     case 0x5F8: e3d.indexed = 1; break; // DrawElementsCount
     case 0x585: { // VertexEndGl: dibujar
         uint32_t *R = e3d.regs;
+        if (!render_enabled()) break;
         NxDraw d = {R, (const uint64_t (*)[18])e3d.cb_addr, (const uint32_t (*)[18])e3d.cb_size, R[0x586] & 0xFFFF,
                     e3d.indexed ? R[0x5F7] : R[0x35D], e3d.indexed ? R[0x5F8] : R[0x35E], e3d.instance, 1, e3d.indexed};
         NxDraw *p = &e3d.pend;
@@ -450,9 +492,10 @@ static void method_3d(uint32_t m, uint32_t v) {
         }
         break;
     }
+    case 0x556: render_cond_escrito = 1; break;
     case 0x8C4: e3d.regs[0xD00] = 1; break; // FirmwareCall4: el firmware (falcon) toca registros
                                             // que no nos importan y avisa en MmeFirmwareArgs[0]
-    case 0x674: clear_buffers(v); break;                                // ClearBuffers
+    case 0x674: if (render_enabled()) clear_buffers(v); break;          // ClearBuffers
     case 0x6C3: draw_flush(), nx_gl_flush(), report_semaphore(v); break; // SetReportSemaphore
     case 0x54C: draw_flush(), nx_gl_contador_reiniciar(v); break;         // CounterReset
     case 0x06C: // LaunchDma (carga en línea): destino y largo
@@ -624,6 +667,19 @@ static void dma_launch(uint32_t v) {
             if (s && d) memmove(d, s, len);
             continue;
         }
+        if (!remap) { // en "block linear" cada tramo de 16 bytes alineado es contiguo: se copia por tramos
+            for (uint32_t x = 0, n; x < len; x += n) {
+                n = len - x;
+                if (src_bl && n > 16 - ((sx0 + x) & 15)) n = 16 - ((sx0 + x) & 15);
+                if (dst_bl && n > 16 - ((dx0 + x) & 15)) n = 16 - ((dx0 + x) & 15);
+                uint64_t sa = dma_addr(src_bl, src, R[0x104], R[0x1CA], sw, sh, sz, sx0 + x, sy0 + y);
+                uint64_t da = dma_addr(dst_bl, dst, R[0x105], R[0x1C3], dw, dh, dz, dx0 + x, dy0 + y);
+                uint64_t sav, dav;
+                uint8_t *s = nx_gpu_ptr_n(sa, &sav), *d = nx_gpu_ptr_n(da, &dav);
+                if (s && d && sav >= n && dav >= n) memmove(d, s, n);
+            }
+            continue;
+        }
         for (uint32_t x = 0; x < len; x++) {
             uint64_t sa = dma_addr(src_bl, src, R[0x104], R[0x1CA], sw, sh, sz, (sx0 + x) * sbpp, sy0 + y);
             uint64_t da = dma_addr(dst_bl, dst, R[0x105], R[0x1C3], dw, dh, dz, (dx0 + x) * dbpp, dy0 + y);
@@ -641,6 +697,14 @@ static void dma_launch(uint32_t v) {
             }
         }
     }
+}
+
+// Semáforo al terminar la copia (LaunchDma bits 3-4: 1 una palabra, 2 cuatro palabras con marca de tiempo).
+static void dma_semaforo(uint32_t v) {
+    uint32_t tipo = v >> 3 & 3;
+    if (!tipo) return;
+    uint8_t *p = nx_gpu_ptr((uint64_t)dma[0x090] << 32 | dma[0x091]);
+    if (p) reporte(p, dma[0x092], tipo == 1);
 }
 
 static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
@@ -668,7 +732,7 @@ static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
         }
     } else if (cls == CLASS_DMA) {
         if (m < 0x200) dma[m] = v;
-        if (m == 0x0C0) dma_launch(v);
+        if (m == 0x0C0) dma_launch(v), dma_semaforo(v);
     }
     else if (cls == CLASS_I2M) { // la carga en línea usa los mismos métodos 0x60-0x6D
         if (m >= 0x60 && m <= 0x6D) method_3d(m, v);
