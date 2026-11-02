@@ -70,6 +70,39 @@ static void estado(DkLogicOp logic, DkCompareOp alfa) {
     dkCmdBufBindColorState(g_cmdbuf, &cs);
 }
 
+// Un pool "sparse" como los de RE Engine y Unreal: un rango de 4 páginas de 64 KiB con dos trozos de
+// memoria distintos (Remap) y un hueco entre ellos. La GPU lo copia a un buffer: el hueco tiene que
+// leer ceros. Devuelve 1 si quedó bien.
+typedef struct {
+    u16 flags, kind;
+    u32 handle, buf_off, gpu_off, pages;
+} Remap;
+
+static int prueba_sparse(DkMemBlock destino) {
+    u32 fd;
+    if (R_FAILED(nvOpen(&fd, "/dev/nvhost-as-gpu"))) return 0;
+    u64 va = 0;
+    if (R_FAILED(nvioctlNvhostAsGpu_AllocSpace(fd, 4, 0x10000, NvAllocSpaceFlags_Sparse, 0x10000, &va))) return 0;
+    static u8 a[0x10000] __attribute__((aligned(0x1000))), b[0x10000] __attribute__((aligned(0x1000)));
+    memset(a, 0x11, sizeof a);
+    memset(b, 0x22, sizeof b);
+    nvMapInit();
+    NvMap ma, mb;
+    if (R_FAILED(nvMapCreate(&ma, a, sizeof a, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(nvMapCreate(&mb, b, sizeof b, 0x1000, NvKind_Pitch, true)))
+        return 0;
+    Remap e[2] = {{0, 0, nvMapGetHandle(&ma), 0, (u32)(va >> 16), 1}, {0, 0, nvMapGetHandle(&mb), 0, (u32)(va >> 16) + 2, 1}};
+    if (R_FAILED(nvIoctl(fd, _NV_IOWR(0x41, 0x14, e), e))) return 0;
+    u8 *d = dkMemBlockGetCpuAddr(destino);
+    memset(d, 0x77, 3 * 0x10000);
+    dkCmdBufCopyBuffer(g_cmdbuf, va, dkMemBlockGetGpuAddr(destino), 3 * 0x10000);
+    dkQueueSubmitCommands(g_queue, dkCmdBufFinishList(g_cmdbuf));
+    dkQueueWaitIdle(g_queue);
+    int ok = d[0] == 0x11 && d[0xFFFF] == 0x11 && d[0x10000] == 0 && d[0x1FFFF] == 0 && d[0x20000] == 0x22 && d[0x2FFFF] == 0x22;
+    fprintf(stderr, "sparse: %02x %02x %02x\n", d[0], d[0x10000], d[0x20000]);
+    return ok;
+}
+
 static void graphicsInitialize(void) {
     DkDeviceMaker deviceMaker;
     dkDeviceMakerDefaults(&deviceMaker);
@@ -281,6 +314,10 @@ static void graphicsInitialize(void) {
     int ok_muestras = muestras == 200 * 200;
     int ok_tiempo = t0 && t1 >= t0 && cpu_ns + 1000 >= gpu_ns && cpu_ns - gpu_ns < 1000000000ull;
     int ok_var = dkVariableRead(&g_var) == 42;
+    dkMemBlockMakerDefaults(&mm, g_device, 3 * 0x10000);
+    mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
+    DkMemBlock destino = dkMemBlockCreate(&mm);
+    int ok_sparse = prueba_sparse(destino);
     fprintf(stderr, "muestras %llu, marcas %llu %llu (CPU %llu), variable %u\n", (unsigned long long)muestras,
            (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)ahora, dkVariableRead(&g_var));
     // (Sin dkCmdBufClear: reusaría la memoria de la lista común, que se sigue llamando en cada cuadro.)
@@ -307,8 +344,8 @@ static void graphicsInitialize(void) {
     rect(1050, 100, 1250, 300, 1, 0, 0, 1);
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     estado(DkLogicOp_Copy, DkCompareOp_Always);
-    int oks[3] = {ok_muestras, ok_tiempo, ok_var};
-    for (int k = 0; k < 3; k++) {
+    int oks[4] = {ok_muestras, ok_tiempo, ok_var, ok_sparse};
+    for (int k = 0; k < 4; k++) {
         rect(50 + k * 150, 400, 150 + k * 150, 500, oks[k] ? 0 : 1, oks[k] ? 1 : 0, 0, 1);
         dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     }

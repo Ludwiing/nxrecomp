@@ -29,7 +29,7 @@
 typedef struct {
     uint64_t gpu, size, cpu;
 } Mapping;
-#define MAX_MAPS 16384
+#define MAX_MAPS 65000 // el índice + 1 va en 16 bits
 #define PAG 12           // páginas de 4 KiB
 #define N2 14            // 2^14 páginas por bloque (64 MiB)
 #define N1 (40 - PAG - N2)
@@ -92,6 +92,31 @@ void nx_gpu_unmap(uint64_t gpu) {
         libres[nlibres++] = k;
     }
     pthread_mutex_unlock(&as_lock);
+}
+
+void nx_gpu_unmap_rango(uint64_t gpu, uint64_t size) {
+    pthread_mutex_lock(&as_lock);
+    paginas(gpu, size, 0);
+    pthread_mutex_unlock(&as_lock);
+}
+
+uint64_t nx_gpu_leer(uint64_t gpu, void *dst, uint64_t size) {
+    uint8_t *d = dst;
+    uint64_t hechos = 0;
+    while (size) {
+        uint64_t avail, paso = (1u << PAG) - (gpu & ((1u << PAG) - 1));
+        const uint8_t *p = nx_gpu_ptr_n(gpu, &avail);
+        if (paso > size) paso = size;
+        if (p) {
+            if (avail > size) avail = size;
+            memcpy(d, p, avail);
+            hechos += avail, paso = avail;
+        } else {
+            memset(d, 0, paso);
+        }
+        d += paso, gpu += paso, size -= paso;
+    }
+    return hechos;
 }
 
 void *nx_gpu_ptr(uint64_t gpu) {
@@ -663,9 +688,26 @@ static void dma_launch(uint32_t v) {
     nx_gl_cpu_write(src, sspan);
     nx_gl_cpu_write(dst, dspan);
     for (uint32_t y = 0; y < lines; y++) {
-        if (!remap && !src_bl && !dst_bl) { // fila contigua
-            uint8_t *s = nx_gpu_ptr(src + (uint64_t)y * R[0x104]), *d = nx_gpu_ptr(dst + (uint64_t)y * R[0x105]);
-            if (s && d) memmove(d, s, len);
+        if (!remap && !src_bl && !dst_bl) { // fila contigua, por tramos: puede cruzar mapeos o huecos (sparse)
+            uint64_t sa = src + (uint64_t)y * R[0x104], da = dst + (uint64_t)y * R[0x105];
+            for (uint32_t x = 0, n; x < len; x += n) {
+                uint64_t sav, dav;
+                uint8_t *s = nx_gpu_ptr_n(sa + x, &sav), *d = nx_gpu_ptr_n(da + x, &dav);
+                n = len - x;
+                if (d && n > dav) n = (uint32_t)dav;
+                if (s && n > sav) n = (uint32_t)sav;
+                if (!d) { // destino sin mapear: saltar hasta la próxima página
+                    uint32_t k = 0x1000 - ((da + x) & 0xFFF);
+                    n = n < k ? n : k;
+                    continue;
+                }
+                if (s) memmove(d, s, n);
+                else { // origen sin mapear: lee ceros, como un pool sparse
+                    uint32_t k = 0x1000 - ((sa + x) & 0xFFF);
+                    n = n < k ? n : k;
+                    memset(d, 0, n);
+                }
+            }
             continue;
         }
         if (!remap) { // en "block linear" cada tramo de 16 bytes alineado es contiguo: se copia por tramos

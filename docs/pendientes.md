@@ -43,8 +43,9 @@ Se marca [x] lo hecho.
     multisample y PIXLD, lectura de stencil.
 11. [ ] Origen abajo-izquierda completo (gl_FragCoord.y, scissor, SR_Y_DIRECTION).
 12. [ ] Etapas y registros: geometría *passthrough*, VertexA, primitive ID, máscaras de hilos.
-13. [ ] Estado por canal (cada cola de NVN es un canal), espacio de direcciones con sparse y Remap,
-    páginas sin mapear que leen 0.
+13. [~] [x] Memoria sparse: Remap (trozos de 64 KiB de distintos buffers, o vacíos), copias DMA que
+    cruzan mapeos y huecos (leen ceros), texturas repartidas en varios mapeos (se juntan en un buffer).
+    Prueba en deko_gpu. [ ] Estado por canal (cada cola de NVN es un canal).
 14. [~] Presentación: [x] intervalo de swap (30 fps), [x] recorte y espejos del QueueBuffer.
     Falta: nvdec/vic para videos; presentar directo desde la textura de la GPU (hoy se deshace el
     block linear en la CPU en cada cuadro).

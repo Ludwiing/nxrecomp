@@ -418,8 +418,20 @@ static uint32_t ctrl_gpu_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-ctrl-g
     return 1;
 }
 
-static uint32_t as_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-as-gpu: el espacio de direcciones
+static uint32_t as_ioctl(uint32_t nr, uint8_t *io, uint32_t size_io) { // /dev/nvhost-as-gpu: el espacio de direcciones
     switch (nr) {
+    case 0x14: { // Remap: entradas de 0x14 bytes (banderas, kind, handle, offset en el buffer, dirección de GPU,
+                 // páginas), todo en páginas de 64 KiB. Así arma un juego un pool "sparse" (RE Engine, Unreal):
+                 // un rango grande de direcciones con trozos de memoria física puestos donde hagan falta.
+        for (uint32_t k = 0; (k + 1) * 0x14 <= size_io; k++) {
+            const uint8_t *e = io + k * 0x14;
+            uint64_t buf_off = (uint64_t)u32at(e + 8) << 16, va = (uint64_t)u32at(e + 12) << 16, n = (uint64_t)u32at(e + 16) << 16;
+            NvMapObj *m = u32at(e + 4) ? nvmap_by_handle(u32at(e + 4)) : NULL;
+            if (m && buf_off + n <= m->size) nx_gpu_map(va, n, m->addr + buf_off);
+            else nx_gpu_unmap_rango(va, n); // handle 0: el trozo vuelve a quedar vacío (lee ceros)
+        }
+        return 0;
+    }
     case 0x01: case 0x03: case 0x09: return 0; // BindChannel / FreeSpace / InitializeEx
     case 0x02: { // AllocSpace(páginas, tamaño de página, banderas, offset o alineación)
         uint64_t size = (uint64_t)u32at(io) * u32at(io + 4);
@@ -511,7 +523,7 @@ uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
         pthread_mutex_unlock(&nv_lock);
         if (dev == DEV_CTRL) err = ctrl_ioctl(nr, io);
         else if (dev == DEV_CTRL_GPU) err = ctrl_gpu_ioctl(nr, io);
-        else if (dev == DEV_AS_GPU) err = as_ioctl(nr, io);
+        else if (dev == DEV_AS_GPU) err = as_ioctl(nr, io, size);
         else if (dev == DEV_GPU) {
             NxBuffer *x = r->cmd == 11 ? nx_in_buffer(r, 1) : NULL;
             err = gpu_ioctl(type, nr, io, x ? (const uint8_t *)(uintptr_t)x->addr : NULL, x ? x->size : 0);

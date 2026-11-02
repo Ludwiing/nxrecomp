@@ -873,7 +873,14 @@ static GLuint textura(const uint32_t *tic_words, int shader_type) {
     uint64_t bytes = tex_layout(&t, f, target == GL_TEXTURE_3D ? 1 : layers, level_off, &layer_size);
     uint64_t avail;
     const uint8_t *mem = nx_gpu_ptr_n(t.addr, &avail);
-    if (!mem || avail < bytes) return 0;
+    if (!mem || avail < bytes) {
+        // Repartida en varios mapeos (un pool sparse): se junta en un buffer; lo no mapeado es cero.
+        static uint8_t *junta;
+        static uint64_t junta_cap;
+        if (bytes > junta_cap) junta = realloc(junta, junta_cap = bytes);
+        if (!nx_gpu_leer(t.addr, junta, bytes)) return 0;
+        mem = junta;
+    }
     Tex *x = NULL;
     for (int i = 0; i < ntexs; i++)
         if (texs[i].target == target && !memcmp(texs[i].tic, tic_words, 32)) {

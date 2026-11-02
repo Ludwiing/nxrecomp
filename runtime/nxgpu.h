@@ -22,6 +22,10 @@ uint32_t nx_syncpt_read(uint32_t id);
 void nx_syncpt_incr(uint32_t id);
 int nx_syncpt_wait(uint32_t id, uint32_t threshold, int32_t timeout_us); // 1 si llegó
 
+void nx_gpu_unmap_rango(uint64_t gpu, uint64_t size); // deja sin mapear un rango (Remap con handle 0)
+// Copia `size` bytes desde la dirección de GPU `gpu` aunque crucen varios mapeos; lo no mapeado lee
+// ceros (como un pool sparse). Devuelve los bytes que sí estaban mapeados.
+uint64_t nx_gpu_leer(uint64_t gpu, void *dst, uint64_t size);
 void nx_gpu_bloquear(void);   // el candado de la GPU (recursivo)
 void nx_gpu_desbloquear(void);
 void nx_gpu_submit(const uint64_t *gpfifo_entries, uint32_t n);
