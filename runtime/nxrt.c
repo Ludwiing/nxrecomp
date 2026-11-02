@@ -109,8 +109,90 @@ uint64_t nx_symbol(const char *name) {
 static __thread Ctx *crash_ctx;
 void nx_set_crash_ctx(Ctx *c) { crash_ctx = c; }
 
+// ---------- vigilancia de memoria ----------
+// Por página de 4 KiB: el sello de su última escritura vista y su estado (0 nunca protegida, 1
+// protegida, 2 abierta después de una escritura). Tabla de dos niveles sobre 47 bits.
+#define VPAG 12
+#define VBLOQUE 14 // páginas por bloque: 64 MiB
+typedef struct {
+    uint32_t sello[1u << VBLOQUE];
+    uint8_t estado[1u << VBLOQUE];
+} Bloque;
+static Bloque *bloques[1u << (47 - VPAG - VBLOQUE)];
+static uint32_t sello_global = 1;
+static int vigia = -1;
+
+int nx_vigia_activa(void) {
+    if (vigia < 0) vigia = !getenv("NX_SIN_VIGIA");
+    return vigia;
+}
+
+static Bloque *bloque(uint64_t pg, int crear) {
+    uint64_t i = pg >> VBLOQUE;
+    if (i >= sizeof bloques / sizeof *bloques) return NULL;
+    Bloque *b = __atomic_load_n(&bloques[i], __ATOMIC_ACQUIRE);
+    if (!b && crear) {
+        Bloque *n = calloc(1, sizeof *n);
+        if (!__atomic_compare_exchange_n(&bloques[i], &b, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) free(n);
+        else b = n;
+    }
+    return b;
+}
+
+uint32_t nx_vigia_proteger(uint64_t addr, uint64_t size) {
+    if (!nx_vigia_activa() || !size) return __atomic_load_n(&sello_global, __ATOMIC_SEQ_CST);
+    uint64_t p0 = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG;
+    for (uint64_t pg = p0; pg < p1;) {
+        Bloque *b = bloque(pg, 1);
+        if (!b) break;
+        uint64_t fin = ((pg >> VBLOQUE) + 1) << VBLOQUE; // hasta el fin del bloque o del rango
+        if (fin > p1) fin = p1;
+        uint64_t ini = pg;
+        for (; pg < fin; pg++) __atomic_store_n(&b->estado[pg & ((1u << VBLOQUE) - 1)], 1, __ATOMIC_SEQ_CST);
+        if (mprotect((void *)(uintptr_t)(ini << VPAG), (fin - ini) << VPAG, PROT_READ)) // con un hueco, página por página
+            for (uint64_t q = ini; q < fin; q++)
+                if (mprotect((void *)(uintptr_t)(q << VPAG), 1u << VPAG, PROT_READ))
+                    __atomic_store_n(&b->estado[q & ((1u << VBLOQUE) - 1)], 0, __ATOMIC_SEQ_CST);
+    }
+    return __atomic_load_n(&sello_global, __ATOMIC_SEQ_CST);
+}
+
+int nx_vigia_cambio(uint64_t addr, uint64_t size, uint32_t desde) {
+    if (!nx_vigia_activa()) return 1;
+    uint64_t p0 = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG;
+    for (uint64_t pg = p0; pg < p1; pg++) {
+        Bloque *b = bloque(pg, 0);
+        if (!b) return 1; // nunca protegida: no se sabe
+        uint32_t i = pg & ((1u << VBLOQUE) - 1);
+        if (!__atomic_load_n(&b->estado[i], __ATOMIC_SEQ_CST) || __atomic_load_n(&b->sello[i], __ATOMIC_SEQ_CST) > desde) return 1;
+    }
+    return 0;
+}
+
+// Abre la página `pg` con un sello nuevo. Devuelve 0 si no era una página vigilada.
+static int abrir(uint64_t pg) {
+    Bloque *b = bloque(pg, 0);
+    if (!b) return 0;
+    uint32_t i = pg & ((1u << VBLOQUE) - 1);
+    uint8_t e = __atomic_load_n(&b->estado[i], __ATOMIC_SEQ_CST);
+    if (!e) return 0;
+    if (e == 1) __atomic_store_n(&b->sello[i], __atomic_add_fetch(&sello_global, 1, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+    __atomic_store_n(&b->estado[i], 2, __ATOMIC_SEQ_CST);
+    return !mprotect((void *)(uintptr_t)(pg << VPAG), 1u << VPAG, PROT_READ | PROT_WRITE);
+}
+
+void nx_vigia_tocar(uint64_t addr, uint64_t size) {
+    if (!nx_vigia_activa() || !size) return;
+    for (uint64_t pg = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG; pg < p1; pg++) {
+        Bloque *b = bloque(pg, 0);
+        if (b && __atomic_load_n(&b->estado[pg & ((1u << VBLOQUE) - 1)], __ATOMIC_SEQ_CST) == 1) abrir(pg);
+    }
+}
+
 static void on_crash(int sig, siginfo_t *si, void *uc) {
     (void)uc;
+    // Una escritura en una página vigilada: se anota, se abre y la instrucción se repite.
+    if (sig == SIGSEGV && si->si_code == SEGV_ACCERR && abrir((uint64_t)(uintptr_t)si->si_addr >> VPAG)) return;
     fflush(stdout);
     fprintf(stderr, "\n[nxrt] %s en la dirección 0x%llx\n", sig == SIGSEGV ? "violación de segmento" : "error de bus",
             (unsigned long long)(uintptr_t)si->si_addr);

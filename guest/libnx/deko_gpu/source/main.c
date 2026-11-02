@@ -32,8 +32,9 @@ static DkImage g_framebuffers[FB_NUM];
 static DkSwapchain g_swapchain;
 static uint32_t g_codeMemOffset;
 static DkShader g_vsh, g_fsh, g_falta, g_tex, g_texarr, g_capa_v, g_capa_f, g_texcapa;
-static DkMemBlock g_imgMem, g_desc, g_arrMem;
-static DkImage g_img, g_arr;
+static DkMemBlock g_imgMem, g_desc, g_arrMem, g_cpuMem;
+static DkImage g_img, g_arr, g_cpu;
+static int g_cuadro;
 static DkCmdBuf g_cmdbuf;
 static DkCmdList g_cmdsBindFramebuffer[FB_NUM], g_cmdsRender;
 static DkQueue g_queue;
@@ -127,7 +128,7 @@ static void graphicsInitialize(void) {
     mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
     g_desc = dkMemBlockCreate(&mm);
     DkImageDescriptor *imgDesc = dkMemBlockGetCpuAddr(g_desc);
-    DkSamplerDescriptor *smpDesc = (DkSamplerDescriptor *)(imgDesc + 3);
+    DkSamplerDescriptor *smpDesc = (DkSamplerDescriptor *)(imgDesc + 4);
     DkImageView v;
     dkImageViewDefaults(&v, &g_img);
     v.swizzle[0] = DkImageSwizzle_Blue;
@@ -153,6 +154,21 @@ static void graphicsInitialize(void) {
     dkImageInitialize(&g_arr, &arrLayout, g_arrMem, 0);
     dkImageViewDefaults(&v, &g_arr);
     dkImageDescriptorInitialize(&imgDesc[2], &v, false, false);
+
+    // Una textura de 8x8 que la CPU reescribe antes de cada cuadro, sin avisarle a la GPU: un solo
+    // color, así que da igual el orden de los píxeles en memoria.
+    dkImageLayoutMakerDefaults(&lm, g_device);
+    lm.format = DkImageFormat_RGBA8_Unorm;
+    lm.dimensions[0] = 8;
+    lm.dimensions[1] = 8;
+    DkImageLayout cpuLayout;
+    dkImageLayoutInitialize(&cpuLayout, &lm);
+    dkMemBlockMakerDefaults(&mm, g_device, (dkImageLayoutGetSize(&cpuLayout) + DK_MEMBLOCK_ALIGNMENT - 1) & ~(DK_MEMBLOCK_ALIGNMENT - 1));
+    mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
+    g_cpuMem = dkMemBlockCreate(&mm);
+    dkImageInitialize(&g_cpu, &cpuLayout, g_cpuMem, 0);
+    dkImageViewDefaults(&v, &g_cpu);
+    dkImageDescriptorInitialize(&imgDesc[3], &v, false, false);
     DkSampler smp;
     dkSamplerDefaults(&smp);
     dkSamplerDescriptorInitialize(smpDesc, &smp);
@@ -307,8 +323,8 @@ static void graphicsInitialize(void) {
     rect(300, 560, 500, 660, 1, 1, 1, 1);
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     // La imagen aparte leída con el swizzle cambiado (0.6, 0.4, 0.2) y como arreglo (0.2, 0.4, 0.6).
-    dkCmdBufBindImageDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc), 3);
-    dkCmdBufBindSamplerDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc) + 3 * sizeof(DkImageDescriptor), 1);
+    dkCmdBufBindImageDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc), 4);
+    dkCmdBufBindSamplerDescriptorSet(g_cmdbuf, dkMemBlockGetGpuAddr(g_desc) + 4 * sizeof(DkImageDescriptor), 1);
     DkShader const *ts[] = {&g_vsh, &g_tex};
     dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, ts, 2);
     DkResHandle h0 = dkMakeTextureHandle(0, 0), h1 = dkMakeTextureHandle(1, 0);
@@ -329,10 +345,20 @@ static void graphicsInitialize(void) {
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     rect(1150, 560, 1250, 660, 1, 0, 0, 1);
     dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
+    // La textura que escribe la CPU: tiene que verse el color del cuadro actual.
+    dkCmdBufBindShaders(g_cmdbuf, DkStageFlag_GraphicsMask, ts, 2);
+    DkResHandle h3 = dkMakeTextureHandle(3, 0);
+    dkCmdBufBindTextures(g_cmdbuf, DkStage_Fragment, 0, &h3, 1);
+    rect(650, 400, 750, 500, 1, 1, 1, 1);
+    dkCmdBufDraw(g_cmdbuf, DkPrimitive_Triangles, 6, 1, 0, 0);
     g_cmdsRender = dkCmdBufFinishList(g_cmdbuf);
 }
 
 static void graphicsUpdate(void) {
+    g_cuadro++;
+    uint32_t color = (uint32_t)(g_cuadro * 50 & 255) | (uint32_t)((255 - g_cuadro * 50) & 255) << 8 | 0xFF000000u;
+    uint32_t *px = dkMemBlockGetCpuAddr(g_cpuMem);
+    for (uint32_t i = 0; i < dkMemBlockGetSize(g_cpuMem) / 4; i++) px[i] = color;
     int slot = dkQueueAcquireImage(g_queue, g_swapchain);
     dkQueueSubmitCommands(g_queue, g_cmdsBindFramebuffer[slot]);
     dkQueueSubmitCommands(g_queue, g_cmdsRender);

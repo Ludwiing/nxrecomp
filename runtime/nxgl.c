@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #define GL_GLEXT_PROTOTYPES
 #include "nxgl.h"
+#include "nxrt.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -252,6 +253,7 @@ typedef struct {
     uint32_t sx, sy; // muestras por píxel en x e y: en memoria cada píxel ocupa sx × sy
     uint32_t capas;  // > 1: arreglo (render en capas con gl_Layer); cada capa empieza `paso` bytes después
     uint64_t paso;
+    uint32_t sello;  // de la vigilancia de memoria: cuándo la textura y la memoria coincidieron
     struct {         // vistas para leerlo como textura con otro formato compatible, tipo o swizzle
         GLuint tex;
         GLenum internal, target;
@@ -286,6 +288,13 @@ static uint64_t rt_bytes(const Rt *r) {
 }
 
 static uint64_t rt_total(const Rt *r) { return (uint64_t)(r->capas - 1) * r->paso + rt_bytes(r); }
+
+// Para la vigilancia de memoria: la dirección de CPU de su memoria (0 si no está toda junta).
+static uint64_t rt_cpu(const Rt *r) {
+    uint64_t avail;
+    void *p = nx_gpu_ptr_n(r->addr, &avail);
+    return p && avail >= rt_total(r) ? (uint64_t)(uintptr_t)p : 0;
+}
 
 // Memoria del juego <-> imagen lineal (filas de w*bpp bytes), de la capa `capa`.
 static void rt_copia(Rt *r, uint8_t *lin, int a_memoria, uint32_t capa) {
@@ -338,6 +347,7 @@ static void rotar8(uint8_t *lin, size_t n, int izq) {
 
 static void rt_cargar(Rt *r) {
     if (traza) fprintf(stderr, "[nxgl] cargo el render target 0x%llx\n", (unsigned long long)r->addr);
+    r->sello = nx_vigia_proteger(rt_cpu(r), rt_cpu(r) ? rt_total(r) : 0);
     uint8_t *lin = tmp_buf((size_t)r->w * r->h * r->f->bpp);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     for (uint32_t c = 0; c < r->capas; c++) {
@@ -360,6 +370,7 @@ static void rt_escribir(Rt *r) {
         rt_copia(r, lin, 1, c);
     }
     r->dirty = 0;
+    r->sello = nx_vigia_proteger(rt_cpu(r), rt_cpu(r) ? rt_total(r) : 0); // memoria = textura otra vez
 }
 
 static uint32_t modo_msaa; // MultisampleMode del draw o limpieza en curso
@@ -401,7 +412,7 @@ static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32
         rts[0] = rts[--nrts];
     }
     Rt *r = &rts[nrts++];
-    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, capas, paso, {{0}}};
+    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, capas, paso, 0, {{0}}};
     glCreateTextures(capas > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, 1, &r->tex);
     if (capas > 1) glTextureStorage3D(r->tex, 1, f->internal, w, h, capas);
     else glTextureStorage2D(r->tex, 1, f->internal, w, h);
@@ -427,10 +438,14 @@ void nx_gl_release(void) {
 }
 
 
+// Un envío nuevo: lo que la CPU haya escrito en la memoria de un render target se vuelve a cargar.
+// Con la vigilancia de memoria, solo si de verdad cambió alguna de sus páginas.
 void nx_gl_invalidate_all(void) {
     envio++;
     for (int i = 0; i < nrts; i++)
-        if (!rts[i].dirty) rts[i].stale = 1;
+        if (!rts[i].dirty && (!nx_vigia_activa() || !rt_cpu(&rts[i]) ||
+                              nx_vigia_cambio(rt_cpu(&rts[i]), rt_total(&rts[i]), rts[i].sello)))
+            rts[i].stale = 1;
 }
 
 // ---------- shaders ----------
@@ -627,7 +642,9 @@ typedef struct {
     GLenum target;
     GLuint tex;
     uint64_t hash, bytes;
-    uint32_t visto; // envío en que se comprobó la memoria por última vez
+    uint32_t visto; // envío en que se comprobó la memoria por última vez (0: algo la escribió)
+    uint32_t sello; // de la vigilancia de memoria al leerla
+    uint64_t cpu;   // dónde está su memoria para la CPU (la vigilancia mira esa, no la de la GPU)
 } Tex;
 
 static Tex *texs;
@@ -820,9 +837,16 @@ static GLuint textura(const uint32_t *tic_words, int shader_type) {
             break;
         }
     if (x && x->visto == envio) return ultima_tex = x, x->tex;
+    // Con la vigilancia de memoria no hace falta volver a leerla: si ninguna página cambió, sirve.
+    if (x && x->visto && nx_vigia_activa() && x->cpu == (uint64_t)(uintptr_t)mem && !nx_vigia_cambio(x->cpu, x->bytes, x->sello)) {
+        x->visto = envio;
+        return ultima_tex = x, x->tex;
+    }
+    uint32_t sello = nx_vigia_proteger((uint64_t)(uintptr_t)mem, bytes); // antes de leer: lo que se escriba después se nota
     uint64_t h = hash_mem(mem, bytes);
     if (x) {
         x->visto = envio;
+        x->sello = sello, x->cpu = (uint64_t)(uintptr_t)mem;
         ultima_tex = x;
         if (x->hash == h) return x->tex;
         x->hash = h;
@@ -833,7 +857,8 @@ static GLuint textura(const uint32_t *tic_words, int shader_type) {
     x = &texs[ntexs++];
     memset(x, 0, sizeof *x);
     memcpy(x->tic, tic_words, 32);
-    x->target = target, x->hash = h, x->bytes = bytes, x->visto = envio, x->addr = t.addr;
+    x->target = target, x->hash = h, x->bytes = bytes, x->visto = envio, x->addr = t.addr, x->sello = sello;
+    x->cpu = (uint64_t)(uintptr_t)mem;
     glCreateTextures(target, 1, &x->tex);
     GLenum internal = t.srgb && f->srgb ? f->srgb : f->internal;
     if (target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP) glTextureStorage2D(x->tex, t.levels, internal, t.w, t.h);

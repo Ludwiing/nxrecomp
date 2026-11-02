@@ -208,6 +208,7 @@ static uint32_t csrng(ServiceObject *self, NxRequest *r) {
     NxBuffer *b = nx_out_buffer(r, 0);
     if (b) {
         uint8_t *p = (uint8_t *)(uintptr_t)b->addr;
+        nx_vigia_tocar(b->addr, b->size);
         for (uint64_t k = 0; k < b->size;) {
             ssize_t n = getrandom(p + k, b->size - k, 0);
             if (n <= 0) break;

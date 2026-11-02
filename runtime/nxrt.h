@@ -93,6 +93,17 @@ __attribute__((noreturn)) void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to);
 __attribute__((noreturn)) void nx_import_call(Ctx *c, int index);
 uint64_t nx_symbol(const char *name);
 void nx_install_crash_handler(void);
+
+// Vigilancia de memoria (nxrt.c): la GPU sabe qué memoria del juego cambió desde que la copió, sin
+// volver a leerla. nx_vigia_proteger deja las páginas de solo lectura y devuelve el sello actual; la
+// primera escritura de la CPU en una de ellas salta a un manejador que le pone un sello nuevo y la
+// vuelve a abrir. nx_vigia_cambio dice si alguna página del rango tiene un sello posterior a `desde`.
+// nx_vigia_tocar abre un rango antes de que el anfitrión escriba ahí con una llamada al sistema (un
+// read() en una página protegida daría EFAULT, no una señal). NX_SIN_VIGIA=1 la apaga.
+int nx_vigia_activa(void);
+uint32_t nx_vigia_proteger(uint64_t addr, uint64_t size);
+int nx_vigia_cambio(uint64_t addr, uint64_t size, uint32_t desde);
+void nx_vigia_tocar(uint64_t addr, uint64_t size);
 void nx_trace_func(Ctx *c, uint64_t addr);
 void nx_set_crash_ctx(Ctx *c);
 

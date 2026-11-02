@@ -37,6 +37,7 @@ static uint32_t storage_handle(ServiceObject *self, NxRequest *r) {
         uint64_t off = nx_in64(r, 0), size = nx_in64(r, 8);
         if (!r->nb || size > r->b[0].size || off > s->size || size > s->size - off) return R_FS_OUT_OF_RANGE;
         fseeko(s->f, (off_t)off, SEEK_SET);
+        nx_vigia_tocar(r->b[0].addr, size); // read() en una página protegida daría EFAULT
         if (fread((void *)(uintptr_t)r->b[0].addr, 1, size, s->f) != size) return R_FS_OUT_OF_RANGE;
         return OK;
     }
@@ -99,6 +100,7 @@ static uint32_t file_handle(ServiceObject *self, NxRequest *r) {
         uint64_t off = nx_in64(r, 8), size = nx_in64(r, 16);
         if (!r->nb) return R_FS_OUT_OF_RANGE;
         if (size > r->b[0].size) size = r->b[0].size;
+        nx_vigia_tocar(r->b[0].addr, size);
         ssize_t got = pread(fd, (void *)(uintptr_t)r->b[0].addr, size, (off_t)off);
         nx_out64(r, got < 0 ? 0 : (uint64_t)got);
         return got < 0 ? R_FS_OUT_OF_RANGE : OK;
