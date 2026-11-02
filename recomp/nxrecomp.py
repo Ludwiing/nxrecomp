@@ -154,8 +154,9 @@ def emit_function(mod, f, strong, out, stats):
         k = i.kind
 
         def jump(t):
-            if t in strong and t != f:
-                return f"{{ {fname(t)}(c); return; }}"
+            if t in strong and t != f:  # salto a otra función: llamada de cola garantizada, la pila del
+                # host no crece aunque el juego encadene saltos sin volver (intérpretes, máquinas de estado)
+                return f"{{ __attribute__((musttail)) return {fname(t)}(c); }}"
             if t in body:
                 return f"goto L_{t:x};"
             return f'{{ nx_bad_jump(c, 0x{pc:x}ull, 0x{t:x}ull); return; }}'

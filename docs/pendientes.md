@@ -62,8 +62,11 @@ Se marca [x] lo hecho.
    (necesitan continuaciones en los landing pads y en los puntos de retorno: diseño pendiente).
 3. [~] [x] Barrera después de STLR. [ ] Accesos a memoria del juego como atómicos relajados antes de
    optimizar registros.
-4. [ ] Llamadas de cola garantizadas (musttail) para que la pila del host no crezca.
-5. [ ] Escala: probar con un main de 60–100 MB (memoria de Python, tiempo de clang).
+4. [~] [x] Saltos directos a otra función con `musttail` (la pila del host no crece). [ ] Los
+   indirectos (BR por puntero) siguen pasando por nx_dispatch, que no tiene la misma firma.
+5. [~] Escala: medido con deko_examples (≈300 KB de código: 2,5 s, 76 MB, 8,4 MB de C, unos 20 s
+   de clang); proyectado a 60–100 MB: minutos de Python y 10–20 min de clang en 16 núcleos. Caché del
+   resolvedor de tablas acotada. [ ] Probar con un main real.
 6. [ ] NRO cargados con nn::ro (ldr:ro), ZBIC, relocaciones TLS.
 
 ## Kernel
