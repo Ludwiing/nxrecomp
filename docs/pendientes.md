@@ -62,8 +62,8 @@ Se marca [x] lo hecho.
    (necesitan continuaciones en los landing pads y en los puntos de retorno: diseño pendiente).
 3. [~] [x] Barrera después de STLR. [ ] Accesos a memoria del juego como atómicos relajados antes de
    optimizar registros.
-4. [~] [x] Saltos directos a otra función con `musttail` (la pila del host no crece). [ ] Los
-   indirectos (BR por puntero) siguen pasando por nx_dispatch, que no tiene la misma firma.
+4. [x] Llamadas de cola garantizadas: saltos directos a otra función con `musttail`, y los
+   indirectos (BR sin tabla, RET a otra dirección) por puntero con nx_buscar + `musttail`.
 5. [~] Escala: medido con deko_examples (≈300 KB de código: 2,5 s, 76 MB, 8,4 MB de C, unos 20 s
    de clang); proyectado a 60–100 MB: minutos de Python y 10–20 min de clang en 16 núcleos. Caché del
    resolvedor de tablas acotada. [ ] Probar con un main real.
