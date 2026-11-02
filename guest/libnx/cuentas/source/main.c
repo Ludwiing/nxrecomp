@@ -96,6 +96,16 @@ int main(int argc, char **argv) {
     Result rz = timeLoadTimeZoneRule(&lugar, &regla);
     fprintf(o, "región: 0x%x (%d), zona horaria: 0x%x 0x%x\n", rr, (int)region, rl, rz);
 
+    // Opus: un paquete de un solo byte (TOC de CELT a 48 kHz, 20 ms, una trama vacía) da 960 muestras de silencio.
+    rc = 0;
+    HwopusDecoder dec = {0};
+    s32 consumido = 0, muestras = 0;
+    static const u8 paquete[9] = {0, 0, 0, 1, 0, 0, 0, 0, 0xF8};
+    static s16 pcm[960 * 2];
+    Result rd = hwopusDecoderInitialize(&dec, 48000, 2);
+    if (R_SUCCEEDED(rd)) rd = hwopusDecodeInterleaved(&dec, &consumido, &muestras, paquete, sizeof paquete, pcm, sizeof pcm);
+    fprintf(o, "opus: 0x%x 0x%x, %d bytes consumidos, %d muestras\n", rc, rd, consumido, muestras);
+
     SwkbdConfig kbd;
     char texto[64] = "x";
     rc = swkbdCreate(&kbd, 0);

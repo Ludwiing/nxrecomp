@@ -27,7 +27,7 @@ def main():
     ap.add_argument("--progreso", action="store_true", help="una línea \"progreso i/n\" por archivo (para la app)")
     ap.add_argument("-O", dest="opt", default="2", help="nivel de optimización de clang (por defecto 2)")
     args = ap.parse_args()
-    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c"]
+    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c"]
     srcs = sorted(glob.glob(os.path.join(args.carpeta, "*.c"))) + [os.path.join(ROOT, "runtime", f) for f in runtime]
     objdir = os.path.join(args.carpeta, "obj")
     os.makedirs(objdir, exist_ok=True)
@@ -51,7 +51,7 @@ def main():
     errors = [e for _, e in results if e]
     if errors:
         sys.exit(errors[0])
-    subprocess.run(["clang", *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-lEGL", "-lOpenGL", "-o", args.salida], check=True)
+    subprocess.run(["clang", *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-lEGL", "-lOpenGL", "-lopus", "-o", args.salida], check=True)
     print(f"{args.salida}: {len(srcs)} archivos compilados con {args.j} hilos")
 
 

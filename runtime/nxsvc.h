@@ -61,6 +61,7 @@ int nx_en_base(void);
 // Servicios por archivo
 uint32_t nx_am_oe(ServiceObject *self, NxRequest *r);
 uint32_t nx_acc(ServiceObject *self, NxRequest *r);
+uint32_t nx_hwopus(ServiceObject *self, NxRequest *r);
 ServiceObject *nx_servicio_otro(const char *nombre); // nxsvc_otros.c: stubs y servicios menores
 uint32_t nx_hid(ServiceObject *self, NxRequest *r);
 uint32_t nx_time(ServiceObject *self, NxRequest *r);

@@ -65,7 +65,7 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxsvc_opus.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
@@ -90,7 +90,7 @@ $(B)/%_rec/programa.c: $(B)/%.nro $(RECOMP)
 	python3 recomp/nxrecomp.py $< -o $(B)/$*_rec
 
 $(B)/%: $(B)/%_rec/programa.c $(RUNTIME) $(RUNTIME_H)
-	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread $(SDL_LIBS) -lEGL -lOpenGL -o $@
+	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread $(SDL_LIBS) -lEGL -lOpenGL -lopus -o $@
 
 # El mismo programa compilado directo para x86_64: su salida es la referencia.
 $(B)/%_ref: guest/%.c guest/mini.h | $(B)

@@ -92,6 +92,7 @@ Se marca [x] lo hecho.
 5. [x] `hid` (evento de estilos ya avisando), `time` (zonas 1-6, ClockSnapshot 400/401, 300, 500,
    CalculateSpanBetween), `apm` (overclock), `set` (región, mapa de teclas, apodo), `set:sys`/`set:fd`
    (tema, ajustes de depuración, autor de Mii).
-6. [ ] Audio con las revisiones del SDK (5–15), efectos, IAudioDevice, `audout` Stop, `hwopus`.
+6. [~] [x] `hwopus` con libopus (uno y varios flujos, con y sin reinicio). [ ] Audio con las
+   revisiones del SDK (5–15), efectos, IAudioDevice (en curso), `audout` Stop.
 7. [ ] Herramienta que lista los servicios que nombra el juego antes del primer arranque.
    Prueba: guest/libnx/cuentas (guest/esperado/cuentas.txt). NX_TRAZA_IPC=1 muestra cada comando.

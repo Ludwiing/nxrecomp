@@ -133,6 +133,7 @@ static const struct {
     {"acc:u0", "acc:u0", nx_acc},
     {"acc:u1", "acc:u1", nx_acc},
     {"acc:su", "acc:su", nx_acc},
+    {"hwopus", "hwopus", nx_hwopus},
     {"hid", "hid", nx_hid},
     {"time:u", "time:u", nx_time},
     {"time:a", "time:a", nx_time},
