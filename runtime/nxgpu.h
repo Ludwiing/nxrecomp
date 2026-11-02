@@ -28,4 +28,4 @@ void nx_gpu_unmap_rango(uint64_t gpu, uint64_t size); // deja sin mapear un rang
 uint64_t nx_gpu_leer(uint64_t gpu, void *dst, uint64_t size);
 void nx_gpu_bloquear(void);   // el candado de la GPU (recursivo)
 void nx_gpu_desbloquear(void);
-void nx_gpu_submit(const uint64_t *gpfifo_entries, uint32_t n);
+void nx_gpu_submit(uint32_t canal, const uint64_t *gpfifo_entries, uint32_t n); // canal: uno por /dev/nvhost-gpu abierto

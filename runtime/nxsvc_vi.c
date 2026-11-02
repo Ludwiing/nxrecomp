@@ -463,7 +463,8 @@ static uint32_t as_ioctl(uint32_t nr, uint8_t *io, uint32_t size_io) { // /dev/n
 
 static uint32_t chan_syncpt = 18; // el syncpoint del canal de la GPU
 
-static uint32_t gpu_ioctl(uint32_t type, uint32_t nr, uint8_t *io, const uint8_t *extra, uint64_t extra_size) {
+// `canal_actual`: el fd de /dev/nvhost-gpu, que identifica el canal (la cola de NVN).
+static uint32_t gpu_ioctl(uint32_t canal_actual, uint32_t type, uint32_t nr, uint8_t *io, const uint8_t *extra, uint64_t extra_size) {
     if (type == 0x47) return 0; // SetUserData
     switch (nr) {
     case 0x01: case 0x03: case 0x0B: case 0x0C: case 0x0D: return 0; // nvmap fd, timeout, zcull, notificador, prioridad
@@ -474,7 +475,7 @@ static uint32_t gpu_ioctl(uint32_t type, uint32_t nr, uint8_t *io, const uint8_t
         uint32_t n = u32at(io + 8);
         const uint8_t *e = nr == 0x08 ? io + 24 : extra;
         if (!e || (nr == 0x1B && extra_size < (uint64_t)n * 8)) return 4;
-        nx_gpu_submit((const uint64_t *)e, n);
+        nx_gpu_submit(canal_actual, (const uint64_t *)e, n);
         io32(io, 16, chan_syncpt);
         io32(io, 20, nx_syncpt_read(chan_syncpt));
         return 0;
@@ -526,7 +527,7 @@ uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
         else if (dev == DEV_AS_GPU) err = as_ioctl(nr, io, size);
         else if (dev == DEV_GPU) {
             NxBuffer *x = r->cmd == 11 ? nx_in_buffer(r, 1) : NULL;
-            err = gpu_ioctl(type, nr, io, x ? (const uint8_t *)(uintptr_t)x->addr : NULL, x ? x->size : 0);
+            err = gpu_ioctl(fd, type, nr, io, x ? (const uint8_t *)(uintptr_t)x->addr : NULL, x ? x->size : 0);
         }
         if (err == 1)
             fprintf(stderr, "[RED] nvdrv: ioctl 0x%08x en %s no implementado\n", req, fd < 64 ? fds[fd].name : "?");

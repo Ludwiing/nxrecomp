@@ -45,7 +45,9 @@ Se marca [x] lo hecho.
 12. [ ] Etapas y registros: geometría *passthrough*, VertexA, primitive ID, máscaras de hilos.
 13. [~] [x] Memoria sparse: Remap (trozos de 64 KiB de distintos buffers, o vacíos), copias DMA que
     cruzan mapeos y huecos (leen ceros), texturas repartidas en varios mapeos (se juntan en un buffer).
-    Prueba en deko_gpu. [ ] Estado por canal (cada cola de NVN es un canal).
+    Prueba en deko_gpu. [x] Estado por canal: cada /dev/nvhost-gpu abierto tiene sus
+    registros, macros, motores y lector de pushbuffer (sin prueba propia: deko3d vuelve a fijar todo
+    el estado en cada lista, así que no se nota con sus ejemplos).
 14. [~] Presentación: [x] intervalo de swap (30 fps), [x] recorte y espejos del QueueBuffer.
     Falta: nvdec/vic para videos; presentar directo desde la textura de la GPU (hoy se deshace el
     block linear en la CPU en cada cuadro).

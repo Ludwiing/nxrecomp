@@ -200,8 +200,31 @@ typedef struct {
     uint32_t shadow[REGS];   // "shadow RAM": copia de los registros que MmeShadowRamControl graba o repone
 } Engine3D;
 
-static Engine3D e3d;
-static uint32_t subch_class[8];
+// Cada vez que el juego abre /dev/nvhost-gpu tiene un canal: una cola de NVN, con su propio estado de
+// los motores, sus macros y su lector de pushbuffers (dos colas en dos hilos no se pisan; nxnative
+// lo vio en Xenoblade 2, donde cada cola guarda su propio origen de la rasterización).
+typedef struct {
+    uint32_t method, sub, count, mode; // count: datos que faltan del comando en curso
+} PbEstado;
+typedef struct {
+    Engine3D e3d;
+    uint32_t subch_class[8];
+    uint32_t puller_regs[0x40];
+    uint32_t comp[REGS]; // registros del motor de cómputo
+    uint32_t r2d[0x300];
+    uint32_t dma[0x200];
+    PbEstado pbs;
+    int iniciado;
+} Canal;
+#define NCANALES 16
+static Canal *canales[NCANALES], *canal;
+#define e3d (canal->e3d)
+#define subch_class (canal->subch_class)
+#define puller_regs (canal->puller_regs)
+#define comp (canal->comp)
+#define r2d (canal->r2d)
+#define dma (canal->dma)
+#define pbs (canal->pbs)
 // Recursivo: un render target escondido se copia a memoria desde el manejador de la señal, que puede
 // saltar en el mismo hilo que está ejecutando un envío.
 static pthread_mutex_t gpu_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
@@ -574,11 +597,10 @@ static void method_gpfifo(uint32_t m, uint32_t v, uint32_t *regs) {
     }
 }
 
-static uint32_t puller_regs[0x40];
-static uint32_t comp[REGS]; // registros del motor de cómputo
+
 
 // ---------- motor 2D (0x902D): blits con escala ----------
-static uint32_t r2d[0x300];
+
 
 static uint32_t fmt_bpp(uint32_t f) { // bytes por píxel de un formato de superficie de color
     if (f >= 0xC0 && f <= 0xC5) return 16;
@@ -655,7 +677,7 @@ static void blit2d(void) {
 }
 
 // ---------- motor de copia (DMA, 0xB0B5) ----------
-static uint32_t dma[0x200];
+
 
 // Dirección de un byte de una superficie del motor de copia (lineal con pitch o "block linear").
 static uint64_t dma_addr(int bl, uint64_t base, uint32_t pitch, uint32_t blk, uint32_t w_bytes, uint32_t h, uint32_t z,
@@ -786,9 +808,7 @@ static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
 // Estado del lector de pushbuffers. Sobrevive entre entradas del GPFIFO y entre envíos, como en el
 // hardware: NVN arma los draws indirectos con la llamada a la macro en una entrada y sus argumentos
 // (escritos por la GPU) en la siguiente. La macro corre cuando llega su último argumento.
-static struct {
-    uint32_t method, sub, count, mode; // count: datos que faltan del comando en curso
-} pbs;
+
 
 static void run_pushbuffer(uint64_t gpu, uint32_t words) {
     uint64_t avail;
@@ -823,11 +843,14 @@ static void run_pushbuffer(uint64_t gpu, uint32_t words) {
     }
 }
 
-void nx_gpu_submit(const uint64_t *entries, uint32_t n) {
+void nx_gpu_submit(uint32_t id_canal, const uint64_t *entries, uint32_t n) {
     pthread_mutex_lock(&gpu_lock);
     static int iniciada;
-    if (!iniciada++) {
-        traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
+    if (!iniciada++) traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
+    Canal **c = &canales[id_canal % NCANALES];
+    if (!*c) *c = calloc(1, sizeof **c);
+    canal = *c;
+    if (!canal->iniciado++) {
         // Registros que en el hardware no arrancan en 0 y que un driver puede no escribir nunca.
         e3d.regs[0x0DF] = 1; // RasterEnable
         e3d.regs[0x556] = 1; // SetRenderEnableC: siempre

@@ -60,6 +60,8 @@ def _preds(mod, lo, hi):
     """Para cada dirección de [lo, hi), los saltos que llegan a ella: {destino: [(origen, condición)]}."""
     key = (id(mod), lo, hi)
     if key not in _branch_maps:
+        if len(_branch_maps) > 256:
+            _branch_maps.clear()  # uno por función con BR: en un juego de cientos de MB no puede crecer sin límite
         m = {}
         for q in range(lo, hi, 4):
             if not mod.in_text(q):
