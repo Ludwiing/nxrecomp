@@ -51,6 +51,7 @@ Además corren dos ejemplos oficiales de devkitPro con pantalla, sin tocar: `pri
 Hay dos ejemplos de audio:
 - `playtone` (`audout`) toca 220, 440 y 1760 Hz con A, B y X, y se compara el WAV.
 - `audren-simple` (el renderizador) tiene que sacar su `sample.bin` intacto, muestra por muestra, en los dos canales.
+- `audren_rev` habla con el renderizador en las revisiones del SDK de Nintendo que libnx no conoce (REV11 y REV15): arma a mano los buffers de cada actualización, toca dos voces (una con biquad y splitter hacia una submezcla) y compara, muestra por muestra, lo que devuelve un efecto AUX. También prueba `IAudioDevice`.
 
 Y los de la GPU, con deko3d (el driver de bajo nivel de los homebrew modernos): `deko_basic` arranca el dispositivo, crea las colas, sube sus shaders y dibuja su triángulo de colores; `deko_console` dibuja una consola de texto con una textura de fuente (un arreglo 2D de 256 capas subido con el motor de copia) y 3600 instancias por cuadro. `make test` comprueba varios píxeles de cada uno. Además corren los 9 ejemplos de `deko_examples` (elegidos desde su menú con `NX_PULSAR`, `tools/deko_ejemplo.sh N`): triángulo con vertex buffer, cubo con profundidad, cubo con textura BC1, teselación en alambre, multisampling, iluminación en sRGB, deferred shading con varios render targets y un shader de cómputo que genera la geometría. Necesitan glm (`switch-glm` o sus cabeceras en `~/src/glm`); como están animados, se comprueba la fracción de píxeles dibujados y su color medio.
 
@@ -81,8 +82,11 @@ Como en nxnative, el código del SDK de Nintendo (o el de libnx) corre traducido
     - Mandos: por posición, como en la Switch.
     - Pruebas: `NX_PULSAR="30:plus,45:a+b"` aprieta botones en cuadros fijos.
 
-  - Audio, en `runtime/nxaudio.c` (salida SDL3), `nxsvc_audio.c` (`audout`) y `nxsvc_audren.c` (el renderizador `audren`, el que usan los juegos).
-    - El renderizador mezcla 240 muestras cada 5 ms. Lee voces en PCM de 8/16/32 bits, float y DSP-ADPCM, con remuestreo lineal, factores de mezcla por canal, submezclas y salida estéreo o 5.1.
+  - Audio, en `runtime/nxaudio.c` (salida SDL3), `nxsvc_audio.c` (`audout`), `nxsvc_audren.c` (el renderizador `audren`, el que usan los juegos, e `IAudioDevice`) y `nxaudren.c` (sus cuadros).
+    - El renderizador sigue al de Ryujinx (MIT): habla las revisiones REV1 a REV15 (el formato de cada actualización cambia con la revisión), calcula el tamaño de su memoria de trabajo como Ryujinx y mezcla un cuadro cada 5 ms (240 muestras a 48 kHz, o 160 a 32 kHz con remuestreo a 48 kHz).
+    - Voces en PCM de 8/16/32 bits, float y DSP-ADPCM (con contexto de repetición), remuestreador de Nintendo (las tablas de Ryujinx), rampas de volumen, biquad, depop, splitters, submezclas, sink de dispositivo (estéreo o 5.1, con mezcla a estéreo) y sink de buffer circular.
+    - Efectos: AUX (el juego lee y escribe sus buffers circulares), captura, biquad, mezcla de buffers y limitador. Delay, reverb, reverb 3D y compresor dejan pasar la señal.
+    - `NX_TRAZA_AUDREN=1` muestra cada renderizador abierto y cada actualización o error.
     - `NX_SIN_AUDIO=1` no abre el dispositivo.
     - `NX_AUDIO_WAV=f.wav` graba lo que suena.
 
@@ -132,7 +136,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 - **Arranque de un juego real**: después de los constructores se salta directo a `nnMain`. Un juego con el SDK de Nintendo necesita antes la secuencia de `nn::init::Start` (`nnosInitialize`, `nninitStartup`...), y esa secuencia necesita hilos, SVC y servicios de Horizon. Es el siguiente paso.
 - **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
-- **Audio**: el ADPCM, el remuestreo con tono distinto de 1 y las submezclas están escritos, pero ningún ejemplo los prueba todavía. Faltan los efectos (reverb, delay...) y los formatos de revisión más nuevos que usa el SDK de Nintendo.
+- **Audio**: el ADPCM y el remuestreo con tono distinto de 1 están escritos, pero ningún ejemplo los prueba todavía. Delay, reverb, reverb 3D y compresor dejan pasar la señal sin procesarla. No hay `hwopus`.
 - **Servicios**: la GPU ya dibuja los 9 ejemplos de deko3d (ver arriba), pero no se ha probado con un juego real, y faltan `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
 - **Excepciones de C++ y `longjmp`**: un RET a una dirección que no es inicio de función (el destino de un `longjmp`, o una plataforma de aterrizaje de una excepción) todavía no se resuelve.
 - **FPCR**: se asume la configuración por defecto (redondeo al más cercano, sin flush-to-zero ni NaN por defecto). FPSR no lleva las banderas de excepción ni QC.

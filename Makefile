@@ -50,6 +50,8 @@ PULSAR := 10:a,20:b+x,30:up,40:zl+r,50:minus,60:plus
 LIBNX_AUDIO := $(if $(wildcard $(DEVKITPRO)/libnx),playtone)
 # El renderizador (audren): el ejemplo audren-simple tiene que sacar data/sample.bin intacto.
 LIBNX_AUDREN := $(if $(wildcard $(DEVKITPRO)/libnx),audren_simple)
+# Las revisiones del SDK de Nintendo (REV11 y REV15) por IPC directo: la mezcla vuelve por un efecto AUX.
+LIBNX_AUDREN_REV := $(if $(wildcard $(DEVKITPRO)/libnx),audren_rev)
 
 
 OPT ?= -O2
@@ -65,11 +67,11 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxaudren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
-all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(B)/astc_test $(if $(LIBNX_GPU),$(B)/libnx_deko_astc) $(if $(DEKO_EJEMPLOS),$(B)/libnx_deko_examples) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh) $(SHADERS_COMP:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%)
+all: $(PROGS:%=$(B)/%) $(PROGS:%=$(B)/%_ref) $(PROGS_ESPERADO:%=$(B)/%) $(B)/romfs_prueba.img $(LIBNX_PROGS:%=$(B)/libnx_%) $(LIBNX_PANTALLA:%=$(B)/libnx_%) $(LIBNX_GPU:%=$(B)/libnx_%) $(B)/astc_test $(if $(LIBNX_GPU),$(B)/libnx_deko_astc) $(if $(DEKO_EJEMPLOS),$(B)/libnx_deko_examples) $(if $(SHADERS),$(B)/shader_test $(SHADERS:%=$(B)/shaders/%.dksh) $(SHADERS_COMP:%=$(B)/shaders/%.dksh)) $(LIBNX_MANDOS:%=$(B)/libnx_%) $(LIBNX_AUDIO:%=$(B)/libnx_%) $(LIBNX_AUDREN:%=$(B)/libnx_%) $(LIBNX_AUDREN_REV:%=$(B)/libnx_%)
 
 $(B)/romfs_prueba.img: | $(B)
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 31 + (i >> 8)) & 255 for i in range(65536)))" > $@
@@ -216,6 +218,11 @@ test: all
 			timeout 60 $(B)/libnx_$$p >/dev/null; \
 		if python3 tests/compara_audio.py $(B)/$$p.wav guest/libnx/$$p/data/sample.bin >/dev/null; then \
 			echo "OK: $$p (libnx, audren) mezcló el sonido intacto"; else echo "MAL: $$p mezcló otro sonido"; ok=0; fi; \
+	done; \
+	for p in $(LIBNX_AUDREN_REV); do \
+		NX_SIN_VENTANA=1 NX_SIN_AUDIO=1 timeout 60 $(B)/libnx_$$p > $(B)/$$p.salida.txt; \
+		if diff -u guest/esperado/$$p.txt $(B)/$$p.salida.txt; then echo "OK: $$p (libnx, audren REV11 y REV15) mezcló lo esperado"; \
+		else ok=0; fi; \
 	done; test $$ok = 1
 
 $(B):
