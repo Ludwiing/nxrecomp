@@ -104,6 +104,14 @@ int nx_vigia_activa(void);
 uint32_t nx_vigia_proteger(uint64_t addr, uint64_t size);
 int nx_vigia_cambio(uint64_t addr, uint64_t size, uint32_t desde);
 void nx_vigia_tocar(uint64_t addr, uint64_t size);
+// Páginas escondidas (sin acceso): la memoria de un render target cuyo contenido nuevo está solo en la
+// GPU. El primer acceso de la CPU llama a la función registrada con nx_vigia_al_leer, que lo copia a
+// memoria. nx_vigia_resolver hace lo mismo a propósito (antes de pasarle memoria del juego a OpenGL o a
+// una llamada al sistema); nx_vigia_destapar las abre sin copiar (porque se va a escribir encima).
+void nx_vigia_ocultar(uint64_t addr, uint64_t size);
+void nx_vigia_destapar(uint64_t addr, uint64_t size);
+void nx_vigia_resolver(uint64_t addr, uint64_t size);
+void nx_vigia_al_leer(void (*fn)(uint64_t addr));
 void nx_trace_func(Ctx *c, uint64_t addr);
 void nx_set_crash_ctx(Ctx *c);
 

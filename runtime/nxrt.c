@@ -169,6 +169,50 @@ int nx_vigia_cambio(uint64_t addr, uint64_t size, uint32_t desde) {
     return 0;
 }
 
+static void (*al_leer)(uint64_t);
+void nx_vigia_al_leer(void (*fn)(uint64_t)) { al_leer = fn; }
+
+static uint8_t estado_de(uint64_t pg) {
+    Bloque *b = bloque(pg, 0);
+    return b ? __atomic_load_n(&b->estado[pg & ((1u << VBLOQUE) - 1)], __ATOMIC_SEQ_CST) : 0;
+}
+
+void nx_vigia_ocultar(uint64_t addr, uint64_t size) {
+    if (!nx_vigia_activa() || !size) return;
+    uint64_t p0 = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG;
+    for (uint64_t pg = p0; pg < p1; pg++) {
+        Bloque *b = bloque(pg, 1);
+        if (b) __atomic_store_n(&b->estado[pg & ((1u << VBLOQUE) - 1)], 3, __ATOMIC_SEQ_CST);
+    }
+    mprotect((void *)(uintptr_t)(p0 << VPAG), (p1 - p0) << VPAG, PROT_NONE);
+}
+
+// Abre sin copiar. Para la CPU el contenido cambia (lo que se escriba ahora no lo dibujó la GPU en
+// esta memoria): un sello nuevo, para que las texturas que la leen se recarguen.
+void nx_vigia_destapar(uint64_t addr, uint64_t size) {
+    if (!nx_vigia_activa() || !size) return;
+    uint64_t p0 = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG;
+    uint32_t s = __atomic_add_fetch(&sello_global, 1, __ATOMIC_SEQ_CST);
+    for (uint64_t pg = p0; pg < p1; pg++) {
+        Bloque *b = bloque(pg, 0);
+        if (!b) continue;
+        uint32_t i = pg & ((1u << VBLOQUE) - 1);
+        if (__atomic_load_n(&b->estado[i], __ATOMIC_SEQ_CST) != 3) continue;
+        __atomic_store_n(&b->sello[i], s, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&b->estado[i], 2, __ATOMIC_SEQ_CST);
+        mprotect((void *)(uintptr_t)(pg << VPAG), 1u << VPAG, PROT_READ | PROT_WRITE);
+    }
+}
+
+void nx_vigia_resolver(uint64_t addr, uint64_t size) {
+    if (!nx_vigia_activa() || !size) return;
+    for (uint64_t pg = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG; pg < p1; pg++)
+        if (estado_de(pg) == 3) {
+            if (al_leer) al_leer(pg << VPAG);
+            if (estado_de(pg) == 3) nx_vigia_destapar(pg << VPAG, 1u << VPAG); // nadie la reclamó
+        }
+}
+
 // Abre la página `pg` con un sello nuevo. Devuelve 0 si no era una página vigilada.
 static int abrir(uint64_t pg) {
     Bloque *b = bloque(pg, 0);
@@ -176,6 +220,10 @@ static int abrir(uint64_t pg) {
     uint32_t i = pg & ((1u << VBLOQUE) - 1);
     uint8_t e = __atomic_load_n(&b->estado[i], __ATOMIC_SEQ_CST);
     if (!e) return 0;
+    if (e == 3) { // escondida: que el dueño la copie a memoria; el acceso se repite (y si escribe, vuelve)
+        nx_vigia_resolver(pg << VPAG, 1);
+        return 1;
+    }
     if (e == 1) __atomic_store_n(&b->sello[i], __atomic_add_fetch(&sello_global, 1, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
     __atomic_store_n(&b->estado[i], 2, __ATOMIC_SEQ_CST);
     return !mprotect((void *)(uintptr_t)(pg << VPAG), 1u << VPAG, PROT_READ | PROT_WRITE);
@@ -183,6 +231,7 @@ static int abrir(uint64_t pg) {
 
 void nx_vigia_tocar(uint64_t addr, uint64_t size) {
     if (!nx_vigia_activa() || !size) return;
+    nx_vigia_resolver(addr, size);
     for (uint64_t pg = addr >> VPAG, p1 = (addr + size + (1u << VPAG) - 1) >> VPAG; pg < p1; pg++) {
         Bloque *b = bloque(pg, 0);
         if (b && __atomic_load_n(&b->estado[pg & ((1u << VBLOQUE) - 1)], __ATOMIC_SEQ_CST) == 1) abrir(pg);
@@ -191,7 +240,8 @@ void nx_vigia_tocar(uint64_t addr, uint64_t size) {
 
 static void on_crash(int sig, siginfo_t *si, void *uc) {
     (void)uc;
-    // Una escritura en una página vigilada: se anota, se abre y la instrucción se repite.
+    // Un acceso a una página vigilada: se anota (o se copia lo que estaba en la GPU), se abre y la
+    // instrucción se repite.
     if (sig == SIGSEGV && si->si_code == SEGV_ACCERR && abrir((uint64_t)(uintptr_t)si->si_addr >> VPAG)) return;
     fflush(stdout);
     fprintf(stderr, "\n[nxrt] %s en la dirección 0x%llx\n", sig == SIGSEGV ? "violación de segmento" : "error de bus",
@@ -214,7 +264,7 @@ void nx_install_crash_handler(void) {
     sigaltstack(&ss, NULL);
     struct sigaction sa = {0};
     sa.sa_sigaction = on_crash;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER; // la copia de un render target puede tocar otra página vigilada
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 }

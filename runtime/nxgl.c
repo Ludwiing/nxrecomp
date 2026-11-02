@@ -47,6 +47,7 @@ static void APIENTRY depurar(GLenum src, GLenum type, GLuint id, GLenum sev, GLs
 }
 
 static void contadores_empezar(void);
+static void rt_leido_por_cpu(uint64_t addr);
 
 static int iniciar(void) {
     if (estado) return estado > 0;
@@ -95,6 +96,7 @@ static int iniciar(void) {
     glEnable(GL_FRAMEBUFFER_SRGB); // como la GPU: los render targets sRGB convierten al escribir
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS); // los cubos de Maxwell filtran entre caras
     contadores_empezar();
+    nx_vigia_al_leer(rt_leido_por_cpu);
     estado = 1;
     return 1;
 }
@@ -165,6 +167,7 @@ void nx_gl_contador_reiniciar(uint32_t v) {
 
 // Copia `size` bytes a un anillo y devuelve el offset (alineado a `align`).
 static GLintptr subir(GLuint buf, GLintptr *off, const void *data, size_t size, size_t align) {
+    nx_vigia_resolver((uint64_t)(uintptr_t)data, size); // que OpenGL no lea páginas escondidas
     GLintptr o = (*off + align - 1) & ~(GLintptr)(align - 1);
     if (o + size > RING) {
         glFinish(); // el anillo da la vuelta: que nada lo esté usando
@@ -254,6 +257,7 @@ typedef struct {
     uint32_t capas;  // > 1: arreglo (render en capas con gl_Layer); cada capa empieza `paso` bytes después
     uint64_t paso;
     uint32_t sello;  // de la vigilancia de memoria: cuándo la textura y la memoria coincidieron
+    int oculto;      // su memoria está escondida: lo último dibujado está solo en la GPU
     struct {         // vistas para leerlo como textura con otro formato compatible, tipo o swizzle
         GLuint tex;
         GLenum internal, target;
@@ -360,6 +364,10 @@ static void rt_cargar(Rt *r) {
 }
 
 static void rt_escribir(Rt *r) {
+    if (r->oculto) { // se va a escribir encima: abrir sin copiar nada
+        nx_vigia_destapar(rt_cpu(r), rt_total(r));
+        r->oculto = 0;
+    }
     if (traza) fprintf(stderr, "[nxgl] escribo el render target 0x%llx\n", (unsigned long long)r->addr);
     size_t n = (size_t)r->w * r->h * r->f->bpp;
     uint8_t *lin = tmp_buf(n);
@@ -412,7 +420,7 @@ static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32
         rts[0] = rts[--nrts];
     }
     Rt *r = &rts[nrts++];
-    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, capas, paso, 0, {{0}}};
+    *r = (Rt){addr, w, h, fmt, tile, f, 0, 1, 0, sx, sy, capas, paso, 0, 0, {{0}}};
     glCreateTextures(capas > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, 1, &r->tex);
     if (capas > 1) glTextureStorage3D(r->tex, 1, f->internal, w, h, capas);
     else glTextureStorage2D(r->tex, 1, f->internal, w, h);
@@ -421,13 +429,49 @@ static Rt *rt_buscar(uint64_t addr, uint32_t w, uint32_t h, uint32_t fmt, uint32
     return r;
 }
 
+// Lo dibujado tiene que poder verse desde la CPU (antes de un syncpoint o un semáforo). Con la
+// vigilancia de memoria no se copia nada todavía: la memoria de cada render target se esconde y se
+// copia recién cuando alguien la toca (rt_leido_por_cpu). Casi ningún render target se lee nunca
+// desde la CPU, y copiarlos todos en cada cuadro era lo más caro de la sincronización.
 void nx_gl_flush(void) {
     if (estado <= 0) return;
     for (int i = 0; i < nrts; i++)
         if (rts[i].dirty) {
+            uint64_t cpu = nx_vigia_activa() ? rt_cpu(&rts[i]) : 0;
+            if (cpu) {
+                if (!rts[i].oculto) nx_vigia_ocultar(cpu, rt_total(&rts[i]));
+                rts[i].oculto = 1;
+                continue;
+            }
             tomar();
             rt_escribir(&rts[i]);
         }
+}
+
+// La CPU (o el runtime) tocó la memoria escondida de un render target: copiarlo desde la GPU. Corre
+// dentro del manejador de la señal, en el hilo que la tocó.
+static void rt_leido_por_cpu(uint64_t addr) {
+    nx_gpu_bloquear();
+    int tenia = actual;
+    uint8_t *tmp_viejo = tmp;
+    size_t cap_viejo = tmp_cap;
+    tmp = NULL, tmp_cap = 0; // por si la señal saltó en medio de otra copia que usa el mismo buffer
+    for (int i = 0; i < nrts; i++) {
+        uint64_t cpu = rts[i].oculto ? rt_cpu(&rts[i]) : 0;
+        if (cpu && addr >= cpu && addr < cpu + rt_total(&rts[i])) {
+            tomar();
+            rts[i].oculto = 0;
+            nx_vigia_destapar(cpu, rt_total(&rts[i]));
+            rt_escribir(&rts[i]);
+        }
+    }
+    free(tmp);
+    tmp = tmp_viejo, tmp_cap = cap_viejo;
+    if (!tenia && actual) {
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        actual = 0;
+    }
+    nx_gpu_desbloquear();
 }
 
 void nx_gl_release(void) {
@@ -999,6 +1043,7 @@ static GLuint textura_buffer(const uint32_t *w) {
         glTextureBuffer(cache[i].tex, f->internal, cache[i].buf);
     }
     if (cache[i].envio != envio) {
+        nx_vigia_resolver((uint64_t)(uintptr_t)mem, bytes);
         glNamedBufferSubData(cache[i].buf, 0, (GLsizeiptr)bytes, mem);
         cache[i].envio = envio;
     }
@@ -1555,6 +1600,7 @@ static int ssbos(const uint64_t *cbs, const NxShaderInfo *info, int base, int n)
         }
         if (!size || size > avail) size = avail > (64u << 20) ? 64u << 20 : (uint32_t)avail;
         nx_gl_cpu_write(addr, size); // lo que la GPU tenga pendiente en esa memoria, antes
+        nx_vigia_resolver((uint64_t)(uintptr_t)mem, size);
         glNamedBufferData(b, size, mem, GL_DYNAMIC_COPY);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, base + k, b);
         if (info->ssbo[k].written && n < 96) sb_pend[n++] = (SbBind){b, addr, size, 1};
@@ -1571,6 +1617,7 @@ static void sb_volver(int n) {
         uint64_t avail;
         uint8_t *mem = nx_gpu_ptr_n(sb_pend[i].addr, &avail);
         if (!mem || avail < sb_pend[i].size) continue;
+        nx_vigia_resolver((uint64_t)(uintptr_t)mem, sb_pend[i].size);
         glGetNamedBufferSubData(sb_pend[i].buf, 0, sb_pend[i].size, mem);
         nx_gl_cpu_write(sb_pend[i].addr, sb_pend[i].size); // las copias de esa memoria quedan viejas
     }

@@ -22,4 +22,6 @@ uint32_t nx_syncpt_read(uint32_t id);
 void nx_syncpt_incr(uint32_t id);
 int nx_syncpt_wait(uint32_t id, uint32_t threshold, int32_t timeout_us); // 1 si llegó
 
+void nx_gpu_bloquear(void);   // el candado de la GPU (recursivo)
+void nx_gpu_desbloquear(void);
 void nx_gpu_submit(const uint64_t *gpfifo_entries, uint32_t n);

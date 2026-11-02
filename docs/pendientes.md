@@ -17,8 +17,9 @@ Se marca [x] lo hecho.
    apaga): una textura o un render target se vuelve a leer solo si la CPU escribió alguna de sus
    páginas desde la última lectura (antes se hasheaba todo en cada envío y se recargaban todos los
    render targets); las lecturas de archivos abren las páginas antes del read(). Prueba: la textura
-   que la CPU reescribe en deko_gpu. [ ] Devolver los render targets a memoria solo cuando la CPU
-   los lee (hoy en cada syncpoint); caché de buffers en vez de subir todo en cada draw; storage
+   que la CPU reescribe en deko_gpu. [x] Los render targets se devuelven a memoria solo cuando la
+   CPU (o el runtime) los toca: en el syncpoint su memoria se esconde (PROT_NONE) y el primer acceso
+   la copia desde la GPU, dentro del manejador de la señal. [ ] caché de buffers en vez de subir todo en cada draw; storage
    buffers de tamaño 0.
 4. [~] Reportes: hecho el tipo de contador (consultas de OpenGL), CounterReset y las marcas de
    tiempo en ticks de 614,4 MHz. [x] Renderizado condicional (RenderEnable, sin prueba: deko3d no lo expone). Antes: tipo de contador (oclusión, primitivas, transform feedback) y marcas de tiempo en

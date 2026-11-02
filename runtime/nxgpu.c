@@ -177,7 +177,11 @@ typedef struct {
 
 static Engine3D e3d;
 static uint32_t subch_class[8];
-static pthread_mutex_t gpu_lock = PTHREAD_MUTEX_INITIALIZER;
+// Recursivo: un render target escondido se copia a memoria desde el manejador de la señal, que puede
+// saltar en el mismo hilo que está ejecutando un envío.
+static pthread_mutex_t gpu_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+void nx_gpu_bloquear(void) { pthread_mutex_lock(&gpu_lock); }
+void nx_gpu_desbloquear(void) { pthread_mutex_unlock(&gpu_lock); }
 
 static uint64_t iova(const uint32_t *regs, uint32_t m) { return (uint64_t)regs[m] << 32 | regs[m + 1]; }
 
