@@ -153,6 +153,9 @@ def emit_function(mod, f, strong, out, stats):
             out.append(f"    c->pc = 0x{pc:x}ull;")
         k = i.kind
 
+        def tail_dispatch(reg):
+            return f"{{ NxFn fn = nx_buscar({reg}); __attribute__((musttail)) return fn(c); }}"
+
         def jump(t):
             if t in strong and t != f:  # salto a otra función: llamada de cola garantizada, la pila del
                 # host no crece aunque el juego encadene saltos sin volver (intérpretes, máquinas de estado)
@@ -185,13 +188,13 @@ def emit_function(mod, f, strong, out, stats):
                 out.append(f"    switch ({i.reg}) {{")
                 for t in i.targets:
                     out.append(f"    case 0x{t:x}ull: {jump(t)}")
-                out.append(f"    default: nx_dispatch(c, {i.reg}); return;")
+                out.append(f"    default: {tail_dispatch(i.reg)}")
                 out.append("    }")
             else:
-                out.append(f"    nx_dispatch(c, {i.reg}); return;")
+                out.append(f"    {tail_dispatch(i.reg)}")
             continue
-        elif k == "ret":
-            out.append(f"    if ({i.reg} != lr0) nx_dispatch(c, {i.reg});")
+        elif k == "ret":  # un RET a otra dirección (el juego cambió x30): seguir allí, también de cola
+            out.append(f"    if ({i.reg} != lr0) {tail_dispatch(i.reg)}")
             out.append("    return;")
             continue
         if nxt != pc + 4:  # la siguiente instrucción no está justo después: salto explícito
@@ -312,15 +315,21 @@ def main():
     out.append(f"const uint64_t nx_program_id = 0x{np.get('programa', 0):x}ull;")
     out.append(f"const int nx_main_priority = {np.get('prioridad', 44)}, nx_main_core = {np.get('núcleo', 0)};")
     out.append("")
-    out.append("void nx_dispatch(Ctx *c, uint64_t a) {")
-    out.append("    switch (a) {")
-    out += [f"    case 0x{f:x}ull: {fname(f)}(c); return;" for f in sorted(entries)]
-    out.append("    }")
-    out.append(f"    if (a >= 0x{IMPORT_BASE:x}ull && a < 0x{IMPORT_BASE:x}ull + 16ull * nx_nimports && !(a & 15))")
-    out.append(f"        nx_import_call(c, (int)((a - 0x{IMPORT_BASE:x}ull) / 16));")
-    out.append("    else")
-    out.append("        nx_bad_jump(c, 0, a);")
+    out.append("static __thread uint64_t destino_malo;")
+    out.append("static void salto_malo(Ctx *c) { nx_bad_jump(c, 0, destino_malo); }")
+    out.append("static void importacion(Ctx *c) {")
+    out.append(f"    nx_import_call(c, (int)((destino_malo - 0x{IMPORT_BASE:x}ull) / 16));")
     out.append("}")
+    out.append("NxFn nx_buscar(uint64_t a) {")
+    out.append("    switch (a) {")
+    out += [f"    case 0x{f:x}ull: return {fname(f)};" for f in sorted(entries)]
+    out.append("    }")
+    out.append("    destino_malo = a;")
+    out.append(f"    if (a >= 0x{IMPORT_BASE:x}ull && a < 0x{IMPORT_BASE:x}ull + 16ull * nx_nimports && !(a & 15))")
+    out.append("        return importacion;")
+    out.append("    return salto_malo;")
+    out.append("}")
+    out.append("void nx_dispatch(Ctx *c, uint64_t a) { nx_buscar(a)(c); }")
     open(os.path.join(args.output, "programa.c"), "w").write("\n".join(out) + "\n")
 
     print(f"{args.output}: {len(entries)} funciones en {nfiles} archivos; "

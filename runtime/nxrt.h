@@ -74,6 +74,10 @@ extern const int nx_main_priority, nx_main_core;
 extern const unsigned char nx_romfs_data[]; // el RomFS que venía dentro del NRO (homebrew)
 extern const uint64_t nx_romfs_size;
 void nx_dispatch(Ctx *c, uint64_t addr);
+// La función recompilada que empieza en `addr` (o una que avisa del salto inválido o de la importación
+// que falta). Con ella los saltos indirectos son llamadas de cola (musttail) y la pila no crece.
+typedef void (*NxFn)(Ctx *c);
+NxFn nx_buscar(uint64_t addr);
 
 enum {
     NX_TPIDR_EL0, NX_TPIDRRO_EL0, NX_CNTFRQ_EL0, NX_CNTPCT_EL0, NX_CNTVCT_EL0,
