@@ -87,6 +87,9 @@ static const StubDef stubs[] = {
     {"IGeneralService", {{4, OBJETO, "IRequest"}, {12, ERROR, 0, R_SIN_RED}, {18, ERROR, 0, 0x2586Eu}}},
     {"IRequest", {{0}}},
     {"aoc:u", {{0}}},
+    // Nombrados por el SDK de juegos grandes (Tears of the Kingdom): los que una aplicación casi nunca usa.
+    {"acc:aa", {{0}}}, {"auddev", {{0}}}, {"audrec:u", {{0}}}, {"btm:u", {{0}}}, {"hid:dbg", {{0}}},
+    {"hid:sys", {{0}}}, {"hidbus", {{0}}}, {"lbl", {{0}}}, {"nim:eca", {{0}}}, {"nsd:u", {{0}}},
     {"IPurchaseEventManager", {{0, EVENTO}, {1, ERROR, 0, 0x6A9Cu}}},
 };
 

@@ -53,24 +53,42 @@ def _cmp_imm(w):
     return None
 
 
-_branch_maps = {}
+_mapas = {}
+
+
+class _Vista:
+    """Los saltos del mapa del módulo que salen de [lo, hi)."""
+
+    def __init__(self, mapa, lo, hi):
+        self.mapa, self.lo, self.hi = mapa, lo, hi
+
+    def get(self, q, defecto=None):
+        r = [s for s in self.mapa.get(q, ()) if self.lo <= s[0] < self.hi]
+        return r if r else (defecto if defecto is not None else [])
+
+
+def _mapa(mod):
+    """Todos los saltos directos del texto del programa, una sola vez: {destino: [(origen, condición)]}.
+    (Antes se recorría un rango de código distinto por cada BR: con un juego de decenas de MB, horas.)"""
+    if id(mod) not in _mapas:
+        m = {}
+        for lo, hi in mod.text_ranges:
+            for q in range(lo, hi, 4):
+                w = mod.word(q)
+                top = w >> 24
+                # B, B.cond, CBZ/CBNZ, TBZ/TBNZ: descartar rápido lo que no es salto
+                if (top & 0xFC) not in (0x14, 0x54, 0x34, 0xB4, 0x36, 0xB6, 0x16):
+                    continue
+                b = _branch(w, q)
+                if b:
+                    m.setdefault(b[0], []).append((q, b[1]))
+        _mapas[id(mod)] = m
+    return _mapas[id(mod)]
 
 
 def _preds(mod, lo, hi):
-    """Para cada dirección de [lo, hi), los saltos que llegan a ella: {destino: [(origen, condición)]}."""
-    key = (id(mod), lo, hi)
-    if key not in _branch_maps:
-        if len(_branch_maps) > 256:
-            _branch_maps.clear()  # uno por función con BR: en un juego de cientos de MB no puede crecer sin límite
-        m = {}
-        for q in range(lo, hi, 4):
-            if not mod.in_text(q):
-                break
-            b = _branch(mod.word(q), q)
-            if b:
-                m.setdefault(b[0], []).append((q, b[1]))
-        _branch_maps[key] = m
-    return _branch_maps[key]
+    """Para cada dirección, los saltos de [lo, hi) que llegan a ella: {destino: [(origen, condición)]}."""
+    return _Vista(_mapa(mod), lo, hi)
 
 
 def backward_path(mod, pc, lo):

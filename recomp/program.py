@@ -211,11 +211,37 @@ class Program:
             raise ValueError("fuera de la imagen")
         return bytes(m.img.data[a - m.base:a - m.base + n])
 
+    # word e in_text se llaman millones de veces con un juego grande: el módulo y el rango de texto
+    # de la última consulta quedan a mano, y las palabras se leen de una vista de 32 bits.
+    _ultimo = (0, 0, None)  # (desde, hasta, palabras)
+
     def word(self, a):
-        return struct.unpack("<I", self.read(a, 4))[0]
+        lo, hi, w = self._ultimo
+        if not (lo <= a < hi) or a & 3:
+            m = self.module_at(a)
+            if m is None or a + 4 > m.base + m.img.size:
+                raise ValueError("fuera de la imagen")
+            if a & 3:
+                return struct.unpack("<I", self.read(a, 4))[0]
+            if not hasattr(m, "_palabras"):
+                n = len(m.img.data) & ~3
+                m._palabras = memoryview(bytes(m.img.data[:n])).cast("I")
+            self._ultimo = lo, hi, w = (m.base, m.base + (len(m.img.data) & ~3), m._palabras)
+        return w[(a - lo) >> 2]
+
+    _texto = (0, 0)
 
     def in_text(self, a):
-        return a % 4 == 0 and any(lo <= a < hi for lo, hi in self.text_ranges)
+        if a & 3:
+            return False
+        lo, hi = self._texto
+        if lo <= a < hi:
+            return True
+        for lo, hi in self.text_ranges:
+            if lo <= a < hi:
+                self._texto = (lo, hi)
+                return True
+        return False
 
     def entry_points(self):
         """Inicios seguros: la entrada de cada módulo, DT_INIT, init_array y funciones exportadas."""

@@ -1,6 +1,6 @@
 // Tomado de nxnative (https://github.com/seedds/nxnative, dm/tools/nx_extract, commit 5474c6f),
 // licencia MIT (ver LICENSE.nxnative). Único cambio: en Linux la copia de archivos idénticos usa
-// File.Copy en lugar de clonefile de macOS.
+// File.Copy en lugar de clonefile de macOS; además acepta NCA sueltas y lee title.keys junto a prod.keys.
 // NSP extraction: nx_extract <prod.keys> <base NSP> <update NSP or -> <output dir> [base RomFS dir to compare against] [--manifest] [--romfs-image]
 // --romfs-image streams the merged RomFS directly to <output dir>/RomFS.img (the packing script's default); only ExeFS is expanded. Without it, legacy folder extraction remains available.
 // With a base RomFS dir in legacy mode, files whose content matches it become APFS clones (no new space).
@@ -40,9 +40,9 @@ static class P {
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
         bool image = Array.IndexOf(a, "--romfs-image") >= 0; a = Array.FindAll(a, s => s != "--romfs-image");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
-        if (a.Length == 3 && a[1] == "--title") return Title(ExternalKeyReader.ReadKeyFile(a[0]), a[2]);
+        if (a.Length == 3 && a[1] == "--title") return Title(ReadKeys(a[0]), a[2]);
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [--romfs-image]\n       nx_extract <prod.keys> --title <nsp|nsz|xci|xcz>"); return 2; }
-        KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
+        KeySet ks = ReadKeys(a[0]);
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], image);
         var basePkg = OpenNsp(ks, a[1], ContentMetaType.Application); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
@@ -129,8 +129,17 @@ static class P {
 
     // Open an NSP (PFS0) or the secure partition of an XCI, import the common tickets, list all NCAs. With a content meta type, only the NCAs that the package's content metas of
     // that type list (when it has one): a cartridge dump with its update on it (1G+1U) holds the update's NCAs beside the base game's, its Program NCA under the same title ID
+    // nxrecomp: also the title keys of title.keys next to prod.keys (a game copied from the console's own storage
+    // instead of an NSP has no ticket; Lockpick_RCM dumps its keys there).
+    static KeySet ReadKeys(string prod) {
+        string tk = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(prod)) ?? ".", "title.keys");
+        return ExternalKeyReader.ReadKeyFile(prod, File.Exists(tk) ? tk : null);
+    }
+
     static List<Nca> OpenNsp(KeySet ks, string path, ContentMetaType? only = null) {
         IFileSystem pfs; var st0 = new LocalStorage(path, FileAccess.Read);
+        // nxrecomp: a bare NCA (decrypted from the SD card's NAX0) is a package of one
+        if (path.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) return new List<Nca> { new Nca(ks, st0) };
         byte[] magic = new byte[4]; st0.Read(0x100, magic).ThrowIfFailure();
         if (System.Text.Encoding.ASCII.GetString(magic) == "HEAD") {   // XCI: the card header's magic at 0x100
             var xci = new Xci(ks, st0);

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("nx_extract")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+76a675addb014d1027358df60cf050aa32ac6309")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7c846fd687e118f8f82f2962027d0ce142ae54fd")]
 [assembly: System.Reflection.AssemblyProductAttribute("nx_extract")]
 [assembly: System.Reflection.AssemblyTitleAttribute("nx_extract")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
