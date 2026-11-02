@@ -1,0 +1,35 @@
+GetWorkBufferSize con una revisión inválida: 0x499
+== REV11
+GetWorkBufferSize: 0x0, 0xc000 bytes
+OpenAudioRenderer: 0x0
+frecuencia 48000, muestras 240, buffers 4, estado 1
+revisión equivocada: 0x5299
+primera actualización: 0x0, 6896 bytes de entrada
+salida: revisión igual, comportamiento 0xb0, memorias 0x90, voces 0x20, efectos 0x90, sinks 0x20, rendimiento 0x10, cuadros 0x10, total 0x270
+memorias: 5 0, voces nuevas: 0/0 0/0
+AUX antes de empezar: estado 4
+errores: 0
+Start: 0x0, estado 0
+voces: 4800 muestras y 1 buffer(es), 4800 muestras y 1 buffer(es)
+AUX andando: estado 3, cuadros hechos: 22 o más, historial de rendimiento: sí (PERF)
+AUX: 22 o más cuadros enviados, punteros alineados: sí, 0 muestras distintas
+== REV15
+GetWorkBufferSize: 0x0, 0xc000 bytes
+OpenAudioRenderer: 0x0
+frecuencia 48000, muestras 240, buffers 4, estado 1
+revisión equivocada: 0x5299
+primera actualización: 0x0, 7056 bytes de entrada
+salida: revisión igual, comportamiento 0xb0, memorias 0x90, voces 0x20, efectos 0x90, sinks 0x20, rendimiento 0x10, cuadros 0x10, total 0x270
+memorias: 5 0, voces nuevas: 0/0 0/0
+AUX antes de empezar: estado 4
+errores: 0
+Start: 0x0, estado 0
+voces: 4800 muestras y 1 buffer(es), 4800 muestras y 1 buffer(es)
+AUX andando: estado 3, cuadros hechos: 22 o más, historial de rendimiento: sí (PERF)
+AUX: 22 o más cuadros enviados, punteros alineados: sí, 0 muestras distintas
+== IAudioDevice: 0x0
+5 dispositivos: AudioStereoJackOutput AudioBuiltInSpeakerOutput AudioTvOutput AudioUsbDeviceOutput AudioExternalOutput
+activo: AudioTvOutput, canales: 2
+volumen: 0x0 0x0, 0.25
+dispositivo desconocido: 0x299
+evento del sistema señalado: sí
