@@ -103,6 +103,8 @@ def dependencias():
         ("SDL3", bool(sdl and sdl.returncode == 0), "sdl3", "ventana, mandos y sonido"),
         ("EGL y OpenGL", egl and gl, "libglvnd", "dibujar con tu GPU"),
         ("pkg-config", bool(shutil.which("pkg-config")), "pkgconf", "encontrar SDL3"),
+        ("libopus", bool(_ok(["pkg-config", "--exists", "opus"]) and _ok(["pkg-config", "--exists", "opus"]).returncode == 0),
+         "opus", "el audio Opus de los juegos"),
     ]
 
 

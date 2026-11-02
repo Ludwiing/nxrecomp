@@ -59,8 +59,10 @@ static void *player(void *arg) {
         sleep_ns(clock - nx_now_ns() < 1000000000ull ? clock - nx_now_ns() : 0);
 
         pthread_mutex_lock(&ao->lock);
-        memmove(ao->queue, ao->queue + 1, (size_t)--ao->nqueue * sizeof *ao->queue);
-        if (ao->nreleased < MAX_BUFS) ao->released[ao->nreleased++] = b;
+        if (ao->nqueue && ao->queue[0].tag == b.tag) { // si un Stop no lo devolvió ya
+            memmove(ao->queue, ao->queue + 1, (size_t)--ao->nqueue * sizeof *ao->queue);
+            if (ao->nreleased < MAX_BUFS) ao->released[ao->nreleased++] = b;
+        }
         ao->played += frames;
         pthread_mutex_unlock(&ao->lock);
         nx_event_signal(ao->event);
@@ -75,18 +77,24 @@ static uint32_t audio_out(ServiceObject *self, NxRequest *r) {
     case 1: case 2: // StartAudioOut / StopAudioOut
         pthread_mutex_lock(&ao->lock);
         ao->started = r->cmd == 1;
+        if (r->cmd == 2) { // detener devuelve todo lo pendiente (FMOD esperaba esos buffers y se colgaba)
+            for (int k = 0; k < ao->nqueue && ao->nreleased < MAX_BUFS; k++) ao->released[ao->nreleased++] = ao->queue[k];
+            ao->nqueue = 0;
+        }
         pthread_cond_signal(&ao->cond);
         pthread_mutex_unlock(&ao->lock);
+        if (r->cmd == 2) nx_event_signal(ao->event);
         return OK;
     case 3: case 7: { // AppendAudioOutBuffer(tag) + el AudioOutBuffer
         NxBuffer *in = nx_in_buffer(r, 0);
         if (!in || in->size < 0x28) return 0x7F4u;
         const uint64_t *aob = (const uint64_t *)(uintptr_t)in->addr; // next, buffer, buffer_size, data_size, data_offset
         pthread_mutex_lock(&ao->lock);
-        if (ao->nqueue < MAX_BUFS) ao->queue[ao->nqueue++] = (AudBuf){nx_in64(r, 0), aob[1] + aob[4], aob[3]};
+        int lleno = ao->nqueue >= MAX_BUFS;
+        if (!lleno) ao->queue[ao->nqueue++] = (AudBuf){nx_in64(r, 0), aob[1] + aob[4], aob[3]};
         pthread_cond_signal(&ao->cond);
         pthread_mutex_unlock(&ao->lock);
-        return OK;
+        return lleno ? 0x1099u : OK; // audio 8: la cola está llena (antes se perdía sin avisar)
     }
     case 4: nx_out_copy_handle(r, ao->event_h); return OK; // RegisterBufferEvent
     case 5: case 8: { // GetReleasedAudioOutBuffer → los tags liberados
