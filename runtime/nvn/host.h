@@ -57,3 +57,50 @@ static inline void res_present(Cpu *c) { (void)c; }
 static inline int frame_step_realtime(void) { return 0; }
 static inline uint64_t frame_step_cap_ns(void) { return 0; }
 static inline void frame_step_present(uint64_t display_ns, int interval) { (void)display_ns, (void)interval; }
+
+// ---- lo que pide el backend Vulkan (vk_*.c, gfx_shader.c, gfx_present.c); implementación en nvn_host.c
+enum { RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
+#define RT_ADDRESS_LIMIT (1ull << 39)   // espacio de direcciones del juego (39 bits)
+extern const int rt_game_version;       // TotK: 110/121/143; 0 en el runtime genérico
+void rt_sha256(const void *p, size_t n, uint8_t out[32]);
+// Interruptores TOTK_<name>: 0 apagado, 2 "ab" (medición A/B, aquí siempre apagada), 1 cualquier otro valor.
+int rt_ab(void);
+int rt_knob(const char *name, const char *def);
+#define RT_KNOB_ON(mode) ((mode) == 2 ? rt_ab() : (mode))
+// Estadísticas de rendimiento de totk-pc-recomp: no se recogen en esta adaptación.
+enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_REUP, PERF_CNT_SHADER_SKIP,
+       PERF_CNT_PIPE_WAIT, PERF_CNT_ONESHOT_WAIT, PERF_CNT_PIPE_BUILT, PERF_CNT_TEX_NEW, PERF_CNT_TEX_ALIAS,
+       PERF_CNT_WB, PERF_CNT_WB_SKIP, PERF_CNT_N };
+typedef struct {
+    int have_gpu, have_vram, vram_exact;
+    uint64_t gpu_ns, gpu_parts, gpu_missed;
+    uint64_t vram_used, vram_budget;
+    int have_idle;
+    uint64_t idle_ns, starved_ns, queued_ns;
+    uint64_t idle_gaps, max_gap_ns;
+} PerfGpu;
+extern void (*perf_gpu_stats)(PerfGpu *out);
+static inline void perf_count(int kind) { (void)kind; }
+static inline void perf_present(uint64_t frame) { (void)frame; }
+static inline void perf_replay(uint64_t t0) { (void)t0; }
+static inline void perf_gpu_wait(uint64_t t0) { (void)t0; }
+static inline int perf_gpu_timing(void) { return 0; }
+static inline void perf_gpu_busy(uint64_t ns) { (void)ns; }
+static inline void prof_write(void) {}
+// Memoria del juego: totk-pc-recomp vigila qué páginas escribe la CPU (memory.c). Aquí todavía no: mem_written_pages
+// devuelve UINT64_MAX ("sin vigilancia") y el backend copia el rango entero antes de cada envío. Correcto, más lento.
+uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
+uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
+static inline int mem_freeze(uint64_t a) { (void)a; return 0; }
+static inline int mem_frozen(uint64_t a) { (void)a; return 0; }
+static inline void mem_thaw(uint64_t a, uint64_t n) { (void)a, (void)n; }
+static inline void mem_freeze_stats(uint64_t *f, uint64_t *fz, uint64_t *ft, uint64_t *ot) { *f = *fz = *ft = *ot = 0; }
+uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr);
+// Resolución y DLSS de TotK: sin cambios de tamaño de escena.
+static inline float res_dlss_lod_bias(void) { return 0; }
+static inline int res_dlss_mode(const char *mode) { (void)mode; return 0; }
+void res_sizes(unsigned out[2], unsigned scene[2]);
+static inline void res_fov_live(void) {}
+static inline int probe_census_dir(char *dir, size_t n) { (void)dir, (void)n; return 0; }
+// Vsync del juego: el servicio vi (nxsvc_vi.c) ya la emite; gfx_present.c no tiene eventos registrados.
+static inline void kern_signal_system_event(uint64_t ev) { (void)ev; }

@@ -399,7 +399,8 @@ def loadstore(i, x):
         # Rt2 y Rs "deberían ser 1" en algunas formas; el procesador los ignora, igual que aquí.
         if o2 == 1 and o0 == 0:
             raise Unsupported("LDLAR/STLLR (ARMv8.1)")
-        if not l and o2 == 0 and rs in (rt, rt2) or not l and o2 == 0 and rs == rn and rn != 31:
+        # STXR/STXP: el estado no puede ser el dato (Rt2 solo cuenta en los pares) ni la base (salvo SP).
+        if not l and o2 == 0 and (rs == rt or (o1 and rs == rt2) or (rs == rn and rn != 31)):
             raise Unsupported("exclusiva UNPREDICTABLE")
         if o2 == 1 and o1 == 0:  # LDAR / STLR
             # STLR lleva además una barrera después: x86 deja pasar una carga posterior por delante de

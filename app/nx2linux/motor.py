@@ -651,8 +651,20 @@ def entorno_juego(j):
         if "=" in linea and not linea.strip().startswith("#"):
             k, v = linea.split("=", 1)
             env[k.strip()] = v.strip()
+    # NVN en el host (runtime/nvn): el backend Vulkan traduce los shaders del juego a SPIR-V con totk_xlate (el
+    # traductor de Ryujinx, compilado por totk-pc-recomp) y los guarda en la caché del juego.
+    xlate = os.path.join(motor_especial_repo("totk-pc-recomp"), "build", "xlate", "totk_xlate")
+    if os.path.isfile(xlate):
+        env.setdefault("TOTK_XLATE", xlate)
+    env.setdefault("TOTK_SHADER_CACHE", os.path.join(j.carpeta, "shader-cache"))
     os.makedirs(env["NX_SDMC"], exist_ok=True)
     return env
+
+
+def motor_especial_repo(nombre):
+    """La carpeta de un port (especiales.py), esté o no listo para algún juego."""
+    from . import especiales
+    return next((e.repo() for e in especiales.ESPECIALES.values() if e.nombre == nombre), "")
 
 
 def jugar(j, salida=None):

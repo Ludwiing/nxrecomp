@@ -117,5 +117,7 @@ Se marca [x] lo hecho.
    runtime/nvn/ con backend nulo: TotK llama 183 funciones NVN (pools, texturas, colas, grabaciones, presentación).
    [x] Núcleos virtuales en el kernel (los motores guardan datos por núcleo sin mutex: dos hilos del mismo núcleo no
    pueden correr a la vez), con preferencia en SVC, llamadas indirectas y por señal (SIGURG). TotK pasa CallCommands.
-   [ ] Bucles de espera activa (rt_spin_gate de totk-pc-recomp). [ ] Backend Vulkan.
-   [ ] Traductor de shaders bajo demanda.
+   [ ] Bucles de espera activa (rt_spin_gate de totk-pc-recomp). [x] Backend Vulkan de totk-pc-recomp (runtime/nvn/,
+   ventana de nxdisplay.c): TotK por el camino genérico dibuja su pantalla de carga. [ ] Vigilancia de escrituras de la CPU
+   (hoy se copian los pools enteros en cada envío).
+   [x] Traductor de shaders bajo demanda (totk_xlate; NX2Linux pasa TOTK_XLATE y la caché del juego).

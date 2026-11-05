@@ -120,12 +120,73 @@ void nx_display_present(const NxFrame *f) {
     }
 }
 
+// ---- backend Vulkan (runtime/nvn): la ventana la dibuja él; aquí solo se crea y se atienden sus eventos.
+static SDL_Window *vk_win;
+static int vk_pedida, vk_lista;
+// Los avisos para la presentación de Vulkan (gfx_present.c); débiles, porque las pruebas no la enlazan.
+__attribute__((weak)) void gfx_window_mark_dirty(void);
+__attribute__((weak)) void gfx_window_focus_changed(int in);
+
+// Desde cualquier hilo: pide la ventana Vulkan al hilo principal y espera a que exista (NULL si no se pudo).
+SDL_Window *nx_display_vulkan_window(void) {
+    pthread_mutex_lock(&lock);
+    vk_pedida = 1;
+    pthread_cond_broadcast(&cond);
+    while (!vk_lista) pthread_cond_wait(&cond, &lock);
+    SDL_Window *w = vk_win;
+    pthread_mutex_unlock(&lock);
+    return w;
+}
+
+static void run_vulkan(void) {
+    const char *titulo = getenv("NX_TITULO");
+    int completa = getenv("NX_PANTALLA_COMPLETA") && *getenv("NX_PANTALLA_COMPLETA") == '1';
+    SDL_Window *w = NULL;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
+        w = SDL_CreateWindow(titulo && *titulo ? titulo : "nxrecomp", 1280, 720,
+                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN | (completa ? SDL_WINDOW_FULLSCREEN : 0));
+    if (!w) fprintf(stderr, "[nxrt] no pude crear la ventana Vulkan: %s\n", SDL_GetError());
+    else fprintf(stderr, "[nxrt] presentación: Vulkan (backend de runtime/nvn)\n");
+    pthread_mutex_lock(&lock);
+    vk_win = w;
+    vk_lista = 1;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
+    if (!w)
+        for (;;) pause();
+    for (;;) {
+        SDL_Event ev;
+        if (!SDL_WaitEventTimeout(&ev, 100)) continue;
+        do {
+            if (ev.type == SDL_EVENT_QUIT) {
+                fflush(stdout);
+                _exit(0);
+            }
+            if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F11 && !ev.key.repeat) {
+                completa = !completa;
+                SDL_SetWindowFullscreen(w, completa);
+                continue;
+            }
+            if (ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && gfx_window_mark_dirty) gfx_window_mark_dirty();
+            if ((ev.type == SDL_EVENT_WINDOW_FOCUS_GAINED || ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) &&
+                gfx_window_focus_changed)
+                gfx_window_focus_changed(ev.type == SDL_EVENT_WINDOW_FOCUS_GAINED);
+            nx_input_event(&ev);
+        } while (SDL_PollEvent(&ev));
+    }
+}
+
 // El hilo principal: abre la ventana con el primer cuadro y la mantiene al día.
 void nx_display_run(void) {
     int headless = getenv("NX_SIN_VENTANA") != NULL;
     pthread_mutex_lock(&lock);
-    while (!frame_new) pthread_cond_wait(&cond, &lock);
+    while (!frame_new && !vk_pedida) pthread_cond_wait(&cond, &lock);
+    int vulkan = vk_pedida;
     pthread_mutex_unlock(&lock);
+    if (vulkan) {
+        run_vulkan();
+        return;
+    }
     if (headless)
         for (;;) pause();
 

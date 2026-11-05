@@ -98,6 +98,8 @@ def walk(mod, entry, entries, starts, on_call=None):
             k0 = bisect.bisect_right(starts, pc) - 1
             start = min(entry, starts[k0]) if k0 >= 0 else entry
             i.targets = jumptable.resolve(mod, pc, i.reg_num, start)
+            if not i.targets and k0 + 1 < len(starts):   # tabla que no se leyó: toda la función que sigue a su base
+                i.targets = jumptable.adr_base_targets(mod, pc, i.reg_num, start, starts[k0 + 1])
             stack.extend(t for t in i.targets if t not in entries or t == entry)
     return body
 

@@ -308,6 +308,42 @@ def evaluate(mod, e, k):
     raise ValueError(t)
 
 
+MAX_RANGE = 0x10000   # tope del respaldo por rango (bytes de función)
+
+
+def adr_base_targets(mod, br_pc, reg, lo, hi):
+    """Respaldo cuando resolve no lee la tabla: el `switch` de clang arma el destino como `adr B, L`, una carga
+    (ldrb/ldrh/ldrsb/ldrsh/ldrsw) del desplazamiento O y `add R, B, O, lsl #2` o `sxtw #2`, y salta con `br R`. Sin
+    saber el índice ni dónde está la tabla, el destino es L + 4*O y cae dentro de la función [lo, hi): con O sin signo,
+    toda instrucción desde L; con signo, toda la función. Sobran destinos (código que no se ejecuta), no faltan.
+    [] si el BR no tiene esa forma."""
+    add = None
+    for q in range(br_pc - 4, max(lo, br_pc - 4 * 20) - 4, -4):
+        w = mod.word(q)
+        rd = bits(w, 4, 0)
+        if bits(w, 31, 21) in (0b10001011000, 0b10001011001) and rd == reg:   # ADD Xd, Xn, Xm{, LSL|ext #s}
+            shift = bits(w, 15, 10) if bits(w, 21, 21) == 0 else bits(w, 12, 10)
+            if shift == 2:
+                add = (q, bits(w, 9, 5), bits(w, 20, 16))
+            break
+    if add is None:
+        return []
+    q_add, rb, ro = add
+    base = signed = None
+    for q in range(q_add - 4, max(lo, q_add - 4 * 20) - 4, -4):
+        w = mod.word(q)
+        if base is None and bits(w, 31, 31) == 0 and bits(w, 28, 24) == 0b10000 and bits(w, 4, 0) == rb:   # ADR
+            base = q + sext(bits(w, 23, 5) << 2 | bits(w, 30, 29), 21)
+        if signed is None and bits(w, 4, 0) == ro and bits(w, 29, 27) == 0b111 and bits(w, 25, 24) == 0b00:
+            size, opc = bits(w, 31, 30), bits(w, 23, 22)   # carga del desplazamiento: opc 1 = sin signo, 2/3 = con signo
+            if opc in (1, 2, 3):
+                signed = opc != 1
+    if base is None or not (lo <= base < hi) or hi - lo > MAX_RANGE:
+        return []
+    desde = lo if signed or signed is None else base
+    return [t for t in range(desde, hi, 4)]
+
+
 def resolve(mod, br_pc, reg, entry):
     """Destinos posibles de `BR reg` en br_pc, o [] si no se reconoce una tabla."""
     lo = min(entry, br_pc)

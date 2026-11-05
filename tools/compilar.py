@@ -55,6 +55,12 @@ def compile_source(src, carpeta, opt, newest_h, reuse_optimized=False):
     os.makedirs(objdir, exist_ok=True)
     obj = os.path.join(objdir, os.path.basename(src) + ".o")
     command = ["clang", f"-O{opt}", *FLAGS, f"-I{carpeta}", "-c", src]
+    if os.path.dirname(os.path.abspath(src)).startswith(os.path.join(ROOT, "runtime", "nvn")):
+        # La capa NVN y el backend Vulkan: vk.h incluye Vulkan Memory Allocator (runtime/nvn/third_party/vma). Solo
+        # aquí, para no cambiar la firma de compilación de los objetos del juego.
+        vma = f"-I{ROOT}/runtime/nvn/third_party/vma"
+        command = (["clang++", f"-O{opt}", "-std=c++17", *FLAGS, vma, "-c", src] if src.endswith(".cpp")
+                   else ["clang", f"-O{opt}", *FLAGS, vma, f"-I{carpeta}", "-c", src])
     signature = hashlib.sha256(json.dumps(command).encode()).hexdigest()
     allowed_signatures = {signature}
     if reuse_optimized and opt == "0":
@@ -139,9 +145,12 @@ def main():
     signal.signal(signal.SIGINT, cancel_compilation)
     prepare_dispatch(os.path.join(args.carpeta, "programa.c"))
     runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c",
-               # La capa NVN de totk-pc-recomp (runtime/nvn/, con sus encabezados de adaptación)
-               "nvn/nvn_host.c", "nvn/gfx_null.c", "nvn/nvn_tex.c", "nvn/nvn_api_core.c", "nvn/nvn_api_obj.c",
-               "nvn/nvn_api_cmd.c", "nvn/nvn_ext.c"]
+               ]
+    # La capa NVN y el backend Vulkan de totk-pc-recomp (runtime/nvn/, con sus archivos de adaptación)
+    nvn = os.path.join(ROOT, "runtime", "nvn")
+    runtime += [os.path.relpath(f, os.path.join(ROOT, "runtime"))
+                for f in sorted(glob.glob(os.path.join(nvn, "*.c")) + glob.glob(os.path.join(nvn, "platform", "*.c")))]
+    runtime.append("nvn/vk_vma.cpp")
     srcs = sorted(glob.glob(os.path.join(args.carpeta, "*.c"))) + [os.path.join(ROOT, "runtime", f) for f in runtime]
     objdir = os.path.join(args.carpeta, "obj")
     os.makedirs(objdir, exist_ok=True)
@@ -170,7 +179,7 @@ def main():
     os.close(fd)
     try:
         linker = ["-fuse-ld=lld", f"-Wl,--threads={args.j}"] if shutil.which("ld.lld") else []
-        process = subprocess.Popen(["clang", *linker, *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-lEGL", "-lOpenGL", "-lopus", "-o", temporary], start_new_session=True)
+        process = subprocess.Popen(["clang", *linker, *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-lEGL", "-lOpenGL", "-lopus", "-lvulkan", "-lstdc++", "-o", temporary], start_new_session=True)
         active_compilers.add(process)
         try:
             if cancelled.is_set():

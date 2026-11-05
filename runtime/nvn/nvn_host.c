@@ -78,3 +78,53 @@ const RtConfig *rt_config(void) {
 }
 
 void rt_frame_presented(const tex_t *t, uint64_t n) { (void)t, (void)n; }
+
+// ---- backend Vulkan
+#include "cfg.h"
+#include "sha256.h"
+
+const int rt_game_version = 0;
+void (*perf_gpu_stats)(PerfGpu *out);
+
+__attribute__((constructor)) static void leer_configuracion(void) { cfg_init(); }
+
+void rt_sha256(const void *p, size_t n, uint8_t out[32]) { sha256(p, n, out); }
+
+int rt_ab(void) { return 0; }
+
+int rt_knob(const char *name, const char *def) {
+    char clave[128];
+    snprintf(clave, sizeof clave, "TOTK_%s", name);
+    const char *v = cfg_get(clave);
+    if (!v) v = def;
+    if (!v || !strcmp(v, "0")) return 0;
+    return strcmp(v, "ab") ? 1 : 2;
+}
+
+uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+    (void)addr, (void)size, (void)pages, (void)max;
+    return UINT64_MAX;
+}
+uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+    (void)addr, (void)size, (void)pages, (void)max;
+    return UINT64_MAX;
+}
+uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
+    (void)size;
+    *addr = 0;
+    return 0xD001;   // OutOfMemory: el heap del juego lo maneja el kernel de nxrecomp
+}
+
+void res_sizes(unsigned out[2], unsigned scene[2]) { out[0] = out[1] = scene[0] = scene[1] = 0; }
+
+// Mensajes de foco al juego (applet OE de totk-pc-recomp): el servicio am de nxrecomp ya informa el foco.
+void oe_push_message(uint32_t message) { (void)message; }
+void oe_set_focus(int in_focus) { (void)in_focus; }
+// Capturas de pantalla de prueba y RenderDoc: no hay en esta adaptación.
+void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    (void)rgba, (void)w, (void)h;
+    rt_log("captura %s: rt_write_png no está en esta adaptación", path);
+}
+void rdoc_init(void) {}
+int rdoc_active(void) { return 0; }
+void rdoc_after_present(uint64_t frame) { (void)frame; }
