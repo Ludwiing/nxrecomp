@@ -417,7 +417,9 @@ def main():
     out.append("        return importacion;")
     out.append("    return salto_malo;")
     out.append("}")
-    out.append("void nx_dispatch(Ctx *c, uint64_t a) { nx_buscar(a)(c); }")
+    # Cada llamada indirecta es un punto de cesión del núcleo virtual (nxkern.c): una lectura si nadie espera.
+    out.append("void nx_dispatch(Ctx *c, uint64_t a) { if (__builtin_expect(nx_core_pending, 0)) nx_core_check(); "
+               "nx_buscar(a)(c); }")
     escribir("programa.c", "\n".join(out) + "\n")
     for viejo in os.listdir(args.output):   # lo de una emisión anterior que ya no corresponde
         if viejo.endswith((".c", ".h", ".bin")) and viejo not in escritos:

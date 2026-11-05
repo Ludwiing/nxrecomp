@@ -88,6 +88,9 @@ extern const int nx_main_priority, nx_main_core;
 extern const unsigned char nx_romfs_data[]; // el RomFS que venía dentro del NRO (homebrew)
 extern const uint64_t nx_romfs_size;
 void nx_dispatch(Ctx *c, uint64_t addr);
+extern volatile int nx_core_pending;  // nxkern.c: algún hilo debe ceder su núcleo virtual
+void nx_core_check(void);              // punto de cesión (SVC y llamadas indirectas)
+extern __thread int nx_en_host;       // nxkern.c: >0 mientras el hilo está dentro del runtime (no se interrumpe)
 // La función recompilada que empieza en `addr` (o una que avisa del salto inválido o de la importación
 // que falta). Con ella los saltos indirectos son llamadas de cola (musttail) y la pila no crece.
 typedef void (*NxFn)(Ctx *c);

@@ -115,6 +115,7 @@ Se marca [x] lo hecho.
    reconstruir (`registrar_construido`).
 5. [~] NVN en el host + backend Vulkan genérico (el camino para cualquier juego NVN). [x] Capa NVN de totk-pc-recomp en
    runtime/nvn/ con backend nulo: TotK llama 183 funciones NVN (pools, texturas, colas, grabaciones, presentación).
-   [ ] Núcleos virtuales en el kernel (los motores guardan datos por núcleo sin mutex: dos hilos del mismo núcleo no
-   pueden correr a la vez; TotK comparte su anillo de memoria de control y falla en CallCommands). [ ] Backend Vulkan.
+   [x] Núcleos virtuales en el kernel (los motores guardan datos por núcleo sin mutex: dos hilos del mismo núcleo no
+   pueden correr a la vez), con preferencia en SVC, llamadas indirectas y por señal (SIGURG). TotK pasa CallCommands.
+   [ ] Bucles de espera activa (rt_spin_gate de totk-pc-recomp). [ ] Backend Vulkan.
    [ ] Traductor de shaders bajo demanda.

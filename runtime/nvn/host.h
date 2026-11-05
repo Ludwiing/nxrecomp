@@ -37,9 +37,11 @@ uint64_t rt_original(Cpu *c);
 static inline uint64_t rt_ticks(void) { return nx_ticks(); }
 static inline uint64_t kern_now_ns(void) { return nx_now_ns(); }
 
-// El planificador de núcleos virtuales de totk-pc-recomp: aquí cada hilo del juego es un hilo del host, no hace falta.
-static inline int kern_core_away(void) { return 0; }
-static inline void kern_core_back(int *away) { (void)away; }
+// Núcleos virtuales (nxkern.c): una espera del host suelta el núcleo del hilo y lo vuelve a tomar al terminar.
+int nx_core_away(void);
+void nx_core_back(int away);
+static inline int kern_core_away(void) { return nx_core_away(); }
+static inline void kern_core_back(int *away) { nx_core_back(*away); }
 
 typedef struct { const char *gpu; } RtConfig;   // gpu: NX_GPU (null o vulkan)
 const RtConfig *rt_config(void);

@@ -82,6 +82,166 @@ static HandleEntry *handle_entry(uint32_t h) {
 // ---------- hilos ----------
 #define MAX_THREADS 512
 static KThread *threads[MAX_THREADS];
+
+// ---------- núcleos virtuales ----------
+// En Horizon un hilo corre solo en un núcleo de su máscara de afinidad, y dos hilos no comparten un núcleo a la vez: el
+// que lo tiene sigue hasta que se bloquea, cede o llega uno de mejor prioridad. Los motores guardan datos por núcleo
+// (GetCurrentProcessorNumber) sin mutex y cuentan con eso: TotK reparte un anillo de memoria de control de NVN por
+// núcleo, y dos hilos del mismo núcleo corriendo a la vez se daban el mismo trozo. Aquí cada hilo del juego toma un
+// núcleo virtual antes de ejecutar código del juego y lo suelta en las SVC que bloquean (nx_svc) y en las esperas del
+// host (nx_core_away). El modelo es el de totk-pc-recomp (docs/architecture.md, "Threads and cores").
+// Válvula: un bucle de espera activa no llama a ninguna SVC, así que el que espera un núcleo no puede quitárselo; tras
+// un plazo corre igual (sin núcleo) en lugar de colgar el juego. NX_NUCLEOS_LIBRES=1 desactiva todo el modelo.
+#define NUM_CORES 4
+#define SENAL_TRAS_NS 250000ull         // el que espera pide por señal el núcleo de uno peor (preferencia asíncrona)
+#define VALVULA_MEJOR_NS 20000000ull    // último recurso si el peor sigue sin ceder (dentro del runtime, en un spin lock)
+#define VALVULA_IGUAL_NS 5000000000ull  // igual o peor prioridad: en Horizon también esperaría; solo contra un cuelgue
+static pthread_mutex_t CL = PTHREAD_MUTEX_INITIALIZER;
+volatile int nx_core_pending;   // hilos avisados de que deben ceder su núcleo: nx_dispatch solo mira esto
+__thread int nx_en_host;        // >0: el hilo está dentro del runtime (SVC, HLE): la señal no lo interrumpe ahí
+static pthread_cond_t core_cv = PTHREAD_COND_INITIALIZER;
+static KThread *holder[NUM_CORES];
+static int core_waiters;
+
+static int vcores(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("NX_NUCLEOS_LIBRES");
+    return on;
+}
+
+// El mejor hilo que espera un núcleo k (prioridad más baja en número; a igual prioridad, el que espera hace más).
+static KThread *core_best_waiter(int k) {
+    KThread *best = NULL;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        KThread *t = threads[i];
+        if (t && t->core_waiting && (t->mask >> k & 1) &&
+            (!best || t->priority < best->priority ||
+             (t->priority == best->priority && t->core_wait_since < best->core_wait_since)))
+            best = t;
+    }
+    return best;
+}
+
+static void core_take(KThread *t) {
+    if (!t || !vcores() || t->vcore >= 0) return;
+    pthread_mutex_lock(&CL);
+    t->core_waiting = 1;
+    t->core_wait_since = nx_now_ns();
+    core_waiters++;
+    for (;;) {
+        // Un núcleo libre de la máscara: primero el ideal, luego el último que tuvo, luego cualquiera.
+        int cand[2 + NUM_CORES], n = 0, k = -1;
+        cand[n++] = t->core;
+        cand[n++] = t->last_vcore;
+        for (int j = 0; j < NUM_CORES; j++) cand[n++] = j;
+        for (int j = 0; j < n && k < 0; j++)
+            if (cand[j] >= 0 && cand[j] < NUM_CORES && (t->mask >> cand[j] & 1) && !holder[cand[j]] &&
+                core_best_waiter(cand[j]) == t)
+                k = cand[j];
+        if (k >= 0) {
+            holder[k] = t;
+            t->vcore = t->last_vcore = k;
+            break;
+        }
+        // Avisar al peor que tenga un núcleo de la máscara si este hilo es mejor: cede en su próxima SVC.
+        KThread *peor = NULL;
+        for (int j = 0; j < NUM_CORES; j++)
+            if ((t->mask >> j & 1) && holder[j] && holder[j]->priority > t->priority &&
+                (!peor || holder[j]->priority > peor->priority))
+                peor = holder[j];
+        if (peor && !peor->preempt) {
+            peor->preempt = 1;
+            __atomic_add_fetch(&nx_core_pending, 1, __ATOMIC_RELEASE);
+        }
+        uint64_t espera = nx_now_ns() - t->core_wait_since;
+        // Preferencia asíncrona: el peor puede pasar milisegundos en código del juego sin SVC ni llamada indirecta;
+        // la señal lo hace ceder ahí (preempt_signal), como la interrupción de Horizon.
+        if (peor && espera > SENAL_TRAS_NS && peor->pthread) pthread_kill(peor->pthread, SIGURG);
+        if (espera > (peor ? VALVULA_MEJOR_NS : VALVULA_IGUAL_NS)) {
+            static int avisos;
+            if (getenv("NX_TRAZA_NUCLEOS") || avisos++ < 3) {
+                fprintf(stderr, "[nxkern] hilo %llu (prioridad %d, máscara %#llx) corre sin núcleo tras %llu ms; núcleos:",
+                        (unsigned long long)t->id, t->priority, (unsigned long long)t->mask,
+                        (unsigned long long)(espera / 1000000));
+                for (int j = 0; j < NUM_CORES; j++)
+                    if (holder[j])
+                        fprintf(stderr, " %d=hilo %llu (prioridad %d, pc %#llx)", j, (unsigned long long)holder[j]->id,
+                                holder[j]->priority, (unsigned long long)holder[j]->ctx->x[30]);
+                fprintf(stderr, "\n");
+            }
+            break;   // válvula: sigue sin núcleo (vcore -1); vuelve a pedirlo en su próxima SVC que bloquee
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000;
+        if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+        pthread_cond_timedwait(&core_cv, &CL, &ts);
+    }
+    t->core_waiting = 0;
+    core_waiters--;
+    pthread_mutex_unlock(&CL);
+}
+
+static void core_give(KThread *t) {
+    if (!t || !vcores()) return;
+    pthread_mutex_lock(&CL);
+    if (t->vcore >= 0 && holder[t->vcore] == t) holder[t->vcore] = NULL;
+    t->vcore = -1;
+    if (t->preempt) {
+        t->preempt = 0;
+        __atomic_sub_fetch(&nx_core_pending, 1, __ATOMIC_RELEASE);
+    }
+    if (core_waiters) pthread_cond_broadcast(&core_cv);
+    pthread_mutex_unlock(&CL);
+}
+
+// La señal de preferencia asíncrona, en el hilo que tiene el núcleo: cede solo si está en código del juego (no dentro
+// del runtime, que puede tener tomados sus mutex) y fuera de un spin lock del SDK.
+static void preempt_signal(int sig) {
+    (void)sig;
+    KThread *t = cur;
+    if (!t || nx_en_host || !t->preempt || t->vcore < 0 || *(volatile uint16_t *)(uintptr_t)(t->tls + 0x100)) return;
+    int e = errno;
+    nx_en_host++;
+    core_give(t);
+    core_take(t);
+    nx_en_host--;
+    errno = e;
+}
+
+static void core_signal_install(void) {
+    struct sigaction sa = {0};
+    sa.sa_handler = preempt_signal;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGURG, &sa, NULL);
+}
+
+static void core_signal_init(void) {
+    static pthread_once_t una = PTHREAD_ONCE_INIT;
+    pthread_once(&una, core_signal_install);
+}
+
+// Punto de cesión (cada SVC y cada llamada indirecta del juego, vía nx_dispatch): si un hilo mejor espera el núcleo,
+// se lo da. No dentro de un spin lock del SDK (ThreadLocalRegion+0x100, disable_count): ahí cede en la SVC 0x36.
+void nx_core_check(void) {
+    KThread *t = cur;
+    if (!t || !t->preempt || t->vcore < 0) return;
+    if (*(volatile uint16_t *)(uintptr_t)(t->tls + 0x100)) return;
+    core_give(t);
+    core_take(t);
+}
+
+// Esperas largas del host en nombre del hilo actual (la capa NVN: envíos, presentación, esperas de la GPU): el núcleo
+// queda para los demás, como en la Switch, donde ese hilo estaría bloqueado en IPC.
+int nx_core_away(void) {
+    if (!cur || cur->vcore < 0) return 0;
+    core_give(cur);
+    return 1;
+}
+void nx_core_back(int away) {
+    if (away) core_take(cur);
+}
 static uint64_t next_thread_id = 0x50;
 static uint64_t tls_next = NX_TLS_BASE;
 
@@ -93,6 +253,7 @@ static KThread *thread_new(void) {
     pthread_cond_init(&t->cv, &a);
     t->ctx = calloc(1, sizeof(Ctx));
     t->ctx->excl_addr = ~0ull;
+    t->vcore = t->last_vcore = -1;
     t->id = next_thread_id++;
     t->tls = tls_next;
     tls_next += 0x200;
@@ -120,6 +281,7 @@ KThread *nx_kernel_main_thread(void) {
     KThread *t = thread_new();
     t->priority = nx_main_priority ? nx_main_priority : 44; // prioridad y núcleo del hilo principal: del NPDM
     t->core = nx_main_core >= 0 && nx_main_core < 4 ? nx_main_core : 0;
+    t->mask = 1ull << t->core;
     t->state = TS_RUNNING;
     t->handle = nx_handle_new(KO_THREAD, t, 1);
     cur = t;
@@ -131,6 +293,11 @@ KThread *nx_current_thread(void) { return cur; }
 // El hilo principal del juego corre en un pthread propio (el principal del proceso es la ventana).
 void nx_kernel_adopt(KThread *t) {
     cur = t;
+    t->pthread = pthread_self();
+    nx_en_host = 1;
+    core_signal_init();
+    core_take(t);
+    nx_en_host = 0;
     nx_set_crash_ctx(t->ctx);
     static __thread char altstack[64 * 1024];
     stack_t ss = {.ss_sp = altstack, .ss_size = sizeof altstack};
@@ -140,16 +307,23 @@ void nx_kernel_adopt(KThread *t) {
 static void *thread_main(void *arg) {
     KThread *t = arg;
     cur = t;
+    t->pthread = pthread_self();
+    nx_en_host = 1;
+    core_signal_init();
+    core_take(t);
     nx_set_crash_ctx(t->ctx);
     static __thread char altstack[64 * 1024];
     stack_t ss = {.ss_sp = altstack, .ss_size = sizeof altstack};
     sigaltstack(&ss, NULL);
+    nx_en_host = 0;   // desde aquí, código del juego
     nx_dispatch(t->ctx, t->entry);
+    nx_en_host = 1;
     nx_exit_thread();
     return NULL;
 }
 
 void nx_exit_thread(void) {
+    core_give(cur);
     pthread_mutex_lock(&G);
     cur->state = TS_EXITED;
     pthread_cond_broadcast(&sync_cv);
@@ -675,7 +849,31 @@ static uint32_t get_thread_context(uint32_t h, uint64_t dst) {
 }
 
 // ---------- la tabla de SVC ----------
+static void svc(Ctx *c, uint32_t imm);
+
+// Las SVC que pueden bloquear sueltan el núcleo virtual mientras esperan (en Horizon el hilo deja de correr); en las
+// demás, un hilo avisado de que lo pide uno de mejor prioridad lo cede (y lo vuelve a pedir).
 void nx_svc(Ctx *c, uint32_t imm) {
+    KThread *t = cur;
+    nx_en_host++;
+    int bloquea = imm == 0x0B || imm == 0x18 || imm == 0x1A || imm == 0x1C || imm == 0x34 || imm == 0x21 ||
+                  imm == 0x22 || imm == 0x23 || imm == 0x43;
+    if (t && bloquea) {
+        core_give(t);
+    } else if (t && t->preempt) {
+        if (imm == 0x36) {   // SynchronizePreemptionState: el SDK acaba de salir de un spin lock con el aviso puesto
+            core_give(t);
+            core_take(t);
+        } else {
+            nx_core_check();
+        }
+    }
+    svc(c, imm);
+    if (t && bloquea) core_take(t);
+    nx_en_host--;
+}
+
+static void svc(Ctx *c, uint32_t imm) {
     uint64_t *x = c->x, out = 0;
     static int trace = -1;
     if (trace < 0) trace = getenv("NX_TRAZA_SVC") != NULL;
@@ -697,7 +895,9 @@ void nx_svc(Ctx *c, uint32_t imm) {
         t->ctx->x[0] = x[2];
         t->ctx->sp = x[3];
         t->priority = (int)(uint32_t)x[4];
-        t->core = (int32_t)x[5] < 0 ? 0 : (int)x[5];
+        // Núcleo -2: el del proceso (NPDM). Horizon crea el hilo con afinidad solo a su núcleo ideal.
+        t->core = (int32_t)x[5] >= 0 && (int32_t)x[5] < 4 ? (int)x[5] : (nx_main_core >= 0 && nx_main_core < 4 ? nx_main_core : 0);
+        t->mask = 1ull << t->core;
         t->state = TS_CREATED;
         t->handle = nx_handle_new(KO_THREAD, t, 1);
         pthread_mutex_unlock(&G);
@@ -735,11 +935,24 @@ void nx_svc(Ctx *c, uint32_t imm) {
     }
     case 0x0C: { KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->priority : 0; return; }
     case 0x0D: { KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD); if (t) t->priority = (int)x[1]; x[0] = t ? R_OK_ : R_INVALID_HANDLE; return; }
-    case 0x0E: { KThread *t = nx_handle_get((uint32_t)x[2], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->core : 0; x[2] = 0xF; return; }
-    case 0x0F: { KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD); if (t && (int32_t)x[1] >= 0) t->core = (int)x[1]; x[0] = t ? R_OK_ : R_INVALID_HANDLE; return; }
+    case 0x0E: { KThread *t = nx_handle_get((uint32_t)x[2], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->core : 0; x[2] = t ? t->mask : 0; return; }
+    case 0x0F: { // SetThreadCoreMask(handle, núcleo ideal, máscara): -2 = el del proceso, -3 = no cambiar el ideal
+        KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD);
+        int32_t ideal = (int32_t)x[1];
+        if (!t) { x[0] = R_INVALID_HANDLE; return; }
+        if (ideal == -2) ideal = nx_main_core >= 0 && nx_main_core < 4 ? nx_main_core : 0;
+        if (ideal >= 0 && ideal < 4) t->core = ideal;
+        if (x[2] & 0xF) t->mask = x[2] & 0xF;
+        if (!(t->mask >> t->core & 1)) t->core = __builtin_ctzll(t->mask);   // como Horizon: el ideal pasa a la máscara
+        if (t == cur && t->vcore >= 0 && !(t->mask >> t->vcore & 1)) { core_give(t); core_take(t); } // a un núcleo permitido
+        x[0] = R_OK_;
+        return;
+    }
     case 0x10: { // GetCurrentProcessorNumber: el núcleo del hilo (las colas por núcleo de los motores
                  // esperan que coincida con su máscara), si no, el del host
-        int cpu = cur && cur->core >= 0 && cur->core < 4 ? cur->core : sched_getcpu();
+        int cpu = cur && cur->vcore >= 0 ? cur->vcore                     // el núcleo virtual que tiene
+                : cur && cur->last_vcore >= 0 ? cur->last_vcore
+                : cur && cur->core >= 0 && cur->core < 4 ? cur->core : sched_getcpu();
         x[0] = (uint64_t)(cpu < 0 ? 0 : cpu % 4);
         return;
     }
@@ -927,3 +1140,4 @@ uint32_t nx_shmem_new(uint64_t size, KShmem **out) {
     *out = s;
     return h;
 }
+

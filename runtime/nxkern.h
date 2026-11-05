@@ -31,6 +31,11 @@ typedef struct KThread {
     uint32_t result, tag;
     uint64_t wait_addr, mutex_addr, seq;
     struct KThread *lock_owner;
+    // núcleos virtuales (nxkern.c): afinidad, núcleo que tiene ahora (-1 ninguno) y aviso de que lo pide uno mejor
+    uint64_t mask;
+    int vcore, last_vcore, core_waiting;
+    volatile int preempt;
+    uint64_t core_wait_since;
 } KThread;
 
 typedef struct KEvent {
@@ -69,3 +74,5 @@ uint32_t nx_shmem_new(uint64_t size, KShmem **out); // devuelve un handle para c
 uint32_t nx_connect_named_port(const char *name, uint64_t *handle);
 uint32_t nx_send_sync_request(Ctx *c, uint32_t handle);
 void nx_session_close(KSession *s);
+int nx_core_away(void);          // la capa NVN suelta el núcleo virtual durante una espera del host
+void nx_core_back(int away);

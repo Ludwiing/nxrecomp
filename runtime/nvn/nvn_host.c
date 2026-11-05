@@ -49,7 +49,10 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     va_end(ap);
     c->x[30] = RETORNO_AL_HOST;
     c->tail_pending = 0;
+    int en_host = nx_en_host;   // la función del juego sí se puede interrumpir para ceder el núcleo
+    nx_en_host = 0;
     nx_buscar(fn)(c);
+    nx_en_host = en_host;
     uint64_t r = c->x[0];
     memcpy(c->x, x, sizeof x);   // el host sigue con los registros que tenía (sus argumentos incluidos)
     memcpy(c->vr, v, sizeof v);

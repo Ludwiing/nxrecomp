@@ -65,7 +65,9 @@ static int by_name(const void *a, const void *b) { return strcmp(((const Proc *)
 #define NVN_PROC(n)                                                                                             \
     static void hle_##n(Ctx *c) {                                                                               \
         nx_enter(c);                                                                                            \
+        nx_en_host++; /* dentro del runtime: la preferencia asíncrona no interrumpe aquí (nxkern.c) */          \
         nvnp_##n(c);                                                                                            \
+        nx_en_host--;                                                                                           \
     }
 #include "nvn_procs.inc"
 #undef NVN_PROC
@@ -93,6 +95,8 @@ void nvnp_nvnDeviceGetProcAddress(Ctx *c) { ret_x(c, nvn_proc_address((const cha
 // PFNNVNGENERICFUNC nvnBootstrapLoader(const char *name): sustituye al del juego (recomp/sustituciones.txt)
 void nxhle_nvnBootstrapLoader(Ctx *c) {
     const char *name = (const char *)c->x[0];
+    nx_en_host++;
     if (getenv("NX_TRAZA_NVN")) fprintf(stderr, "[nvn] nvnBootstrapLoader(\"%s\")\n", name ? name : "(null)");
     ret_x(c, nvn_proc_address(name));
+    nx_en_host--;
 }

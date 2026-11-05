@@ -7,12 +7,26 @@ from pathlib import Path
 import re
 
 
+MARKER = 'NxFn nx_buscar(uint64_t a) {\n    switch (a) {\n'
+DISPATCH_OLD = 'void nx_dispatch(Ctx *c, uint64_t a) { nx_buscar(a)(c); }'
+DISPATCH_NEW = ('void nx_dispatch(Ctx *c, uint64_t a) { if (__builtin_expect(nx_core_pending, 0)) nx_core_check(); '
+                'nx_buscar(a)(c); }')
+
+
 def prepare(path):
     path = Path(path)
     if not path.exists():
         return False
     text = path.read_text()
-    marker = 'NxFn nx_buscar(uint64_t a) {\n    switch (a) {\n'
+    # Cada llamada indirecta es un punto de cesión del núcleo virtual (nxkern.c): una lectura si nadie espera.
+    if DISPATCH_OLD in text:
+        text = text.replace(DISPATCH_OLD, DISPATCH_NEW)
+        if MARKER not in text:
+            temporary = path.with_suffix('.dispatch.tmp')
+            temporary.write_text(text)
+            temporary.replace(path)
+            return True
+    marker = MARKER
     if marker not in text:
         return False
     before, rest = text.split(marker, 1)
