@@ -24,6 +24,9 @@ from program import IMPORT_BASE, load_program
 
 LINES_PER_FILE = 150000
 FUNCS_PER_BLOCK = 1000   # funciones por bloque de emisión (un archivo, o varios si pasa de LINES_PER_FILE líneas)
+# Una función de más de estas líneas de C se compila sin optimizar (optnone): clang tardaba más de 40 minutos con cada
+# archivo que tenía alguna de 10000 líneas o más, aun en -O1. En TotK son unas 800 de 302000. 0 = optimizar todas.
+SIN_OPTIMIZAR_DESDE = 5000
 TRACE = False  # --traza: cada instrucción guarda su dirección en c->pc (para depurar)  # el C se reparte en varios archivos para compilarlo en paralelo
 
 
@@ -248,7 +251,10 @@ def emitir_bloque(k):
             # nx_enter consume un salto de cola pendiente: el juego suele llegar aquí con B/BR.
             buf.append(f"void {fname(f)}(Ctx *c) {{ nx_enter(c); {sustituidas[f]}(c); }}")
         else:
+            desde = len(buf)
             emit_function(prog, f, strong, buf, stats)
+            if SIN_OPTIMIZAR_DESDE and len(buf) - desde > SIN_OPTIMIZAR_DESDE:
+                buf[desde] = "__attribute__((optnone, noinline)) " + buf[desde]
         if len(buf) > LINES_PER_FILE:
             flush()
     flush()
@@ -273,6 +279,7 @@ def c_string(s):
 
 
 def main():
+    global TRACE, SIN_OPTIMIZAR_DESDE
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("modulos", nargs="+", help="un NRO, NSO sueltos, o la carpeta ExeFS de un juego")
     ap.add_argument("-o", "--output", required=True, help="carpeta donde se escribe el C")
@@ -285,9 +292,11 @@ def main():
                     "símbolo no se recompila; su cuerpo llama a void funcion_c(Ctx *) del runtime (HLE, p. ej. NVN)")
     ap.add_argument("--progreso", action="store_true", help="líneas \"progreso i/n\" al escribir las funciones (para la app)")
     ap.add_argument("--hilos", type=int, default=0, help="procesos que escriben el C (por defecto, según núcleos y memoria)")
+    ap.add_argument("--sin-optimizar-desde", type=int, default=SIN_OPTIMIZAR_DESDE,
+                    help="líneas de C desde las que una función se compila sin optimizar (0: optimizar todas)")
     args = ap.parse_args()
-    global TRACE
     TRACE = args.traza
+    SIN_OPTIMIZAR_DESDE = args.sin_optimizar_desde
 
     prog = load_program(args.modulos, args.base)
     print("módulos:")

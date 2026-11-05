@@ -117,7 +117,7 @@ def main():
     ap.add_argument("-o", "--salida", required=True)
     ap.add_argument("-j", type=int, default=None)
     ap.add_argument("--progreso", action="store_true", help="una línea \"progreso i/n\" por archivo (para la app)")
-    ap.add_argument("-O", dest="opt", default=None, help="nivel de optimización de clang (por defecto 2)")
+    ap.add_argument("-O", dest="opt", default=None, help="nivel de optimización de clang (por defecto 1)")
     ap.add_argument("--reutilizar-optimizados", action="store_true", default=None,
                     help="con -O0, conserva objetos vigentes ya compilados con -O1/2/3")
     args = ap.parse_args()
@@ -133,7 +133,8 @@ def main():
     if not isinstance(profile, dict):
         ap.error("el perfil de compilación debe ser un objeto JSON")
     args.j = args.j if args.j is not None else profile.get("hilos", min(8, os.cpu_count() or 1))
-    args.opt = args.opt if args.opt is not None else str(profile.get("optimizacion", "2"))
+    # -O1: TotK compila en 17 min y va a sus 30 fps; -O2 tarda mucho más en las funciones grandes y no se midió mejor.
+    args.opt = args.opt if args.opt is not None else str(profile.get("optimizacion", "1"))
     args.reutilizar_optimizados = args.reutilizar_optimizados or profile.get("reutilizar_optimizados", False)
     if type(args.j) is not int or args.opt not in ("0", "1", "2", "3", "s", "z") or type(args.reutilizar_optimizados) is not bool:
         ap.error("perfil inválido: comprueba hilos, optimizacion y reutilizar_optimizados")

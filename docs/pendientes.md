@@ -120,5 +120,6 @@ Se marca [x] lo hecho.
    [ ] Bucles de espera activa (rt_spin_gate de totk-pc-recomp). [x] Backend Vulkan de totk-pc-recomp (runtime/nvn/,
    ventana de nxdisplay.c): TotK por el camino genérico dibuja su introducción. [x] Vigilancia de escrituras de la CPU
    (userfaultfd + PAGEMAP_SCAN sobre el heap y la región alias). [x] Un hilo mejor toma el núcleo de uno que está dentro
-   del runtime (sin válvulas ni carreras). [ ] Compilar el juego en -O1/-O2. [ ] Congelar regiones (mem_freeze).
+   del runtime (sin válvulas ni carreras). [x] -O1 con las funciones de más de 5000 líneas en optnone: TotK compila en
+   17 min y va a 30 fps estables (su tope en la Switch). [ ] Congelar regiones (mem_freeze).
    [x] Traductor de shaders bajo demanda (totk_xlate; NX2Linux pasa TOTK_XLATE y la caché del juego).
