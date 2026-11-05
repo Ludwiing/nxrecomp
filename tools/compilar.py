@@ -138,15 +138,23 @@ def main():
     signal.signal(signal.SIGTERM, cancel_compilation)
     signal.signal(signal.SIGINT, cancel_compilation)
     prepare_dispatch(os.path.join(args.carpeta, "programa.c"))
-    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c", "nxnvn_obj.c"]
+    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c",
+               # La capa NVN de totk-pc-recomp (runtime/nvn/, con sus encabezados de adaptación)
+               "nvn/nvn_host.c", "nvn/gfx_null.c", "nvn/nvn_tex.c", "nvn/nvn_api_core.c", "nvn/nvn_api_obj.c",
+               "nvn/nvn_api_cmd.c", "nvn/nvn_ext.c"]
     srcs = sorted(glob.glob(os.path.join(args.carpeta, "*.c"))) + [os.path.join(ROOT, "runtime", f) for f in runtime]
     objdir = os.path.join(args.carpeta, "obj")
     os.makedirs(objdir, exist_ok=True)
     headers = glob.glob(os.path.join(ROOT, "runtime", "*.h")) + [os.path.join(args.carpeta, "nxgame.h")]
     newest_h = max(os.path.getmtime(h) for h in headers)
 
+    # Los encabezados de runtime/nvn/ solo los incluye esa capa: si cambian, se recompila ella y no todo el juego.
+    nvn_dir = os.path.join(ROOT, "runtime", "nvn")
+    newest_nvn_h = max([newest_h] + [os.path.getmtime(h) for h in glob.glob(os.path.join(nvn_dir, "**", "*.h"), recursive=True)])
+
     def compile_one(src):
-        return compile_source(src, args.carpeta, args.opt, newest_h, args.reutilizar_optimizados)
+        h = newest_nvn_h if os.path.dirname(src).startswith(nvn_dir) else newest_h
+        return compile_source(src, args.carpeta, args.opt, h, args.reutilizar_optimizados)
 
     with concurrent.futures.ThreadPoolExecutor(args.j) as pool:
         futs = [pool.submit(compile_one, s) for s in srcs]

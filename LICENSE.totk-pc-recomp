@@ -21,6 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ---
-runtime/nxnvn_obj.c and runtime/nvn_procs.inc follow totk-pc-recomp (https://github.com/valentderah/totk-pc-recomp),
-which took that code from MacNativeGames (https://github.com/ly05010419/MacNativeGames @ b75be8cf,
-Copyright (c) 2026 MacNativeGames contributors / jhaizhou), also under the MIT License above.
+runtime/nvn/ (except its adaptation files host.h, cfg.h, platform/platform.h and nvn_host.c) and runtime/nvn_procs.inc
+are copied unchanged from totk-pc-recomp (https://github.com/valentderah/totk-pc-recomp @ 101132a6c8d9),
+whose NVN front end was adapted from MacNativeGames (https://github.com/ly05010419/MacNativeGames @ b75be8cf,
+Copyright (c) 2026 MacNativeGames contributors; d2r_gfx by jhaizhou, origin d2r-mobile), also under the MIT License above.

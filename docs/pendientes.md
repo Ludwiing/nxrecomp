@@ -113,4 +113,8 @@ Se marca [x] lo hecho.
 3. [x] Motores especiales: un juego con port propio se construye y se abre con él (TotK 1.2.1/1.4.3: totk-pc-recomp).
 4. [x] SSBU con ssbu-recomp como motor especial (13.0.2, 13.0.4, 13.0.5); el que ya estaba construido se registró sin
    reconstruir (`registrar_construido`).
-5. [ ] NVN en el host + backend Vulkan genérico (el camino para cualquier juego NVN); hoy llega a los pools de memoria.
+5. [~] NVN en el host + backend Vulkan genérico (el camino para cualquier juego NVN). [x] Capa NVN de totk-pc-recomp en
+   runtime/nvn/ con backend nulo: TotK llama 183 funciones NVN (pools, texturas, colas, grabaciones, presentación).
+   [ ] Núcleos virtuales en el kernel (los motores guardan datos por núcleo sin mutex: dos hilos del mismo núcleo no
+   pueden correr a la vez; TotK comparte su anillo de memoria de control y falla en CallCommands). [ ] Backend Vulkan.
+   [ ] Traductor de shaders bajo demanda.
