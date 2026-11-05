@@ -191,13 +191,16 @@ class Juego:
 
     @property
     def icono(self):
-        p = os.path.join(self.carpeta, "icon.jpg")
-        return p if os.path.exists(p) else None
+        for nombre in ("icon.jpg", "icon.png"):
+            p = os.path.join(self.carpeta, nombre)
+            if os.path.exists(p):
+                return p
+        return None
 
     @property
     def ejecutable(self):
         e = motor_especial(self)
-        return e["exe"] if e else os.path.join(self.carpeta, "juego")
+        return e.exe(self) if e else os.path.join(self.carpeta, "juego")
 
     @property
     def listo(self):
@@ -318,26 +321,26 @@ def _version_del_nombre(a):
     return int(m.group(1)) if m else 0
 
 
-# ---------- motores especiales ----------
-# Un juego con un port propio, más completo que el recompilador genérico, se construye con ese port a partir de lo
-# que NX2Linux extrajo, y se abre con su ejecutable. TotK: totk-pc-recomp (MIT), versiones 1.2.1 y 1.4.3.
-ESPECIALES = {
-    "0100f2c0115b6000": {"nombre": "totk-pc-recomp", "versiones": {"1.2.1": "v121", "1.4.3": "v143"}},
-}
-
-
-def carpeta_totk_pc():
-    return leer_config().get("totk_pc") or os.path.expanduser("~/Projects/totk-pc-recomp")
-
-
 def motor_especial(j):
-    """{nombre, repo, ver, exe} si el juego tiene un port propio instalado (con sus entornos de Python), o None."""
-    e = ESPECIALES.get(j.id)
-    ver = e and e["versiones"].get(j.version)
-    repo = carpeta_totk_pc()
-    if not ver or not all(os.path.isfile(os.path.join(repo, v, "bin", "python")) for v in (".venv", ".venv-py314")):
-        return None
-    return {"nombre": e["nombre"], "repo": repo, "ver": ver, "exe": os.path.join(repo, "build", ver, "totk")}
+    """El motor especial (especiales.py) que construye y abre este juego, o None si va por el camino genérico."""
+    from . import especiales
+    return especiales.para(j)
+
+
+def registrar_construido(title, nombre, version, datos=None, icono=None):
+    """Agrega a la biblioteca un juego que un motor especial ya construyó fuera de NX2Linux (sin volver a construirlo).
+    `datos` va a juego.json (p. ej. {"dump": carpeta}); `icono` es una imagen que pasa a ser la del juego."""
+    j = Juego(os.path.join(carpeta_juegos(), title))
+    j.datos.update({"nombre": nombre, "version": version, "importado": True, **(datos or {})})
+    if not motor_especial(j):
+        raise RuntimeError(f"{nombre} {version} no tiene un motor especial instalado")
+    ahora = time.strftime("%Y-%m-%d %H:%M:%S")
+    j.datos["pasos"] = {k: ahora for k, _, _ in PASOS}
+    j.guardar()
+    if icono:
+        shutil.copyfile(icono, os.path.join(j.carpeta, "icon.png"))
+    crear_acceso(j)
+    return j
 
 
 def nuevo_juego(origen, llaves=None):
@@ -546,7 +549,8 @@ class Construccion:
         j = self.juego
         e = motor_especial(j)
         if e:
-            return self._recompilar_especial(e)
+            self._linea("recompilar", 0, f"Motor especial para este juego: {e.nombre} ({e.repo()})")
+            return e.recompilar(self, j)
         try:
             r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "servicios.py"), os.path.join(j.carpeta, "ExeFS")],
                                capture_output=True, text=True, timeout=600)
@@ -572,7 +576,7 @@ class Construccion:
         j = self.juego
         e = motor_especial(j)
         if e:
-            return self._compilar_especial(e)
+            return e.compilar(self, j)
         romfs = os.path.join(j.carpeta, "RomFS.img")
         if os.path.isfile(romfs):
             self._ejecutar("compilar", [sys.executable, os.path.join(ROOT, "tools", "romfs_native.py"), romfs])
@@ -583,48 +587,6 @@ class Construccion:
 
         self._ejecutar("compilar", [sys.executable, os.path.join(ROOT, "tools", "compilar.py"),
                                     os.path.join(j.carpeta, "c"), "-o", j.ejecutable, "--progreso"], prog)
-
-    # Con un motor especial: su carpeta build/extracted/<ver> se arma con el ExeFS y el RomFS de este juego (el RomFS
-    # en formato estándar, enlazado sin copiar sus gigas) y su generador traduce el código a C.
-    def _recompilar_especial(self, e):
-        j, repo, ver = self.juego, e["repo"], e["ver"]
-        self._linea("recompilar", 0, f"Motor especial para este juego: {e['nombre']} ({repo})")
-        romfs = os.path.join(j.carpeta, "RomFS.img")
-        if os.path.isfile(romfs):
-            self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "tools", "romfs_native.py"), romfs])
-        destino = os.path.join(repo, "build", "extracted", ver)
-        shutil.rmtree(os.path.join(destino, "exefs"), ignore_errors=True)
-        shutil.copytree(os.path.join(j.carpeta, "ExeFS"), os.path.join(destino, "exefs"))
-        os.makedirs(os.path.join(destino, "romfs"), exist_ok=True)
-        imagen, nativa = os.path.join(destino, "romfs", "romfs.bin"), romfs + ".native"
-        if not (os.path.exists(imagen) and os.path.samefile(imagen, nativa)):
-            if os.path.exists(imagen):
-                os.remove(imagen)
-            try:
-                os.link(nativa, imagen)
-            except OSError:   # otro sistema de archivos: copia (reflink si se puede)
-                self._ejecutar("recompilar", ["cp", "--reflink=auto", nativa, imagen])
-        self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "tools", "indice_romfs.py"), repo,
-                                      os.path.dirname(imagen)])
-        py = os.path.join(repo, ".venv", "bin", "python")
-        self._ejecutar("recompilar", [py, os.path.join(repo, "recomp", "gen.py"), "--exefs", os.path.join(destino, "exefs"),
-                                      "--out", os.path.join(repo, "generated", ver),
-                                      "--patches", os.path.join(repo, "recomp", f"patches-{ver}.txt")],
-                       lambda l: (lambda m: int(m.group(1)) / int(m.group(2)) if m else None)(
-                           re.match(r"emitted (\d+)/(\d+) chunks", l)), cwd=repo)
-
-    def _compilar_especial(self, e):
-        repo, ver = e["repo"], e["ver"]
-        py, py314 = os.path.join(repo, ".venv", "bin", "python"), os.path.join(repo, ".venv-py314", "bin", "python")
-        self._ejecutar("compilar", [py314, os.path.join(repo, "tools", "make_romfs_patches.py"), "--version", ver], cwd=repo)
-
-        def ninja(linea):
-            m = re.match(r"\[(\d+)/(\d+)\]", linea)
-            return 0.8 * int(m.group(1)) / int(m.group(2)) if m else None
-        self._ejecutar("compilar", [py, os.path.join(repo, "tools", "build_game.py"), "--version", ver], ninja, cwd=repo)
-        self._linea("compilar", 0.8, "Preparando los shaders (se traducen una vez y quedan en caché)...")
-        self._ejecutar("compilar", [py314, os.path.join(repo, "tools", "prepare_shaders.py"),
-                                    os.path.join(repo, "build", ver), "--version", ver], cwd=repo)
 
     # Paso 4: ícono PNG y entrada .desktop, para abrirlo desde el lanzador de Omarchy.
     def _terminar(self):
@@ -698,8 +660,8 @@ def jugar(j, salida=None):
     if not os.path.exists(j.ejecutable):
         raise RuntimeError("el juego todavía no está construido")
     log = salida or open(os.path.join(j.carpeta, "ultima_partida.txt"), "w")
-    if motor_especial(j):   # el port lee su configuración y sus datos junto a su ejecutable
-        return subprocess.Popen([j.ejecutable], stdout=log, stderr=subprocess.STDOUT,
-                                cwd=os.path.dirname(j.ejecutable), start_new_session=True)
+    e = motor_especial(j)
+    if e:
+        return e.lanzar(j, log)
     return subprocess.Popen([j.ejecutable], env=entorno_juego(j), stdout=log, stderr=subprocess.STDOUT,
                             cwd=j.carpeta, start_new_session=True)

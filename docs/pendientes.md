@@ -111,5 +111,6 @@ Se marca [x] lo hecho.
    extraer y reconstruye; el recompilador solo reescribe los archivos de C que cambiaron.
 2. [x] Elegir el prod.keys al agregar cada juego (el juego lo recuerda); la app propone los de las carpetas habituales.
 3. [x] Motores especiales: un juego con port propio se construye y se abre con él (TotK 1.2.1/1.4.3: totk-pc-recomp).
-4. [ ] SSBU con ssbu-recomp como motor especial.
+4. [x] SSBU con ssbu-recomp como motor especial (13.0.2, 13.0.4, 13.0.5); el que ya estaba construido se registró sin
+   reconstruir (`registrar_construido`).
 5. [ ] NVN en el host + backend Vulkan genérico (el camino para cualquier juego NVN); hoy llega a los pools de memoria.
