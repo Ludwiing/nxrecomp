@@ -35,6 +35,7 @@ typedef struct KThread {
     uint64_t mask;
     int vcore, last_vcore, core_waiting;
     volatile int preempt;
+    volatile int en_host_k, robado;   // en el runtime (no ejecuta código del juego); un hilo mejor le quitó el núcleo
     uint64_t core_wait_since;
 } KThread;
 

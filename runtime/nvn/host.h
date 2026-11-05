@@ -87,8 +87,8 @@ static inline void perf_gpu_wait(uint64_t t0) { (void)t0; }
 static inline int perf_gpu_timing(void) { return 0; }
 static inline void perf_gpu_busy(uint64_t ns) { (void)ns; }
 static inline void prof_write(void) {}
-// Memoria del juego: totk-pc-recomp vigila qué páginas escribe la CPU (memory.c). Aquí todavía no: mem_written_pages
-// devuelve UINT64_MAX ("sin vigilancia") y el backend copia el rango entero antes de cada envío. Correcto, más lento.
+// Memoria del juego: qué páginas escribió la CPU (nxkern.c nx_mem_written, con userfaultfd). UINT64_MAX fuera del heap
+// y de la región alias: el backend copia ese rango entero. Congelar regiones (mem_freeze) todavía no está.
 uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
 static inline int mem_freeze(uint64_t a) { (void)a; return 0; }

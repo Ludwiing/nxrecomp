@@ -49,9 +49,13 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     va_end(ap);
     c->x[30] = RETORNO_AL_HOST;
     c->tail_pending = 0;
-    int en_host = nx_en_host;   // la función del juego sí se puede interrumpir para ceder el núcleo
-    nx_en_host = 0;
+    // La función del juego corre como código del juego: con su núcleo virtual (si se lo quitaron, lo recupera) y
+    // con la preferencia asíncrona activa.
+    int en_host = nx_en_host;
+    nx_en_host = 1;
+    nx_host_leave();
     nx_buscar(fn)(c);
+    nx_host_enter();
     nx_en_host = en_host;
     uint64_t r = c->x[0];
     memcpy(c->x, x, sizeof x);   // el host sigue con los registros que tenía (sus argumentos incluidos)
@@ -101,13 +105,12 @@ int rt_knob(const char *name, const char *def) {
     return strcmp(v, "ab") ? 1 : 2;
 }
 
+uint64_t nx_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);   // nxkern.c
 uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
-    (void)addr, (void)size, (void)pages, (void)max;
-    return UINT64_MAX;
+    return nx_mem_written(addr, size, pages, max, 1);
 }
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
-    (void)addr, (void)size, (void)pages, (void)max;
-    return UINT64_MAX;
+    return nx_mem_written(addr, size, pages, max, 0);
 }
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     (void)size;

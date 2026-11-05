@@ -16,6 +16,12 @@
 #include "nxkern.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/userfaultfd.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -149,6 +155,18 @@ static void core_take(KThread *t) {
             if ((t->mask >> j & 1) && holder[j] && holder[j]->priority > t->priority &&
                 (!peor || holder[j]->priority > peor->priority))
                 peor = holder[j];
+        // El peor está dentro del runtime (un envío a la GPU, un pipeline que se compila): no ejecuta código del juego,
+        // así que su núcleo pasa al mejor ya, como con la interrupción de Horizon; al volver al juego lo pide otra vez.
+        if (peor && peor->en_host_k && peor->vcore >= 0) {
+            holder[peor->vcore] = NULL;
+            peor->vcore = -1;
+            peor->robado = 1;
+            if (peor->preempt) {
+                peor->preempt = 0;
+                __atomic_sub_fetch(&nx_core_pending, 1, __ATOMIC_RELEASE);
+            }
+            continue;
+        }
         if (peor && !peor->preempt) {
             peor->preempt = 1;
             __atomic_add_fetch(&nx_core_pending, 1, __ATOMIC_RELEASE);
@@ -193,6 +211,24 @@ static void core_give(KThread *t) {
     }
     if (core_waiters) pthread_cond_broadcast(&core_cv);
     pthread_mutex_unlock(&CL);
+}
+
+// Entrar y salir del runtime (SVC, funciones HLE como NVN). Al salir del más externo, el hilo vuelve a código del juego:
+// si un hilo mejor le quitó el núcleo mientras tanto (core_take), lo pide de nuevo. La salida mira bajo CL, para no
+// cruzarse con quien se lo está quitando.
+void nx_host_enter(void) {
+    if (nx_en_host++ == 0 && cur) cur->en_host_k = 1;
+}
+
+void nx_host_leave(void) {
+    KThread *t = cur;
+    if (--nx_en_host || !t) return;
+    pthread_mutex_lock(&CL);
+    t->en_host_k = 0;
+    int robado = t->robado;
+    t->robado = 0;
+    pthread_mutex_unlock(&CL);
+    if (robado) core_take(t);
 }
 
 // La señal de preferencia asíncrona, en el hilo que tiene el núcleo: cede solo si está en código del juego (no dentro
@@ -616,13 +652,69 @@ static void region_remove(uint64_t addr) {
             return;
         }
 }
-static void reserve(uint64_t addr, uint64_t size, const char *what) {
+// ---- vigilancia de escrituras: qué páginas escribió la CPU desde la última consulta. El backend Vulkan (runtime/nvn)
+// copia a la GPU solo esas, en lugar de cada pool entero en cada envío. userfaultfd en protección contra escritura
+// asíncrona (Linux 6.7): el kernel quita la protección de una página en su primera escritura sin avisarnos, y
+// PAGEMAP_SCAN lista las que la perdieron y las protege otra vez (como platform/linux.c de totk-pc-recomp).
+static int ww_fd = -1, pm_fd = -1;
+
+static void ww_open(void) {
+    int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
+    if (fd < 0 || ioctl(fd, UFFDIO_API, &api)) {
+        fprintf(stderr, "[nxrt] sin userfaultfd asíncrono (%s): la GPU copiará la memoria entera\n", strerror(errno));
+        if (fd >= 0) close(fd);
+        return;
+    }
+    pm_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (pm_fd < 0) close(fd);
+    else ww_fd = fd;
+}
+
+static void reserve(uint64_t addr, uint64_t size, const char *what, int watch) {
     void *p = mmap((void *)(uintptr_t)addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
                    -1, 0);
     if (p != (void *)(uintptr_t)addr) {
         fprintf(stderr, "[nxrt] no pude reservar %s en 0x%llx\n", what, (unsigned long long)addr);
         exit(1);
     }
+    if (!watch || getenv("NX_SIN_VIGILANCIA")) return;   // NX_SIN_VIGILANCIA=1: la GPU copia la memoria entera
+    if (ww_fd < 0 && pm_fd < 0) ww_open();
+    if (ww_fd < 0) return;
+    // Las páginas enormes contarían 2 MiB como escritos al tocar 4 KiB.
+    madvise(p, size, MADV_NOHUGEPAGE);
+    struct uffdio_register reg = {.range = {addr, size}, .mode = UFFDIO_REGISTER_MODE_WP};
+    if (ioctl(ww_fd, UFFDIO_REGISTER, &reg))
+        fprintf(stderr, "[nxrt] no pude vigilar las escrituras en %s (%s)\n", what, strerror(errno));
+}
+
+// Las páginas de [addr, addr+n) escritas desde la última consulta (hasta max, en orden); reset: vuelven a protegerse.
+// UINT64_MAX si ese rango no se vigila (fuera del heap y de la región alias, o sin userfaultfd).
+uint64_t nx_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
+    if (!max || !n) return 0;
+    int dentro = (addr >= NX_HEAP_BASE && addr + n <= NX_HEAP_BASE + NX_HEAP_MAX) ||
+                 (addr >= NX_ALIAS_BASE && addr + n <= NX_ALIAS_BASE + NX_ALIAS_SIZE);
+    if (ww_fd < 0 || !dentro) return UINT64_MAX;
+    struct page_region r[256];
+    uint64_t got = 0;
+    for (uint64_t at = addr & ~0xFFFull, end = (addr + n + 0xFFF) & ~0xFFFull; at < end && got < max;) {
+        // Escrita: sin la protección y con página propia (presente o en swap), que no sea la página cero compartida.
+        struct pm_scan_arg arg = {.size = sizeof arg,
+                                  .flags = reset ? PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC : 0,
+                                  .start = at, .end = end, .vec = (uint64_t)(uintptr_t)r, .vec_len = 256,
+                                  .max_pages = max - got,
+                                  .category_inverted = PAGE_IS_PFNZERO,
+                                  .category_mask = PAGE_IS_WRITTEN | PAGE_IS_PFNZERO,
+                                  .category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED,
+                                  .return_mask = PAGE_IS_WRITTEN};
+        long k = ioctl(pm_fd, PAGEMAP_SCAN, &arg);
+        if (k < 0) return UINT64_MAX;
+        for (long i = 0; i < k; i++)
+            for (uint64_t pg = r[i].start; pg < r[i].end && got < max; pg += 0x1000) pages[got++] = pg;
+        if (arg.walk_end <= at) break;
+        at = arg.walk_end;
+    }
+    return got;
 }
 
 // La región de pilas está reservada en el host, pero para Horizon lo que no se usa ahí sigue
@@ -637,9 +729,9 @@ static int range_free(uint64_t addr, uint64_t size) {
 }
 
 void nx_memory_init(void) {
-    reserve(NX_HEAP_BASE, NX_HEAP_MAX, "el heap");
-    reserve(NX_ALIAS_BASE, NX_ALIAS_SIZE, "la región alias");
-    reserve(NX_STACK_BASE, NX_STACK_SIZE, "la región de pilas");
+    reserve(NX_HEAP_BASE, NX_HEAP_MAX, "el heap", 1);
+    reserve(NX_ALIAS_BASE, NX_ALIAS_SIZE, "la región alias", 1);
+    reserve(NX_STACK_BASE, NX_STACK_SIZE, "la región de pilas", 0);
     for (int k = 0; k < nx_nmodules; k++) {
         const NxModule *m = &nx_modules[k];
         // Cada segmento aparte, como en la consola: el desenrollador de excepciones del SDK busca el
@@ -855,7 +947,7 @@ static void svc(Ctx *c, uint32_t imm);
 // demás, un hilo avisado de que lo pide uno de mejor prioridad lo cede (y lo vuelve a pedir).
 void nx_svc(Ctx *c, uint32_t imm) {
     KThread *t = cur;
-    nx_en_host++;
+    nx_host_enter();
     int bloquea = imm == 0x0B || imm == 0x18 || imm == 0x1A || imm == 0x1C || imm == 0x34 || imm == 0x21 ||
                   imm == 0x22 || imm == 0x23 || imm == 0x43;
     if (t && bloquea) {
@@ -870,7 +962,7 @@ void nx_svc(Ctx *c, uint32_t imm) {
     }
     svc(c, imm);
     if (t && bloquea) core_take(t);
-    nx_en_host--;
+    nx_host_leave();
 }
 
 static void svc(Ctx *c, uint32_t imm) {

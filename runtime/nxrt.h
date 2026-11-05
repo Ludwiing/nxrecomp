@@ -91,6 +91,8 @@ void nx_dispatch(Ctx *c, uint64_t addr);
 extern volatile int nx_core_pending;  // nxkern.c: algún hilo debe ceder su núcleo virtual
 void nx_core_check(void);              // punto de cesión (SVC y llamadas indirectas)
 extern __thread int nx_en_host;       // nxkern.c: >0 mientras el hilo está dentro del runtime (no se interrumpe)
+void nx_host_enter(void);              // al entrar al runtime desde código del juego (SVC, HLE)
+void nx_host_leave(void);              // al volver: recupera el núcleo virtual si un hilo mejor lo tomó
 // La función recompilada que empieza en `addr` (o una que avisa del salto inválido o de la importación
 // que falta). Con ella los saltos indirectos son llamadas de cola (musttail) y la pila no crece.
 typedef void (*NxFn)(Ctx *c);
