@@ -75,6 +75,39 @@ class LoadedModule:
         end = self.img.data.index(0, off)
         return self.img.data[off:end].decode(errors="replace")
 
+    def eh_frame_starts(self):
+        """Inicios de función de la tabla de búsqueda de .eh_frame_hdr (MOD0 +0x10/+0x14), relativos al módulo.
+
+        Las excepciones de C++ necesitan un FDE por función, así que la tabla nombra casi todas, también las que solo
+        se alcanzan por punteros (callbacks, vtables armadas en ejecución) y que el recorrido desde BL no encuentra."""
+        if self.mod0 is None or self.mod0 + 0x18 > self.img.size:
+            return set()
+        lo, hi = (self.mod0 + struct.unpack_from("<i", self.img.data, self.mod0 + k)[0] for k in (0x10, 0x14))
+        if not (0 <= lo < hi <= self.img.size) or hi - lo < 12 or self.img.data[lo] != 1:
+            return set()
+        d = self.img.data
+
+        def leer(pos, enc):
+            """Un valor DWARF codificado con enc en pos: (valor, posición siguiente); None si no se sabe leer."""
+            fmt = {0x03: "<I", 0x0B: "<i", 0x04: "<Q", 0x0C: "<q"}.get(enc & 0x0F)
+            if fmt is None or pos + struct.calcsize(fmt) > hi:
+                return None, pos
+            v = struct.unpack_from(fmt, d, pos)[0]
+            base = {0x00: 0, 0x10: pos, 0x30: lo}.get(enc & 0x70)
+            return (None if base is None else v + base), pos + struct.calcsize(fmt)
+
+        ptr_enc, count_enc, table_enc = d[lo + 1], d[lo + 2], d[lo + 3]
+        _, pos = leer(lo + 4, ptr_enc)
+        n, pos = leer(pos, count_enc)
+        out = set()
+        for _ in range(n or 0):
+            inicio, pos = leer(pos, table_enc)
+            _, pos = leer(pos, table_enc)
+            if inicio is None:
+                break
+            out.add(inicio)
+        return out
+
     def _parse_dynamic(self):
         if self.img.size < 8:
             return
@@ -244,10 +277,11 @@ class Program:
         return False
 
     def entry_points(self):
-        """Inicios seguros: la entrada de cada módulo, DT_INIT, init_array y funciones exportadas."""
+        """Inicios seguros: la entrada de cada módulo, DT_INIT, init_array, funciones exportadas y las de .eh_frame_hdr."""
         out = set()
         for m in self.modules:
             out.add(m.base + m.img.text[0])
+            out.update(m.base + a for a in m.eh_frame_starts() if self.in_text(m.base + a) and not a & 3)
             if m.init:
                 out.add(m.base + m.init)
             out.update(a for a in m.init_array if self.in_text(a))
