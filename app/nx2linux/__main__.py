@@ -3,7 +3,8 @@
     nx2linux                       abre la app
     nx2linux --jugar <title id>    abre un juego ya construido (lo usan las entradas del menú)
     nx2linux --lista               lista la biblioteca
-    nx2linux --construir <carpeta o archivos...>   agrega y construye sin ventana
+    nx2linux --construir [--llaves prod.keys] <carpeta o archivos...>   agrega y construye sin ventana
+    nx2linux --agregar <title id> <archivos...>    agrega una actualización o DLC a un juego ya construido
 """
 
 import sys
@@ -13,10 +14,23 @@ from . import motor
 
 def _construir(rutas):
     llaves = motor.ruta_llaves()
+    if rutas[:1] == ["--llaves"] and len(rutas) > 2:
+        llaves, rutas = rutas[1], rutas[2:]
     if not llaves:
-        sys.exit("falta elegir prod.keys: ábrelo una vez con la ventana (Preferencias)")
+        sys.exit("falta elegir prod.keys: ábrelo una vez con la ventana (Preferencias) o usa --llaves")
     origen = motor.clasificar(rutas, llaves)
-    j = motor.nuevo_juego(origen)
+    return _esperar(motor.nuevo_juego(origen, llaves))
+
+
+def _agregar(jid, rutas):
+    j = next((j for j in motor.biblioteca() if j.id == jid), None)
+    if not j:
+        sys.exit(f"no hay un juego {jid} en la biblioteca")
+    hacer = motor.aplicar_contenido(j, motor.clasificar_contenido(j, rutas))
+    return _esperar(j, desde="extraer") if hacer == "extraer" else _esperar(j, solo_dlc=hacer)
+
+
+def _esperar(j, desde=None, solo_dlc=None):
     import threading
     fin = threading.Event()
     estado = {}
@@ -27,7 +41,7 @@ def _construir(rutas):
         if paso in ("fin", "error"):
             estado["ok"] = paso == "fin"
             fin.set()
-    c = motor.Construccion(j, avisar)
+    c = motor.Construccion(j, avisar, desde, solo_dlc)
     c.empezar()
     try:
         fin.wait()
@@ -50,6 +64,8 @@ def main():
         return 0
     if a[:1] == ["--construir"] and len(a) > 1:
         return _construir(a[1:])
+    if a[:1] == ["--agregar"] and len(a) > 2:
+        return _agregar(a[1].lower(), a[2:])
     if a:
         sys.exit(__doc__)
     from .ventana import App

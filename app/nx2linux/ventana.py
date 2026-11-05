@@ -152,13 +152,21 @@ class Ventana(Adw.ApplicationWindow):
     # ---------- agregar ----------
 
     def agregar_juego(self):
-        if not motor.ruta_llaves():
+        llaves = motor.llaves_conocidas()
+        if not llaves:
             self.toast("Primero elige tu archivo prod.keys")
             self.preferencias()
             return
         d = Adw.AlertDialog(heading="Agregar un juego",
                             body="Elige la carpeta con el juego (y su actualización y DLC), o los archivos "
                                  "sueltos. Tienen que ser copias de tus propios juegos.")
+        # Las llaves con que se abre este juego (por ejemplo, las de otra consola); el juego las recuerda.
+        selector = Gtk.DropDown.new_from_strings([abreviar(r) for r in llaves])
+        selector.set_tooltip_text("El prod.keys de la consola de la que sacaste este juego")
+        caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        caja.append(Gtk.Label(label="Llaves de la consola (prod.keys)", xalign=0, css_classes=["dim-label"]))
+        caja.append(selector)
+        d.set_extra_child(caja)
         d.add_response("cancelar", "Cancelar")
         d.add_response("archivos", "Elegir archivos")
         d.add_response("carpeta", "Elegir carpeta")
@@ -166,32 +174,39 @@ class Ventana(Adw.ApplicationWindow):
         d.set_default_response("carpeta")
 
         def resp(_d, r):
-            fd = Gtk.FileDialog(title="Juego de Switch")
-            if r == "carpeta":
-                fd.select_folder(self, None, lambda f, res: self._elegido(lambda: [f.select_folder_finish(res)]))
-            elif r == "archivos":
-                filtro = Gtk.FileFilter(name="Juegos de Switch")
-                for e in motor.EXTENSIONES:
-                    filtro.add_suffix(e[1:])
-                lista = Gio.ListStore.new(Gtk.FileFilter)
-                lista.append(filtro)
-                fd.set_filters(lista)
-                fd.open_multiple(self, None, lambda f, res: self._elegido(lambda: list(f.open_multiple_finish(res))))
+            elegidas = llaves[selector.get_selected()]
+            self._pedir_archivos(r, lambda rutas: self._elegido(rutas, elegidas))
         d.connect("response", resp)
         d.present(self)
 
-    def _elegido(self, obtener):
-        try:
-            rutas = [g.get_path() for g in obtener() if g and g.get_path()]
-        except GLib.Error:
-            return  # cancelado
-        if not rutas:
-            return
+    def _pedir_archivos(self, modo, listo):
+        """Abre el selector de carpeta ("carpeta") o de archivos ("archivos") y pasa las rutas elegidas a listo()."""
+        def tomar(obtener):
+            try:
+                rutas = [g.get_path() for g in obtener() if g and g.get_path()]
+            except GLib.Error:
+                return  # cancelado
+            if rutas:
+                listo(rutas)
+        fd = Gtk.FileDialog(title="Juego de Switch")
+        if modo == "carpeta":
+            fd.select_folder(self, None, lambda f, res: tomar(lambda: [f.select_folder_finish(res)]))
+        elif modo == "archivos":
+            filtro = Gtk.FileFilter(name="Juegos de Switch")
+            for e in motor.EXTENSIONES:
+                filtro.add_suffix(e[1:])
+            lista = Gio.ListStore.new(Gtk.FileFilter)
+            lista.append(filtro)
+            fd.set_filters(lista)
+            fd.open_multiple(self, None, lambda f, res: tomar(lambda: list(f.open_multiple_finish(res))))
+
+    def _elegido(self, rutas, llaves):
         self.toast("Reconociendo los archivos…")
 
         def trabajo():
             try:
-                origen = motor.clasificar(rutas, motor.ruta_llaves())
+                origen = motor.clasificar(rutas, llaves)
+                origen["llaves"] = llaves
                 GLib.idle_add(self._confirmar, origen)
             except Exception as e:
                 GLib.idle_add(self._error, "No se pudo agregar", str(e))
@@ -215,7 +230,7 @@ class Ventana(Adw.ApplicationWindow):
 
         def resp(_d, r):
             if r == "construir":
-                j = motor.nuevo_juego(origen)
+                j = motor.nuevo_juego(origen, origen.get("llaves"))
                 self.refrescar()
                 self.abrir_juego(j)
                 self.construir(j)
@@ -233,13 +248,13 @@ class Ventana(Adw.ApplicationWindow):
         self.detalle = PaginaJuego(self, juego)
         self.nav.push(self.detalle)
 
-    def construir(self, juego, desde=None):
+    def construir(self, juego, desde=None, solo_dlc=None):
         if juego.id in self.construcciones:
             return
 
         def avisar(paso, frac, linea):
             GLib.idle_add(self._aviso, juego.id, paso, frac, linea)
-        c = motor.Construccion(juego, avisar, desde)
+        c = motor.Construccion(juego, avisar, desde, solo_dlc)
         self.construcciones[juego.id] = c
         c.empezar()
         self.refrescar()
@@ -301,6 +316,11 @@ class Ventana(Adw.ApplicationWindow):
         return False
 
 
+def abreviar(ruta):
+    casa = os.path.expanduser("~")
+    return "~" + ruta[len(casa):] if ruta.startswith(casa + os.sep) else ruta
+
+
 def abrir(ruta):
     subprocess.Popen(["xdg-open", ruta], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
@@ -318,6 +338,7 @@ class PaginaJuego(Adw.NavigationPage):
             ("carpeta", "Abrir la carpeta del juego", lambda: abrir(juego.carpeta)),
             ("rehacer", "Construir de nuevo desde cero", lambda: ventana.construir(juego, desde="extraer")),
             ("recompilar", "Recompilar (sin volver a extraer)", lambda: ventana.construir(juego, desde="recompilar")),
+            ("contenido", "Agregar actualización o DLC…", self._agregar_contenido),
             ("quitar", "Quitar de la biblioteca", self._quitar),
         ]:
             a = Gio.SimpleAction(name=nombre)
@@ -350,7 +371,11 @@ class PaginaJuego(Adw.NavigationPage):
         b_ajustes = Gtk.Button(label="Ajustes")
         b_ajustes.add_css_class("pill")
         b_ajustes.connect("clicked", lambda *_: AjustesJuego(juego).present(ventana))
-        for b in (self.b_jugar, self.b_construir, b_ajustes):
+        self.b_contenido = Gtk.Button(label="Actualización o DLC")
+        self.b_contenido.add_css_class("pill")
+        self.b_contenido.set_tooltip_text("Agregar una actualización o contenido descargable de este juego")
+        self.b_contenido.connect("clicked", lambda *_: self._agregar_contenido())
+        for b in (self.b_jugar, self.b_construir, self.b_contenido, b_ajustes):
             botones.append(b)
         info.append(botones)
         cab.append(info)
@@ -402,6 +427,7 @@ class PaginaJuego(Adw.NavigationPage):
             partes.append(f"{len(o['dlc'])} DLC")
         self.sub.set_label(" · ".join(partes) + " — " + texto_estado(j, construyendo))
         self.b_jugar.set_sensitive(j.listo and not construyendo)
+        self.b_contenido.set_sensitive(not construyendo)
         self.b_construir.set_label("Detener" if construyendo else ("Reconstruir" if j.listo else "Construir"))
         self.b_construir.remove_css_class("destructive-action")
         if construyendo:
@@ -453,6 +479,61 @@ class PaginaJuego(Adw.NavigationPage):
             self.exp.set_expanded(True)
             self.v.construir(self.juego)
 
+    def _agregar_contenido(self):
+        if self.juego.id in self.v.construcciones:
+            self.v.toast("Espera a que termine la construcción")
+            return
+        d = Adw.AlertDialog(heading="Actualización o DLC",
+                            body=f"Elige los archivos (NSP, NSZ, XCI) de la actualización o del contenido descargable "
+                                 f"de {self.juego.nombre}, o una carpeta que los tenga. Tienen que ser copias tuyas.")
+        d.add_response("cancelar", "Cancelar")
+        d.add_response("carpeta", "Elegir carpeta")
+        d.add_response("archivos", "Elegir archivos")
+        d.set_response_appearance("archivos", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("archivos")
+        d.connect("response", lambda _d, r: self.v._pedir_archivos(r, self._contenido_elegido))
+        d.present(self.v)
+
+    def _contenido_elegido(self, rutas):
+        self.v.toast("Reconociendo los archivos…")
+
+        def trabajo():
+            try:
+                nuevo = motor.clasificar_contenido(self.juego, rutas)
+                GLib.idle_add(self._confirmar_contenido, nuevo)
+            except Exception as e:
+                GLib.idle_add(self.v._error, "No se pudo agregar", str(e))
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _confirmar_contenido(self, nuevo):
+        partes = []
+        if nuevo["update"]:
+            partes.append(f"Actualización: {os.path.basename(nuevo['update'])}\nEl juego se vuelve a construir: "
+                          "una actualización cambia su código. Las partidas guardadas se conservan.")
+        if nuevo["dlc"]:
+            partes.append(f"Contenido descargable: {len(nuevo['dlc'])}" +
+                          ("" if nuevo["update"] else "\nSolo se extrae; no hace falta recompilar."))
+        d = Adw.AlertDialog(heading="¿Agregar a " + self.juego.nombre + "?", body="\n\n".join(partes))
+        d.add_response("cancelar", "Cancelar")
+        d.add_response("agregar", "Agregar")
+        d.set_response_appearance("agregar", Adw.ResponseAppearance.SUGGESTED)
+
+        def resp(_d, r):
+            if r != "agregar":
+                return
+            try:
+                hacer = motor.aplicar_contenido(self.juego, nuevo)
+            except Exception as e:
+                self.v._error("No se pudo agregar", str(e))
+                return
+            self.exp.set_expanded(True)
+            if hacer == "extraer":
+                self.v.construir(self.juego, desde="extraer")
+            else:
+                self.v.construir(self.juego, solo_dlc=hacer)
+        d.connect("response", resp)
+        d.present(self.v)
+
     def _quitar(self):
         d = Adw.AlertDialog(heading=f"¿Quitar {self.juego.nombre}?",
                             body="Se borra lo que NX2Linux construyó, incluidas las partidas guardadas de este "
@@ -494,6 +575,12 @@ class AjustesJuego(Adw.PreferencesDialog):
         g.add(self.idioma)
         pag.add(g)
         g = Adw.PreferencesGroup(title="Ventana y sonido")
+        renderers = [("opengl", "OpenGL"), ("vulkan", "Vulkan (Zink)")]
+        renderer = Adw.ComboRow(title="API gráfica", subtitle="Zink ejecuta el renderer OpenGL sobre Vulkan.",
+            model=Gtk.StringList.new([name for _, name in renderers]),
+            selected=1 if aj.get("renderer") == "vulkan" else 0)
+        renderer.connect("notify::selected", lambda r, _p: self._poner("renderer", renderers[r.get_selected()][0]))
+        g.add(renderer)
         s = Adw.SwitchRow(title="Pantalla completa", active=aj["pantalla_completa"])
         s.connect("notify::active", lambda r, _p: self._poner("pantalla_completa", r.get_active()))
         g.add(s)

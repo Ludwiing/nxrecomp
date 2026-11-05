@@ -46,6 +46,7 @@ IDIOMAS = [
 ]
 
 AJUSTES_POR_DEFECTO = {
+    "renderer": "opengl",     # "vulkan" usa la capa Zink de Mesa
     "modo": "base",           # "base" (TV, 1080p) o "portatil" (720p)
     "idioma": "es-419",
     "pantalla_completa": False,
@@ -73,8 +74,45 @@ def guardar_config(cfg):
 
 
 def ruta_llaves():
+    """El prod.keys predeterminado (Preferencias)."""
     p = leer_config().get("llaves")
     return p if p and os.path.isfile(p) else None
+
+
+# Donde se suele guardar el prod.keys sacado de la consola (lockpick_rcm lo deja en /switch/prod.keys).
+CARPETAS_LLAVES = [
+    "~/.switch/prod.keys",
+    "~/.local/share/yuzu/keys/prod.keys", "~/.local/share/suyu/keys/prod.keys",
+    "~/.local/share/citron/keys/prod.keys", "~/.local/share/eden/keys/prod.keys",
+    "~/.config/Ryujinx/system/prod.keys", "~/.var/app/org.ryujinx.Ryujinx/config/Ryujinx/system/prod.keys",
+]
+
+
+def llaves_conocidas():
+    """Los prod.keys que existen: el predeterminado, los usados antes y los de las carpetas habituales (sin repetir)."""
+    cfg = leer_config()
+    rutas = [cfg.get("llaves")] + cfg.get("llaves_usadas", []) + [os.path.expanduser(c) for c in CARPETAS_LLAVES]
+    vistos, lista = set(), []
+    for r in rutas:
+        if r and os.path.isfile(r) and os.path.realpath(r) not in vistos:
+            vistos.add(os.path.realpath(r))
+            lista.append(r)
+    return lista
+
+
+def recordar_llaves(ruta):
+    """Anota un prod.keys usado; si todavía no hay predeterminado, pasa a serlo."""
+    cfg = leer_config()
+    cfg["llaves_usadas"] = ([ruta] + [r for r in cfg.get("llaves_usadas", []) if r != ruta])[:8]
+    if not ruta_llaves():
+        cfg["llaves"] = ruta
+    guardar_config(cfg)
+
+
+def llaves_de(juego):
+    """Las llaves con que se agregó el juego; si ya no están, las predeterminadas."""
+    p = juego.datos.get("llaves")
+    return p if p and os.path.isfile(p) else ruta_llaves()
 
 
 def carpeta_juegos():
@@ -158,7 +196,8 @@ class Juego:
 
     @property
     def ejecutable(self):
-        return os.path.join(self.carpeta, "juego")
+        e = motor_especial(self)
+        return e["exe"] if e else os.path.join(self.carpeta, "juego")
 
     @property
     def listo(self):
@@ -236,11 +275,7 @@ def title_id(archivo, llaves):
     return int(m.group(1), 16)
 
 
-def clasificar(rutas, llaves):
-    """De una carpeta o una lista de archivos saca {base, update, dlc[], title}.
-
-    Los title ID de la Switch dicen qué es cada cosa: el juego termina en 000, su actualización en 800
-    y los DLC tienen el bloque siguiente (base + 0x1000 + n)."""
+def _archivos(rutas):
     archivos = []
     for r in rutas:
         if os.path.isdir(r):
@@ -249,6 +284,15 @@ def clasificar(rutas, llaves):
             archivos.append(r)
     if not archivos:
         raise RuntimeError("no hay archivos .nsp, .nsz, .xci ni .xcz")
+    return archivos
+
+
+def clasificar(rutas, llaves):
+    """De una carpeta o una lista de archivos saca {base, update, dlc[], title}.
+
+    Los title ID de la Switch dicen qué es cada cosa: el juego termina en 000, su actualización en 800
+    y los DLC tienen el bloque siguiente (base + 0x1000 + n)."""
+    archivos = _archivos(rutas)
     bases, updates, dlcs = [], [], []
     for a in archivos:
         t = title_id(a, llaves)
@@ -274,13 +318,75 @@ def _version_del_nombre(a):
     return int(m.group(1)) if m else 0
 
 
-def nuevo_juego(origen):
+# ---------- motores especiales ----------
+# Un juego con un port propio, más completo que el recompilador genérico, se construye con ese port a partir de lo
+# que NX2Linux extrajo, y se abre con su ejecutable. TotK: totk-pc-recomp (MIT), versiones 1.2.1 y 1.4.3.
+ESPECIALES = {
+    "0100f2c0115b6000": {"nombre": "totk-pc-recomp", "versiones": {"1.2.1": "v121", "1.4.3": "v143"}},
+}
+
+
+def carpeta_totk_pc():
+    return leer_config().get("totk_pc") or os.path.expanduser("~/Projects/totk-pc-recomp")
+
+
+def motor_especial(j):
+    """{nombre, repo, ver, exe} si el juego tiene un port propio instalado (con sus entornos de Python), o None."""
+    e = ESPECIALES.get(j.id)
+    ver = e and e["versiones"].get(j.version)
+    repo = carpeta_totk_pc()
+    if not ver or not all(os.path.isfile(os.path.join(repo, v, "bin", "python")) for v in (".venv", ".venv-py314")):
+        return None
+    return {"nombre": e["nombre"], "repo": repo, "ver": ver, "exe": os.path.join(repo, "build", ver, "totk")}
+
+
+def nuevo_juego(origen, llaves=None):
     j = Juego(os.path.join(carpeta_juegos(), origen["title"]))
     j.datos["origen"] = {k: origen[k] for k in ("base", "update", "dlc")}
     j.datos["pasos"] = {}
     j.datos.setdefault("nombre", os.path.splitext(os.path.basename(origen["base"]))[0])
+    if llaves:
+        j.datos["llaves"] = llaves
+        recordar_llaves(llaves)
     j.guardar()
     return j
+
+
+def clasificar_contenido(juego, rutas):
+    """Archivos para un juego ya instalado: {update, dlc[]}. Falla si alguno es de otro juego o es el juego base."""
+    llaves = llaves_de(juego)
+    if not llaves:
+        raise RuntimeError("falta elegir tu archivo prod.keys en Preferencias")
+    t = int(juego.id, 16)
+    updates, dlc = [], []
+    for a in _archivos(rutas):
+        d = title_id(a, llaves)
+        if d == t | 0x800:
+            updates.append(a)
+        elif t + 0x1000 < d < t + 0x2000:
+            dlc.append({"ruta": a, "indice": d - t - 0x1000})
+        elif d == t:
+            raise RuntimeError(f"{os.path.basename(a)} es el juego base, que ya está en la biblioteca")
+        else:
+            raise RuntimeError(f"{os.path.basename(a)} es de otro juego (title ID {d:016x}), no de {juego.nombre}")
+    return {"update": max(updates, key=_version_del_nombre) if updates else None, "dlc": dlc}
+
+
+def aplicar_contenido(juego, nuevo):
+    """Anota la actualización y los DLC en el juego. Devuelve "extraer" si hay que reconstruirlo (una actualización
+    cambia el código) o la lista de índices de DLC que basta con extraer."""
+    o = juego.datos.setdefault("origen", {})
+    if nuevo["update"] and not (o.get("base") and os.path.isfile(o["base"])):
+        raise RuntimeError("para aplicar una actualización hace falta el archivo del juego base con que se agregó, "
+                           "y ya no está: agrega el juego de nuevo junto con la actualización")
+    actuales = {d["indice"]: d for d in o.get("dlc") or [] if isinstance(d, dict)}
+    for d in nuevo["dlc"]:
+        actuales[d["indice"]] = d
+    o["dlc"] = [actuales[k] for k in sorted(actuales)]
+    if nuevo["update"]:
+        o["update"] = nuevo["update"]
+    juego.guardar()
+    return "extraer" if nuevo["update"] else [d["indice"] for d in nuevo["dlc"]]
 
 
 def quitar(juego):
@@ -302,8 +408,9 @@ class Construccion:
     ese hilo con cada novedad: paso es la clave del paso en curso (o "fin"/"error"), fraccion el
     progreso total de 0 a 1 y linea el texto nuevo del registro (o None)."""
 
-    def __init__(self, juego, avisar, desde=None):
-        self.juego, self.avisar, self.desde = juego, avisar, desde
+    def __init__(self, juego, avisar, desde=None, solo_dlc=None):
+        # solo_dlc: índices de DLC nuevos de un juego ya construido; se extraen y no se recompila nada.
+        self.juego, self.avisar, self.desde, self.solo_dlc = juego, avisar, desde, solo_dlc
         self.proc = None
         self.cancelado = False
         self.hilo = threading.Thread(target=self._correr, daemon=True)
@@ -339,6 +446,11 @@ class Construccion:
         try:
             with open(j.registro(), "a") as self.log:
                 self.log.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
+                if self.solo_dlc:
+                    self._linea("extraer", 0, "— Agregar contenido descargable")
+                    self._extraer_dlc([d for d in j.datos["origen"]["dlc"] if d["indice"] in self.solo_dlc])
+                    self.avisar("fin", 1.0, f"Contenido descargable agregado en {self._duracion()}.")
+                    return
                 for clave, nombre, _ in PASOS:
                     if j.paso_hecho(clave):
                         continue
@@ -363,14 +475,14 @@ class Construccion:
             self.log.flush()
         self.avisar(clave, a + w * max(0.0, min(1.0, frac_paso)), texto)
 
-    def _ejecutar(self, clave, cmd, progreso=None, entorno=None):
+    def _ejecutar(self, clave, cmd, progreso=None, entorno=None, cwd=None):
         """Corre una orden y pasa su salida al registro. `progreso(linea)` devuelve la fracción del paso o None."""
         if self.cancelado:
             raise Cancelado()
         self.log.write("$ " + " ".join(cmd) + "\n")
         env = dict(os.environ, PYTHONUNBUFFERED="1", **(entorno or {}))
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-                                     errors="replace", bufsize=1)
+                                     errors="replace", bufsize=1, cwd=cwd)
         frac = 0.0
         ultimas = []
         for linea in self.proc.stdout:
@@ -392,15 +504,12 @@ class Construccion:
     # Paso 1: extraer ExeFS, RomFS (con la actualización), ícono y nombre; los DLC aparte.
     def _extraer(self):
         j = self.juego
-        llaves = ruta_llaves()
-        if not llaves:
-            raise RuntimeError("falta elegir tu archivo prod.keys en Preferencias")
+        llaves = self._llaves()
         o = j.datos["origen"]
         self._linea("extraer", 0.02, "Preparando el extractor (la primera vez se compila)...")
         exe = extractor()
         for d in ("ExeFS",):
             shutil.rmtree(os.path.join(j.carpeta, d), ignore_errors=True)
-        n = 1 + len(o.get("dlc") or [])
 
         def info(linea):
             m = re.match(r"name (.+)", linea)
@@ -413,8 +522,19 @@ class Construccion:
 
         self._ejecutar("extraer", [exe, llaves, o["base"], o.get("update") or "-", j.carpeta, "--romfs-image"], info)
         j.guardar()
-        for k, d in enumerate(o.get("dlc") or []):
-            self._linea("extraer", (k + 1) / n, f"Contenido descargable {k + 1} de {n - 1}")
+        self._extraer_dlc(o.get("dlc") or [])
+
+    def _llaves(self):
+        llaves = llaves_de(self.juego)
+        if not llaves:
+            raise RuntimeError("falta elegir tu archivo prod.keys en Preferencias")
+        return llaves
+
+    def _extraer_dlc(self, lista):
+        j = self.juego
+        llaves, exe = self._llaves(), extractor()
+        for k, d in enumerate(lista):
+            self._linea("extraer", (k + 1) / (len(lista) + 1), f"Contenido descargable {k + 1} de {len(lista)}")
             os.makedirs(os.path.join(j.carpeta, "aoc"), exist_ok=True)
             ruta, indice = (d["ruta"], d["indice"]) if isinstance(d, dict) else (d, k + 1)
             self._ejecutar("extraer", [exe, llaves, "--aoc", ruta, os.path.join(j.carpeta, "aoc", f"{indice}.img"),
@@ -424,6 +544,9 @@ class Construccion:
     # faltan en el runtime (solo informa: el registro dice qué arreglar si no arranca).
     def _recompilar(self):
         j = self.juego
+        e = motor_especial(j)
+        if e:
+            return self._recompilar_especial(e)
         try:
             r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "servicios.py"), os.path.join(j.carpeta, "ExeFS")],
                                capture_output=True, text=True, timeout=600)
@@ -439,13 +562,20 @@ class Construccion:
         pistas = os.path.join(j.carpeta, "pistas.txt")
         self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "recomp", "nxrecomp.py"),
                                       os.path.join(j.carpeta, "ExeFS"), "-o", os.path.join(j.carpeta, "c"), "--progreso",
-                                      "--pistas", pistas], prog)
+                                      "--pistas", pistas,
+                                      "--sustituir", os.path.join(ROOT, "recomp", "sustituciones.txt")], prog)
         j.datos["pistas_usadas"] = _contar_pistas(pistas)
         j.guardar()
 
     # Paso 3: clang en todos los núcleos.
     def _compilar(self):
         j = self.juego
+        e = motor_especial(j)
+        if e:
+            return self._compilar_especial(e)
+        romfs = os.path.join(j.carpeta, "RomFS.img")
+        if os.path.isfile(romfs):
+            self._ejecutar("compilar", [sys.executable, os.path.join(ROOT, "tools", "romfs_native.py"), romfs])
 
         def prog(linea):
             m = re.match(r"progreso (\d+)/(\d+)", linea)
@@ -453,6 +583,48 @@ class Construccion:
 
         self._ejecutar("compilar", [sys.executable, os.path.join(ROOT, "tools", "compilar.py"),
                                     os.path.join(j.carpeta, "c"), "-o", j.ejecutable, "--progreso"], prog)
+
+    # Con un motor especial: su carpeta build/extracted/<ver> se arma con el ExeFS y el RomFS de este juego (el RomFS
+    # en formato estándar, enlazado sin copiar sus gigas) y su generador traduce el código a C.
+    def _recompilar_especial(self, e):
+        j, repo, ver = self.juego, e["repo"], e["ver"]
+        self._linea("recompilar", 0, f"Motor especial para este juego: {e['nombre']} ({repo})")
+        romfs = os.path.join(j.carpeta, "RomFS.img")
+        if os.path.isfile(romfs):
+            self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "tools", "romfs_native.py"), romfs])
+        destino = os.path.join(repo, "build", "extracted", ver)
+        shutil.rmtree(os.path.join(destino, "exefs"), ignore_errors=True)
+        shutil.copytree(os.path.join(j.carpeta, "ExeFS"), os.path.join(destino, "exefs"))
+        os.makedirs(os.path.join(destino, "romfs"), exist_ok=True)
+        imagen, nativa = os.path.join(destino, "romfs", "romfs.bin"), romfs + ".native"
+        if not (os.path.exists(imagen) and os.path.samefile(imagen, nativa)):
+            if os.path.exists(imagen):
+                os.remove(imagen)
+            try:
+                os.link(nativa, imagen)
+            except OSError:   # otro sistema de archivos: copia (reflink si se puede)
+                self._ejecutar("recompilar", ["cp", "--reflink=auto", nativa, imagen])
+        self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "tools", "indice_romfs.py"), repo,
+                                      os.path.dirname(imagen)])
+        py = os.path.join(repo, ".venv", "bin", "python")
+        self._ejecutar("recompilar", [py, os.path.join(repo, "recomp", "gen.py"), "--exefs", os.path.join(destino, "exefs"),
+                                      "--out", os.path.join(repo, "generated", ver),
+                                      "--patches", os.path.join(repo, "recomp", f"patches-{ver}.txt")],
+                       lambda l: (lambda m: int(m.group(1)) / int(m.group(2)) if m else None)(
+                           re.match(r"emitted (\d+)/(\d+) chunks", l)), cwd=repo)
+
+    def _compilar_especial(self, e):
+        repo, ver = e["repo"], e["ver"]
+        py, py314 = os.path.join(repo, ".venv", "bin", "python"), os.path.join(repo, ".venv-py314", "bin", "python")
+        self._ejecutar("compilar", [py314, os.path.join(repo, "tools", "make_romfs_patches.py"), "--version", ver], cwd=repo)
+
+        def ninja(linea):
+            m = re.match(r"\[(\d+)/(\d+)\]", linea)
+            return 0.8 * int(m.group(1)) / int(m.group(2)) if m else None
+        self._ejecutar("compilar", [py, os.path.join(repo, "tools", "build_game.py"), "--version", ver], ninja, cwd=repo)
+        self._linea("compilar", 0.8, "Preparando los shaders (se traducen una vez y quedan en caché)...")
+        self._ejecutar("compilar", [py314, os.path.join(repo, "tools", "prepare_shaders.py"),
+                                    os.path.join(repo, "build", ver), "--version", ver], cwd=repo)
 
     # Paso 4: ícono PNG y entrada .desktop, para abrirlo desde el lanzador de Omarchy.
     def _terminar(self):
@@ -496,6 +668,7 @@ def pistas_nuevas(j):
 def entorno_juego(j):
     aj = j.datos["ajustes"]
     env = dict(os.environ)
+    env["NX_RENDERER"] = aj.get("renderer", "opengl")
     env["NX_ROMFS"] = os.path.join(j.carpeta, "RomFS.img")
     env["NX_SDMC"] = os.path.join(j.carpeta, "guardado", "sdmc")
     env["NX_GUARDADO"] = os.path.join(j.carpeta, "guardado")
@@ -525,5 +698,8 @@ def jugar(j, salida=None):
     if not os.path.exists(j.ejecutable):
         raise RuntimeError("el juego todavía no está construido")
     log = salida or open(os.path.join(j.carpeta, "ultima_partida.txt"), "w")
+    if motor_especial(j):   # el port lee su configuración y sus datos junto a su ejecutable
+        return subprocess.Popen([j.ejecutable], stdout=log, stderr=subprocess.STDOUT,
+                                cwd=os.path.dirname(j.ejecutable), start_new_session=True)
     return subprocess.Popen([j.ejecutable], env=entorno_juego(j), stdout=log, stderr=subprocess.STDOUT,
                             cwd=j.carpeta, start_new_session=True)

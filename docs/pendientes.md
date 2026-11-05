@@ -103,3 +103,13 @@ Se marca [x] lo hecho.
    [ ] delay, reverb, reverb 3D y compresor (hoy dejan pasar la señal).
 7. [x] Herramienta que lista los servicios (tools/servicios.py) que nombra el juego antes del primer arranque.
    Prueba: guest/libnx/cuentas (guest/esperado/cuentas.txt). NX_TRAZA_IPC=1 muestra cada comando.
+
+## App NX2Linux
+
+1. [x] Agregar una actualización o un DLC a un juego ya instalado ("Actualización o DLC" en la página del juego,
+   o `nx2linux --agregar <title id> <archivos>`). DLC: se extrae a `aoc/` sin recompilar. Actualización: vuelve a
+   extraer y reconstruye; el recompilador solo reescribe los archivos de C que cambiaron.
+2. [x] Elegir el prod.keys al agregar cada juego (el juego lo recuerda); la app propone los de las carpetas habituales.
+3. [x] Motores especiales: un juego con port propio se construye y se abre con él (TotK 1.2.1/1.4.3: totk-pc-recomp).
+4. [ ] SSBU con ssbu-recomp como motor especial.
+5. [ ] NVN en el host + backend Vulkan genérico (el camino para cualquier juego NVN); hoy llega a los pools de memoria.
