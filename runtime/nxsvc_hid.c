@@ -14,6 +14,13 @@
 static KShmem *hid_shmem;
 static uint32_t hid_shmem_h;
 
+static uint32_t active_vibration_devices(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    // ActivateVibrationDevice: the SDK requires a live service object even
+    // when the host has no rumble-capable controller connected.
+    return r->cmd == 0 ? OK : NX_R_UNKNOWN_CMD;
+}
+
 static uint32_t applet_resource(ServiceObject *self, NxRequest *r) {
     (void)self;
     if (r->cmd == 0) { // GetSharedMemoryHandle
@@ -33,11 +40,14 @@ uint32_t nx_hid(ServiceObject *self, NxRequest *r) {
     case 0: // CreateAppletResource(aruid)
         nx_out_object(r, nx_object("IAppletResource", applet_resource, NULL));
         return OK;
+    case 203: // CreateActiveVibrationDeviceList
+        nx_out_object(r, nx_object("IActiveVibrationDeviceList", active_vibration_devices, NULL));
+        return OK;
     // Activar dispositivos y configurar mandos: se aceptan.
     case 1: case 11: case 21: case 31: case 40: case 66: case 67: case 68: case 69: case 70: case 71: case 72: case 73:
     case 79: case 80: case 82: case 87: case 100: case 102: case 103: case 104: case 108: case 109: case 120: case 121:
     case 122: case 123: case 124: case 125: case 126: case 128: case 129: case 130: case 131: case 132: case 133:
-    case 134: case 135: case 136: case 200: case 201: case 202: case 203: case 206: case 211: case 300: case 301:
+    case 134: case 135: case 136: case 200: case 201: case 202: case 206: case 211: case 300: case 301:
     case 302: case 303: case 304: case 305: case 306: case 307: case 308: case 309: case 310: case 311: case 1000:
     case 1003:
         return OK;

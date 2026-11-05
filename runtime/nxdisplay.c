@@ -144,8 +144,9 @@ void nx_display_run(void) {
     if (!SDL_CreateWindowAndRenderer(titulo && *titulo ? titulo : "nxrecomp", 1280, 720,
                                      SDL_WINDOW_RESIZABLE | (completa ? SDL_WINDOW_FULLSCREEN : 0), &win, &ren)) {
         fprintf(stderr, "[nxrt] no pude crear la ventana: %s\n", SDL_GetError());
-        for (;;) pause();
+        _exit(4);
     }
+    fprintf(stderr, "[nxrt] presentación: %s\n", SDL_GetRendererName(ren));
     SDL_SetRenderVSync(ren, 1);
     for (;;) {
         SDL_Event ev;

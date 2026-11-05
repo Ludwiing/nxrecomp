@@ -53,11 +53,21 @@ static int iniciar(void) {
     if (estado) return estado > 0;
     estado = -1;
     if (getenv("NX_SIN_GPU")) return 0;
+    int vulkan = getenv("NX_RENDERER") && !strcmp(getenv("NX_RENDERER"), "vulkan");
     PFNEGLQUERYDEVICESEXTPROC qd = (void *)eglGetProcAddress("eglQueryDevicesEXT");
     PFNEGLGETPLATFORMDISPLAYEXTPROC gpd = (void *)eglGetProcAddress("eglGetPlatformDisplayEXT");
     EGLDeviceEXT devs[8];
     EGLint n = 0;
-    if (!qd || !gpd || !qd(8, devs, &n) || n == 0) {
+    if (vulkan && gpd) {
+        dpy = gpd(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+        if (dpy && eglInitialize(dpy, NULL, NULL)) {
+            eglBindAPI(EGL_OPENGL_API);
+            EGLint ca[] = {EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 6,
+                           EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
+            ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ca);
+        }
+    }
+    if (!vulkan && (!qd || !gpd || !qd(8, devs, &n) || n == 0)) {
         fprintf(stderr, "[RED] GPU: no hay dispositivos EGL; no se dibuja\n");
         return 0;
     }
@@ -71,10 +81,18 @@ static int iniciar(void) {
         ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ca);
     }
     if (!ctx || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+        if (vulkan) {
+            fprintf(stderr, "[RED] Vulkan (Zink): no se pudo inicializar; error EGL 0x%x\n", eglGetError());
+            exit(4);
+        }
         fprintf(stderr, "[RED] GPU: no pude crear un contexto OpenGL 4.6; no se dibuja\n");
         return 0;
     }
     actual = 1;
+    if (vulkan && !strstr((const char *)glGetString(GL_RENDERER), "zink")) {
+        fprintf(stderr, "[RED] Vulkan solicitado, pero el driver activo no es Zink\n");
+        exit(4);
+    }
     traza = getenv("NX_TRAZA_GL") != NULL;
     if (traza) {
         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
@@ -1276,7 +1294,10 @@ static void estado_raster(const uint32_t *R) {
     float tx = f32(R[0x283]), ty = f32(R[0x284]), tz = f32(R[0x285]);
     if (!(R[0x64B] & 1)) sx = 1, sy = 1, tx = 0, ty = 0;
     float ax = sx < 0 ? -sx : sx, ay = sy < 0 ? -sy : sy;
-    int zero_uno = R[0x64F] & 1;
+    // DEPTH_CLIP_NEGATIVE_Z (0x0D7C / 4) selects the pre-viewport clip range.
+    // ViewVolumeClipControl is independent; its bit 0 is not this selector.
+    // https://github.com/envytools/envytools/blob/master/rnndb/graph/gf100_3d.xml
+    int zero_uno = R[0x35F] & 1;
     glClipControl(sy < 0 ? GL_UPPER_LEFT : GL_LOWER_LEFT, zero_uno ? GL_ZERO_TO_ONE : GL_NEGATIVE_ONE_TO_ONE);
     glViewportIndexedf(0, tx - ax, ty - ay, 2 * ax, 2 * ay);
     if (zero_uno) glDepthRangeIndexed(0, tz, tz + sz);

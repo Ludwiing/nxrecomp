@@ -10,7 +10,8 @@
 
 ServiceObject *nx_object(const char *name, uint32_t (*fn)(ServiceObject *, NxRequest *), void *state) {
     ServiceObject *o = calloc(1, sizeof *o);
-    o->name = name;
+    // sm GetServiceHandle construye algunos nombres en la pila.
+    o->name = strdup(name);
     o->handle = fn;
     o->state = state;
     return o;

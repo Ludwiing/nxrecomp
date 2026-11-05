@@ -30,15 +30,59 @@ typedef struct {
     uint64_t size;
 } Storage;
 
+static FILE *open_romfs_image(const char *path) {
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) return NULL;
+    char magic[8];
+    size_t got = fread(magic, 1, sizeof magic, f);
+    rewind(f);
+    if (got != 8 || memcmp(magic, "DMROMFS1", 8)) return f;
+    // The extractor's archive is not Nintendo RomFS. Only use a converted
+    // image whose source identity still matches; never serve the archive raw.
+    char *native = NULL, *stamp = NULL;
+    struct stat st;
+    unsigned long long size = 0, mtime = 0;
+    asprintf(&native, "%s.native", path);
+    asprintf(&stamp, "%s.native.source", path);
+    FILE *identity = stamp ? fopen(stamp, "r") : NULL;
+    int valid = identity && fscanf(identity, "%llu%llu", &size, &mtime) == 2
+        && fstat(fileno(f), &st) == 0 && size == (unsigned long long)st.st_size
+        && mtime == (unsigned long long)st.st_mtim.tv_sec * 1000000000ull + st.st_mtim.tv_nsec;
+    if (identity) fclose(identity);
+    fclose(f);
+    f = valid && native ? fopen(native, "rb") : NULL;
+    if (!f) fprintf(stderr, "[RED] imagen DMROMFS1: ejecuta tools/romfs_native.py sobre %s antes de jugar\n", path);
+    free(native); free(stamp);
+    return f;
+}
+
 static uint32_t storage_handle(ServiceObject *self, NxRequest *r) {
     Storage *s = self->state;
     switch (r->cmd) {
     case 0: { // Read(offset, size) → buffer B
         uint64_t off = nx_in64(r, 0), size = nx_in64(r, 8);
         if (!r->nb || size > r->b[0].size || off > s->size || size > s->size - off) return R_FS_OUT_OF_RANGE;
-        fseeko(s->f, (off_t)off, SEEK_SET);
         nx_vigia_tocar(r->b[0].addr, size); // read() en una página protegida daría EFAULT
-        if (fread((void *)(uintptr_t)r->b[0].addr, 1, size, s->f) != size) return R_FS_OUT_OF_RANGE;
+        int fd = fileno(s->f);
+        if (fd >= 0) {
+            // Sessions and domain clones share Storage. A seek followed by a
+            // read races another thread's seek even though stdio locks each
+            // operation separately. Positional reads never change that cursor.
+            uint64_t done = 0;
+            while (done < size) {
+                ssize_t got = pread(fd, (void *)(uintptr_t)(r->b[0].addr + done), size - done, (off_t)(off + done));
+                if (got < 0 && errno == EINTR) continue;
+                if (got <= 0) return R_FS_OUT_OF_RANGE;
+                done += (uint64_t)got;
+            }
+        } else {
+            // Embedded homebrew RomFS uses fmemopen, which has no descriptor.
+            flockfile(s->f);
+            int failed = fseeko(s->f, (off_t)off, SEEK_SET) != 0;
+            if (!failed) failed = fread((void *)(uintptr_t)r->b[0].addr, 1, size, s->f) != size;
+            funlockfile(s->f);
+            if (failed) return R_FS_OUT_OF_RANGE;
+        }
         return OK;
     }
     case 4: nx_out64(r, s->size); return OK; // GetSize
@@ -322,7 +366,7 @@ uint32_t nx_fsp(ServiceObject *self, NxRequest *r) {
     }
     case 200: { // OpenDataStorageByCurrentProcess: el RomFS del juego
         const char *path = getenv("NX_ROMFS");
-        FILE *f = path ? fopen(path, "rb") : NULL;
+        FILE *f = open_romfs_image(path);
         if (!f && nx_romfs_size) f = fmemopen((void *)nx_romfs_data, nx_romfs_size, "rb"); // el del NRO
         if (!f) {
             fprintf(stderr, "[RED] el juego abrió su RomFS, pero no hay imagen: define NX_ROMFS=<RomFS.img>\n");
@@ -365,7 +409,7 @@ uint32_t nx_fsp(ServiceObject *self, NxRequest *r) {
         if (dir && id > base && id - base < 0x1000) {
             char ruta[1100];
             snprintf(ruta, sizeof ruta, "%s/%llu.img", dir, (unsigned long long)(id - base));
-            FILE *f = fopen(ruta, "rb");
+            FILE *f = open_romfs_image(ruta);
             if (f) {
                 Storage *s = calloc(1, sizeof *s);
                 s->f = f;

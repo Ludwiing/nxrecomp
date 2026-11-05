@@ -71,7 +71,11 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
     uint8_t *tls = (uint8_t *)(uintptr_t)c->tpidrro;
     uint32_t w0 = rd32(tls), w1 = rd32(tls + 4);
     uint32_t type = w0 & 0xFFFF, nx = w0 >> 16 & 0xF, na = w0 >> 20 & 0xF, nb = w0 >> 24 & 0xF, nw = w0 >> 28 & 0xF;
+    // Las variantes con contexto usan la misma estructura y semántica CMIF.
+    if (type == 6) type = 4;
+    if (type == 7) type = 5;
     uint32_t data_words = w1 & 0x3FF, cflags = w1 >> 10 & 0xF;
+    int tipc = type >= 16; // TIPC: comando en el tipo HIPC, sin cabecera CMIF.
     if (type == 2) return R_OK_; // cierre de sesión
 
     NxRequest r;
@@ -110,7 +114,7 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
 
     ServiceObject *target = s->obj;
     uint32_t domain_cmd = 0, domain_id = 0;
-    if (s->domain && type != 5) {
+    if (s->domain && type != 5 && !tipc) {
         domain_cmd = tls[raw];
         domain_id = rd32(tls + raw + 4);
         uint32_t nobj = tls[raw + 1];
@@ -123,9 +127,15 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
             target = NULL;
         }
     }
-    r.cmd = rd32(tls + raw + 8);
-    r.in = tls + raw + 16;
-    r.in_size = data_end > raw + 16 ? data_end - raw - 16 : 0;
+    if (tipc) {
+        r.cmd = type - 16;
+        r.in = tls + data;
+        r.in_size = data_words * 4;
+    } else {
+        r.cmd = rd32(tls + raw + 8);
+        r.in = tls + raw + 16;
+        r.in_size = data_end > raw + 16 ? data_end - raw - 16 : 0;
+    }
 
     uint32_t result;
     if (type == 5) { // control: dominios y tamaño del buffer de punteros
@@ -135,7 +145,11 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
             nx_out32(&r, 1);
             result = R_OK_;
         } else if (r.cmd == 2 || r.cmd == 4) { // CloneCurrentObject(Ex)
-            r.out_move[r.nout_move++] = session_handle(s->obj);
+            // Un clon conserva el dominio y sus objetos, no vuelve a CMIF plano.
+            // Las sesiones viven hasta finalizar el proceso (nx_session_close).
+            nx_kernel_lock();
+            r.out_move[r.nout_move++] = nx_handle_new(KO_SESSION, s, 1);
+            nx_kernel_unlock();
             result = R_OK_;
         } else if (r.cmd == 3) { // QueryPointerBufferSize
             nx_out32(&r, 0x8000);
@@ -149,7 +163,7 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
         fprintf(stderr, "[RED] pedido a un objeto inexistente (id %u)\n", domain_id);
         result = R_SESSION_CLOSED;
     } else {
-        r.session_is_domain = s->domain;
+        r.session_is_domain = s->domain && !tipc;
         result = target->handle(target, &r);
         static int traza = -1; // NX_TRAZA_IPC: cada comando, con su objeto y su resultado
         if (traza < 0) traza = getenv("NX_TRAZA_IPC") != NULL;
@@ -161,7 +175,7 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
     // Objetos nuevos: en un dominio van como ids; si no, cada uno es una sesión nueva (handle movido).
     uint32_t out_ids[8], nout_ids = 0;
     for (int k = 0; k < r.nout_objects; k++) {
-        if (s->domain) {
+        if (s->domain && !tipc) {
             for (int j = 0; j < 64; j++)
                 if (!s->objs[j]) {
                     s->objs[j] = r.out_objects[k];
@@ -182,6 +196,15 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
         q += 4;
         for (int k = 0; k < r.nout_copy; k++, q += 4) wr32(tls + q, r.out_copy[k]);
         for (int k = 0; k < r.nout_move; k++, q += 4) wr32(tls + q, r.out_move[k]);
+    }
+    if (tipc) {
+        // libnx tipcParseResponse: resultado y datos inmediatamente después de
+        // los handles, sin alineación a 16 y sin las palabras "SFCO".
+        wr32(tls + q, result);
+        memcpy(tls + q + 4, r.out, r.out_size);
+        wr32(tls, 0);
+        wr32(tls + 4, (r.out_size + 7) / 4 | (special ? 1u << 31 : 0));
+        return R_OK_;
     }
     uint32_t rraw = (q + 15) & ~15u;
     uint32_t o = rraw;

@@ -36,7 +36,21 @@ typedef struct Ctx {
     uint64_t pc;                   // última instrucción ejecutada (solo con nxrecomp --traza)
     uint64_t excl_addr;            // monitor exclusivo: dirección y valor que leyó LDXR/LDXP
     uint64_t excl_val, excl_val2;
+    uint64_t tail_return;
+    uint8_t tail_pending;
 } Ctx;
+
+// A guest tail branch preserves the native caller even when LR was used as
+// scratch storage or still contains the address of an earlier BL.
+static inline uint64_t nx_enter(Ctx *c) {
+    uint64_t result = c->tail_pending ? c->tail_return : c->x[30];
+    c->tail_pending = 0;
+    return result;
+}
+static inline void nx_tail(Ctx *c, uint64_t caller) {
+    c->tail_return = caller;
+    c->tail_pending = 1;
+}
 
 // Escribir un escalar en un registro V pone en cero el resto del registro.
 #define NX_WRV(bits, lane)                                                          \

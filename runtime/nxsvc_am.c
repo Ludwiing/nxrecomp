@@ -10,20 +10,34 @@
 #include "nxsvc.h"
 
 #define R_AM_NO_MESSAGE 0x680u      // am, 3
-#define R_AM_NO_DATA 0x2A8u         // am, 2: no hay parámetro de lanzamiento
+#define R_AM_NO_DATA 0x480u         // am (128), 2: no hay parámetro de lanzamiento
 #define OK 0
 
 static KEvent *msg_event;
 static uint32_t msg_event_h;
+static int initial_focus_message = 1;
 
 static uint32_t common_state(ServiceObject *self, NxRequest *r) {
     (void)self;
     switch (r->cmd) {
     case 0: // GetEventHandle: se señala cuando hay mensajes
-        if (!msg_event_h) msg_event_h = nx_event_new(&msg_event);
+        if (!msg_event_h) {
+            msg_event_h = nx_event_new(&msg_event);
+            if (initial_focus_message) nx_event_signal(msg_event);
+        }
         nx_out_copy_handle(r, msg_event_h);
         return OK;
-    case 1: return R_AM_NO_MESSAGE;           // ReceiveMessage
+    case 1: // ReceiveMessage: la aplicación empieza con derechos de primer plano.
+        nx_kernel_lock();
+        if (!initial_focus_message) {
+            nx_kernel_unlock();
+            return R_AM_NO_MESSAGE;
+        }
+        initial_focus_message = 0;
+        if (msg_event) msg_event->signaled = 0;
+        nx_kernel_unlock();
+        nx_out32(r, 15); // FocusStateChanged; GetCurrentFocusState devuelve InFocus.
+        return OK;
     case 5: nx_out8(r, nx_en_base()); return OK;  // GetOperationMode: 0 portátil, 1 en la base
     case 6: nx_out32(r, nx_en_base()); return OK; // GetPerformanceMode: van juntos
     case 8: nx_out8(r, 0); return OK;         // GetBootMode
@@ -35,6 +49,7 @@ static uint32_t common_state(ServiceObject *self, NxRequest *r) {
         return OK;
     case 61: { KEvent *e; nx_out_copy_handle(r, nx_event_new(&e)); return OK; }
     case 66: return OK;                       // SetCpuBoostMode
+    case 900: return OK; // SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled
     }
     return NX_R_UNKNOWN_CMD;
 }
@@ -56,6 +71,10 @@ static uint32_t self_controller(ServiceObject *self, NxRequest *r) {
         return OK;
     }
     case 40: nx_out64(r, 1); return OK;       // CreateManagedDisplayLayer
+    case 44: // CreateManagedDisplaySeparableLayer: pantalla y grabación.
+        nx_out64(r, 1);
+        nx_out64(r, 2);
+        return OK;
     case 91: { KEvent *e; nx_out_copy_handle(r, nx_event_new(&e)); return OK; }
     }
     return NX_R_UNKNOWN_CMD;

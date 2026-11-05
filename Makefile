@@ -3,7 +3,7 @@ CLANG ?= clang
 B := build
 PROGS := hola neon vm multi
 # programas que hablan con el kernel o los servicios: su salida se compara con guest/esperado/
-PROGS_ESPERADO := hilos servicios
+PROGS_ESPERADO := hilos servicios retorno_br
 # Homebrew hechos con libnx (devkitPro): se compilan con su toolchain si está instalado.
 DEVKITPRO ?= /opt/devkitpro
 LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema kernel cuentas)
@@ -154,7 +154,54 @@ $(B)/libnx_%: guest/libnx/%/source/main.c $(RECOMP) $(RUNTIME) $(RUNTIME_H) | $(
 	python3 recomp/nxrecomp.py guest/libnx/$*/$*.nro -o $(B)/libnx_$*_rec >/dev/null
 	python3 tools/compilar.py $(B)/libnx_$*_rec -o $@ >/dev/null
 
-test: all
+$(B)/ipc_tipc_test: tests/ipc_tipc_test.c runtime/nxipc.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -march=x86-64-v3 -Iruntime tests/ipc_tipc_test.c runtime/nxipc.c -o $@
+
+$(B)/applet_startup_test: tests/applet_startup_test.c runtime/nxsvc_am.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -march=x86-64-v3 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
+
+$(B)/native_window_test: tests/native_window_test.c runtime/nxsvc_vi.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -march=x86-64-v3 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
+
+.PHONY: test-startup
+.PHONY: test-gpu-state
+$(B)/renderer_config_test: tests/renderer_config_test.c runtime/nxmain.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
+
+$(B)/clip_depth_test: tests/clip_depth_test.c runtime/nxgl.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime $(SDL_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lEGL -lOpenGL -lm -o $@
+
+$(B)/gpu_submission_snapshot_test: tests/gpu_submission_snapshot_test.c runtime/nxgpu.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lpthread -lm -o $@
+
+test-gpu-state: $(B)/clip_depth_test $(B)/gpu_submission_snapshot_test $(B)/renderer_config_test
+	$(B)/clip_depth_test
+	$(B)/gpu_submission_snapshot_test
+	$(B)/renderer_config_test
+
+$(B)/hid_startup_test: tests/hid_startup_test.c runtime/nxsvc_hid.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -Iruntime $< -o $@
+
+$(B)/storage_concurrency_test: tests/storage_concurrency_test.c runtime/nxsvc_fs.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lpthread -o $@
+
+$(B)/nv_sync_event_test: tests/nv_sync_event_test.c runtime/nxsvc_vi.c runtime/nxgpu.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime $(SDL_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections $< runtime/nxgpu.c -lpthread -lEGL -lOpenGL -lm -o $@
+
+test-startup: $(B)/ipc_tipc_test $(B)/applet_startup_test $(B)/native_window_test $(B)/hid_startup_test $(B)/storage_concurrency_test $(B)/nv_sync_event_test
+	$(B)/ipc_tipc_test
+	$(B)/applet_startup_test
+	$(B)/native_window_test
+	$(B)/hid_startup_test
+	$(B)/storage_concurrency_test
+	$(B)/nv_sync_event_test
+	python3 tests/romfs_native_test.py
+	python3 tests/dispatch_table_test.py
+	python3 tests/branch_local_test.py
+	python3 tests/compile_cache_test.py
+	python3 tests/compile_cancel_test.py
+
+test: all test-startup
 	@ok=1; for p in $(PROGS) $(PROGS_ESPERADO); do \
 		NX_ROMFS=$(B)/romfs_prueba.img $(B)/$$p > $(B)/$$p.salida.txt; \
 		if [ -f guest/esperado/$$p.txt ]; then cp guest/esperado/$$p.txt $(B)/$$p.referencia.txt; \

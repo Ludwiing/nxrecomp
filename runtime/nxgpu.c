@@ -144,6 +144,8 @@ void *nx_gpu_ptr_n(uint64_t gpu, uint64_t *avail) {
 static uint32_t syncpts[NSYNCPT];
 static pthread_mutex_t sp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sp_cond = PTHREAD_COND_INITIALIZER;
+// nvdrv owns event slots; notify after releasing sp_lock to avoid lock inversion.
+extern void nx_nvdrv_syncpt_changed(uint32_t id) __attribute__((weak));
 
 uint32_t nx_syncpt_read(uint32_t id) { return id < NSYNCPT ? __atomic_load_n(&syncpts[id], __ATOMIC_ACQUIRE) : 0; }
 
@@ -153,6 +155,7 @@ void nx_syncpt_incr(uint32_t id) {
     __atomic_add_fetch(&syncpts[id], 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&sp_cond);
     pthread_mutex_unlock(&sp_lock);
+    if (nx_nvdrv_syncpt_changed) nx_nvdrv_syncpt_changed(id);
 }
 
 int nx_syncpt_wait(uint32_t id, uint32_t threshold, int32_t timeout_us) {
@@ -774,6 +777,7 @@ static void dma_semaforo(uint32_t v) {
 
 static void call_method(uint32_t subch, uint32_t m, uint32_t v) {
     if (m == 0) { // SetObject: qué clase atiende este subcanal
+        if (traza_gpu) fprintf(stderr, "[gpu] subcanal %u: clase 0x%x\n", subch, v);
         subch_class[subch] = v & 0xFFFF;
         return;
     }
@@ -817,6 +821,18 @@ static void run_pushbuffer(uint64_t gpu, uint32_t words) {
         fprintf(stderr, "[RED] GPU: pushbuffer en 0x%llx (%u palabras) sin memoria\n", (unsigned long long)gpu, words);
         return;
     }
+    // Completion methods can wake a producer which immediately reuses this
+    // memory. Latch this entry before executing any of its methods. Entries
+    // are fetched separately because earlier GPU commands can write later ones.
+    uint32_t *snapshot = malloc((size_t)words * sizeof *snapshot);
+    if (!snapshot) abort();
+    memcpy(snapshot, pb, (size_t)words * sizeof *snapshot);
+    pb = snapshot;
+    if (traza_gpu) {
+        fprintf(stderr, "[gpu] primeras palabras:");
+        for (uint32_t k = 0; k < words && k < 8; k++) fprintf(stderr, " %08x", pb[k]);
+        fprintf(stderr, "\n");
+    }
     uint32_t i = 0;
     while (i < words) {
         if (pbs.count) { // datos de un comando que empezó antes (quizá en otra entrada)
@@ -839,11 +855,21 @@ static void run_pushbuffer(uint64_t gpu, uint32_t words) {
         case 0: case 2: break; // SetSubDeviceMask y compañía: una sola GPU
         default:
             if (h) fprintf(stderr, "[RED] GPU: cabecera de pushbuffer 0x%08x\n", h);
+            if (h && traza_gpu) {
+                fprintf(stderr, "[gpu] invalid at 0x%llx word=%u/%u:", (unsigned long long)gpu, i - 1, words);
+                for (uint32_t j = i > 9 ? i - 9 : 0; j < words && j < i + 4; j++)
+                    fprintf(stderr, " %08x", pb[j]);
+                fprintf(stderr, "\n");
+            }
         }
     }
+    free(snapshot);
 }
 
 void nx_gpu_submit(uint32_t id_canal, const uint64_t *entries, uint32_t n) {
+    uint64_t *submitted = n ? malloc((size_t)n * sizeof *submitted) : NULL;
+    if (n && !submitted) abort();
+    if (n) memcpy(submitted, entries, (size_t)n * sizeof *submitted);
     pthread_mutex_lock(&gpu_lock);
     static int iniciada;
     if (!iniciada++) traza_gpu = getenv("NX_TRAZA_GPU") != NULL;
@@ -854,16 +880,22 @@ void nx_gpu_submit(uint32_t id_canal, const uint64_t *entries, uint32_t n) {
         // Registros que en el hardware no arrancan en 0 y que un driver puede no escribir nunca.
         e3d.regs[0x0DF] = 1; // RasterEnable
         e3d.regs[0x556] = 1; // SetRenderEnableC: siempre
+        // VertexB is the default vertex stage. NVN supplies its code offset
+        // without writing this configuration register; zero disables all
+        // vertex processing even though fragment shaders are configured.
+        e3d.regs[0x810] = e3d.shadow[0x810] = 0x11;
     }
     nx_gl_invalidate_all();
     for (uint32_t k = 0; k < n; k++) {
-        uint64_t e = entries[k];
+        uint64_t e = submitted[k];
         uint64_t gpu = e & 0xFFFFFFFFFCull;
         uint32_t words = (uint32_t)(e >> 42 & 0x1FFFFF);
         if (traza_gpu) fprintf(stderr, "[gpu] entrada 0x%llx, %u palabras (pendientes %u)\n", (unsigned long long)gpu, words, pbs.count);
         if (words) run_pushbuffer(gpu, words);
     }
     draw_flush();
+    if (traza_gpu) fprintf(stderr, "[gpu] end submit channel=%u pending=%u method=%x\n", id_canal, pbs.count, pbs.method);
     nx_gl_release();
     pthread_mutex_unlock(&gpu_lock);
+    free(submitted);
 }

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
@@ -14,6 +15,7 @@ static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1)
 static void call(Ctx *c, const char *name, uint64_t x0, uint64_t x1) {
     uint64_t a = nx_symbol(name);
     if (!a) return;
+    if (getenv("NX_TRACE_BOOT")) fprintf(stderr, "[boot] %s 0x%llx\n", name, (unsigned long long)a);
     c->x[0] = x0;
     c->x[1] = x1;
     nx_dispatch(c, a);
@@ -37,7 +39,11 @@ static void *guest_main(void *arg) {
         call(c, "nninitInitializeSdkModule", 0, 0);
         call(c, "nninitStartup", 0, 0);
         call(c, "_init_libc2", 0, 0);
-        for (int k = 0; k < nx_ninits; k++) nx_dispatch(c, nx_inits[k]);
+        for (int k = 0; k < nx_ninits; k++) {
+            if (getenv("NX_TRACE_BOOT")) fprintf(stderr, "[boot] constructor 0x%llx\n", (unsigned long long)nx_inits[k]);
+            nx_dispatch(c, nx_inits[k]);
+        }
+        if (getenv("NX_TRACE_BOOT")) fprintf(stderr, "[boot] nnMain 0x%llx\n", (unsigned long long)nx_main_addr);
         nx_dispatch(c, nx_main_addr);
         fflush(stdout);
         _exit(0);
@@ -51,7 +57,30 @@ static void *guest_main(void *arg) {
     _exit(0);
 }
 
+static int configurar_renderer(void) {
+    const char *renderer = getenv("NX_RENDERER");
+    if (!renderer || !*renderer || !strcmp(renderer, "opengl")) return 1;
+    if (strcmp(renderer, "vulkan")) {
+        fprintf(stderr, "[nxrt] NX_RENDERER desconocido: %s\n", renderer);
+        return 0;
+    }
+    // Zink executes this renderer's OpenGL API over Vulkan. This is a
+    // compatibility backend, distinct from a direct NVN-to-Vulkan frontend.
+    const char *mesa = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+    if (access(mesa, R_OK)) {
+        fprintf(stderr, "[nxrt] Vulkan (Zink) necesita el proveedor EGL de Mesa: %s\n", mesa);
+        return 0;
+    }
+    setenv("__EGL_VENDOR_LIBRARY_FILENAMES", mesa, 1);
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 1);
+    setenv("GALLIUM_DRIVER", "zink", 1);
+    setenv("SDL_RENDER_DRIVER", "vulkan", 1);
+    fprintf(stderr, "[nxrt] renderer solicitado: Vulkan mediante Zink\n");
+    return 1;
+}
+
 int main(void) {
+    if (!configurar_renderer()) return 2;
     for (int k = 0; k < nx_nmodules; k++) {
         const NxModule *m = &nx_modules[k];
         nx_map_fixed(m->base, align_up(m->size + m->bss, 0x1000), m->name);

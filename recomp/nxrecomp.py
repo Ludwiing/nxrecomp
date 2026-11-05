@@ -14,6 +14,7 @@ El C resultante se compila con runtime/nxrt.c y queda un ejecutable nativo de Li
 
 import argparse
 import bisect
+import multiprocessing
 import os
 import struct
 
@@ -22,6 +23,7 @@ from a64 import bits, decode
 from program import IMPORT_BASE, load_program
 
 LINES_PER_FILE = 150000
+FUNCS_PER_BLOCK = 1000   # funciones por bloque de emisión (un archivo, o varios si pasa de LINES_PER_FILE líneas)
 TRACE = False  # --traza: cada instrucción guarda su dirección en c->pc (para depurar)  # el C se reparte en varios archivos para compilarlo en paralelo
 
 
@@ -111,19 +113,26 @@ def discover(mod, roots):
     strong = set(roots)
     weak = pointer_candidates(mod) | adr_candidates(mod)
     work = sorted(strong) + sorted(weak)
+    # starts es sorted(strong) al empezar cada recorrido: se mantiene ordenada en lugar de ordenarla de nuevo en cada
+    # función (con cientos de miles de funciones, eso era casi todo el tiempo del descubrimiento).
+    starts = sorted(strong)
     done = set()
     while work:
         f = work.pop()
         if f in done:
             continue
         done.add(f)
+        nuevas = []
 
         def found(t):
             if t not in strong:
                 strong.add(t)
                 work.append(t)
+                nuevas.append(t)
 
-        walk(mod, f, set(), sorted(strong), found)
+        walk(mod, f, set(), starts, found)
+        for t in nuevas:   # después del recorrido, como la copia que recibía walk antes
+            bisect.insort(starts, t)
     return strong, strong | weak
 
 
@@ -139,7 +148,10 @@ def emit_function(mod, f, strong, out, stats):
     out.append(f"void {fname(f)}(Ctx *c) {{")
     # Dirección de retorno con la que se entró: un RET con otra (código que escribe x30 a mano,
     # como el crt0 de libnx que pone exit en x30 y salta a main) continúa en esa dirección.
-    out.append("    const uint64_t lr0 = c->x[30];")
+    out.append("    const uint64_t lr0 = nx_enter(c);")
+    local_dispatch = any(i.kind == "br" for i in body.values())
+    if local_dispatch:
+        out.append("    uint64_t nx_local_target;")
     if TRACE:
         out.append(f"    nx_trace_func(c, 0x{f:x}ull);")
     order = sorted(body)
@@ -154,14 +166,14 @@ def emit_function(mod, f, strong, out, stats):
         k = i.kind
 
         def tail_dispatch(reg):
-            return f"{{ NxFn fn = nx_buscar({reg}); __attribute__((musttail)) return fn(c); }}"
+            return f"{{ NxFn fn = nx_buscar({reg}); nx_tail(c, lr0); __attribute__((musttail)) return fn(c); }}"
 
         def jump(t):
-            if t in strong and t != f:  # salto a otra función: llamada de cola garantizada, la pila del
-                # host no crece aunque el juego encadene saltos sin volver (intérpretes, máquinas de estado)
-                return f"{{ __attribute__((musttail)) return {fname(t)}(c); }}"
             if t in body:
                 return f"goto L_{t:x};"
+            if t in strong and t != f:  # salto a otra función: llamada de cola garantizada, la pila del
+                # host no crece aunque el juego encadene saltos sin volver (intérpretes, máquinas de estado)
+                return f"{{ nx_tail(c, lr0); __attribute__((musttail)) return {fname(t)}(c); }}"
             return f'{{ nx_bad_jump(c, 0x{pc:x}ull, 0x{t:x}ull); return; }}'
 
         if k == "op":
@@ -184,14 +196,17 @@ def emit_function(mod, f, strong, out, stats):
         elif k == "blr":
             out.append(f"    {{ uint64_t t = {i.reg}; c->x[30] = 0x{pc + 4:x}ull; nx_dispatch(c, t); }}")
         elif k == "br":
+            # Algunas rutinas ensamblador reutilizan LR y vuelven con BR a una
+            # copia de la dirección de retorno. Es un retorno al llamador C.
+            out.append(f"    if ({i.reg} == lr0) return;")
             if i.targets:  # tabla de salto resuelta: cada destino es una etiqueta de esta función
                 out.append(f"    switch ({i.reg}) {{")
                 for t in i.targets:
                     out.append(f"    case 0x{t:x}ull: {jump(t)}")
-                out.append(f"    default: {tail_dispatch(i.reg)}")
+                out.append(f"    default: nx_local_target = {i.reg}; goto nx_local_dispatch;")
                 out.append("    }")
             else:
-                out.append(f"    {tail_dispatch(i.reg)}")
+                out.append(f"    nx_local_target = {i.reg}; goto nx_local_dispatch;")
             continue
         elif k == "ret":  # un RET a otra dirección (el juego cambió x30): seguir allí, también de cola
             out.append(f"    if ({i.reg} != lr0) {tail_dispatch(i.reg)}")
@@ -199,8 +214,55 @@ def emit_function(mod, f, strong, out, stats):
             continue
         if nxt != pc + 4:  # la siguiente instrucción no está justo después: salto explícito
             out.append("    " + jump(pc + 4))
+    if local_dispatch:
+        out.append("nx_local_dispatch:")
+        out.append("    switch (nx_local_target) {")
+        for target in order:
+            out.append(f"    case 0x{target:x}ull: goto L_{target:x};")
+        out.append("    default: { NxFn fn = nx_buscar(nx_local_target); nx_tail(c, lr0); __attribute__((musttail)) return fn(c); }")
+        out.append("    }")
     out.append("}")
     out.append("")
+
+
+_EMITIR = None   # (prog, strong, sustituidas, bloques): lo heredan por fork los procesos de emitir_bloque
+
+
+def emitir_bloque(k):
+    """Escribe en memoria el C del bloque k: [(nombre de archivo, texto)], las estadísticas y cuántas funciones tiene."""
+    prog, strong, sustituidas, bloques = _EMITIR
+    stats = {"br_tabla": set(), "br_indirecto": set()}
+    archivos, buf = [], []
+
+    def flush():
+        if buf:
+            sufijo = f"_{len(archivos):03d}" if archivos else ""   # con ceros: el orden alfabético es el de las direcciones
+            archivos.append((f"funciones_{k:04d}{sufijo}.c", '#include "nxgame.h"\n\n' + "\n".join(buf) + "\n"))
+            buf.clear()
+
+    for f in bloques[k]:
+        if f in sustituidas:
+            buf.append(f"void {sustituidas[f]}(Ctx *c);")
+            # nx_enter consume un salto de cola pendiente: el juego suele llegar aquí con B/BR.
+            buf.append(f"void {fname(f)}(Ctx *c) {{ nx_enter(c); {sustituidas[f]}(c); }}")
+        else:
+            emit_function(prog, f, strong, buf, stats)
+        if len(buf) > LINES_PER_FILE:
+            flush()
+    flush()
+    return archivos, stats, len(bloques[k])
+
+
+def procesos_para_emitir(nbloques):
+    """Un proceso por núcleo, mientras la memoria disponible alcance para que cada uno crezca como este."""
+    cpus = os.cpu_count() or 1
+    try:
+        rss = int(next(l for l in open("/proc/self/status") if l.startswith("VmRSS:")).split()[1]) * 1024
+        libre = int(next(l for l in open("/proc/meminfo") if l.startswith("MemAvailable:")).split()[1]) * 1024
+        por_memoria = max(1, libre // max(rss // 2, 256 << 20))
+    except (OSError, StopIteration, ValueError):
+        por_memoria = cpus
+    return max(1, min(cpus, por_memoria, nbloques))
 
 
 def c_string(s):
@@ -217,7 +279,10 @@ def main():
     ap.add_argument("--traza", action="store_true", help="guardar en c->pc la dirección de cada instrucción")
     ap.add_argument("--pistas", help="archivo con direcciones (una por línea) que también son funciones: las "
                     "que el runtime anotó en NX_PISTAS al saltar a código sin recompilar")
+    ap.add_argument("--sustituir", help="archivo con líneas \"símbolo funcion_c\": la función del juego con ese "
+                    "símbolo no se recompila; su cuerpo llama a void funcion_c(Ctx *) del runtime (HLE, p. ej. NVN)")
     ap.add_argument("--progreso", action="store_true", help="líneas \"progreso i/n\" al escribir las funciones (para la app)")
+    ap.add_argument("--hilos", type=int, default=0, help="procesos que escriben el C (por defecto, según núcleos y memoria)")
     args = ap.parse_args()
     global TRACE
     TRACE = args.traza
@@ -238,51 +303,74 @@ def main():
             if prog.in_text(a) and not a & 3:
                 pistas.add(a)
         print(f"pistas: {len(pistas)} direcciones extra")
+    sustituidas = {}   # dirección -> función C del runtime que la reemplaza
+    if args.sustituir and os.path.exists(args.sustituir):
+        for linea in open(args.sustituir):
+            campos = linea.split("#")[0].split()
+            if len(campos) != 2:
+                continue
+            a = prog.symbols.get(campos[0])
+            if a is None or not prog.in_text(a):
+                print(f"sustituir: el símbolo {campos[0]} no existe en el juego (se ignora)")
+                continue
+            sustituidas[a] = campos[1]
+            pistas.add(a)
+        print(f"sustituir: {len(sustituidas)} funciones del juego reemplazadas por el runtime")
     strong, entries = discover(prog, prog.entry_points() | set(boot["inits"]) | pistas)
 
     os.makedirs(args.output, exist_ok=True)
-    for old in os.listdir(args.output):
-        if old.endswith(".c") or old.endswith(".h") or old.endswith(".bin"):
-            os.remove(os.path.join(args.output, old))
+    escritos = set()
+
+    def escribir(nombre, texto, modo="w"):
+        # Solo se reescribe lo que cambió: compilar.py reutiliza el objeto de un archivo con la fecha anterior.
+        escritos.add(nombre)
+        ruta = os.path.join(args.output, nombre)
+        try:
+            with open(ruta, "rb" if modo == "wb" else "r") as f:
+                if f.read() == texto:
+                    return
+        except OSError:
+            pass
+        with open(ruta, modo) as f:
+            f.write(texto)
 
     hdr = ['#pragma once', '#include "nxrt.h"', ""]
     hdr += [f"void {fname(f)}(Ctx *c);" for f in sorted(entries)]
-    open(os.path.join(args.output, "nxgame.h"), "w").write("\n".join(hdr) + "\n")
+    escribir("nxgame.h", "\n".join(hdr) + "\n")
 
+    # Los bloques tienen un número fijo de funciones contiguas, así la salida no depende de cuántos procesos la escriben.
+    global _EMITIR
+    orden = sorted(entries)
+    bloques = [orden[i:i + FUNCS_PER_BLOCK] for i in range(0, len(orden), FUNCS_PER_BLOCK)]
+    _EMITIR = (prog, strong, sustituidas, bloques)
+    hilos = args.hilos or procesos_para_emitir(len(bloques))
     stats = {"br_tabla": set(), "br_indirecto": set()}
-    part, buf, nfiles = 0, [], 0
-
-    def flush():
-        nonlocal part, buf, nfiles
-        if buf:
-            open(os.path.join(args.output, f"funciones_{part:03d}.c"), "w").write(
-                '#include "nxgame.h"\n\n' + "\n".join(buf) + "\n")
-            part += 1
-            nfiles += 1
-            buf = []
-
-    paso = max(1, len(entries) // 200)
-    for k, f in enumerate(sorted(entries)):
-        if args.progreso and k % paso == 0:
-            print(f"progreso {k}/{len(entries)}", flush=True)
-        emit_function(prog, f, strong, buf, stats)
-        if len(buf) > LINES_PER_FILE:
-            flush()
-    flush()
+    hechas = nfiles = 0
+    with multiprocessing.get_context("fork").Pool(hilos) as pool:
+        for archivos, st, n in pool.imap_unordered(emitir_bloque, range(len(bloques))):
+            for nombre, texto in archivos:
+                escribir(nombre, texto)
+            nfiles += len(archivos)
+            for k in stats:
+                stats[k] |= st[k]
+            hechas += n
+            if args.progreso:
+                print(f"progreso {hechas}/{len(entries)}", flush=True)
+    print(f"emisión: {len(bloques)} bloques en {hilos} procesos")
 
     out = ['#include "nxgame.h"', ""]
     for k, m in enumerate(prog.modules):
         path = os.path.abspath(os.path.join(args.output, f"modulo_{k}_{m.name}.bin"))
         # Un NSO se entrega reubicado (nxrecomp hace de rtld); un NRO se reubica solo al arrancar,
         # así que va con sus bytes originales: aplicar dos veces RELR sumaría la base dos veces.
-        open(path, "wb").write(m.img.original if m.img.kind == "nro" else m.img.data)
+        escribir(os.path.basename(path), m.img.original if m.img.kind == "nro" else m.img.data, "wb")
         asm = f'.section .rodata\n.balign 16\n.global nx_mod{k}\nnx_mod{k}:\n.incbin "{path}"\n.previous\n'
         out.append(f"__asm__({c_string(asm)});")
         out.append(f"extern const unsigned char nx_mod{k}[];")
     romfs = next((getattr(m.img, "romfs", b"") for m in prog.modules if getattr(m.img, "romfs", b"")), b"")
     if romfs:
         path = os.path.abspath(os.path.join(args.output, "romfs.bin"))
-        open(path, "wb").write(romfs)
+        escribir("romfs.bin", romfs, "wb")
         asm = f'.section .rodata\n.balign 16\n.global nx_romfs_data\nnx_romfs_data:\n.incbin "{path}"\n.previous\n'
         out.append(f"__asm__({c_string(asm)});")
         out.append("extern const unsigned char nx_romfs_data[];")
@@ -330,7 +418,10 @@ def main():
     out.append("    return salto_malo;")
     out.append("}")
     out.append("void nx_dispatch(Ctx *c, uint64_t a) { nx_buscar(a)(c); }")
-    open(os.path.join(args.output, "programa.c"), "w").write("\n".join(out) + "\n")
+    escribir("programa.c", "\n".join(out) + "\n")
+    for viejo in os.listdir(args.output):   # lo de una emisión anterior que ya no corresponde
+        if viejo.endswith((".c", ".h", ".bin")) and viejo not in escritos:
+            os.remove(os.path.join(args.output, viejo))
 
     print(f"{args.output}: {len(entries)} funciones en {nfiles} archivos; "
           f"{len(stats['br_tabla'])} tablas de salto resueltas, "

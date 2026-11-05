@@ -4,6 +4,9 @@
 #include "nxrt.h"
 
 #include <signal.h>
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <execinfo.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -74,11 +77,26 @@ void nx_trap(Ctx *c, uint64_t pc, uint32_t word, const char *why) {
 // Un salto indirecto a una dirección que el recompilador no vio como entrada. No se puede seguir,
 // pero se anota en NX_PISTAS (si está definido): la próxima recompilación la toma como función
 // (nxrecomp.py --pistas) y el juego pasa de ahí. NX2Linux lo hace solo.
+static void trace_host_stack(void) {
+    if (!getenv("NX_TRACE_BOOT")) return;
+    void *frames[32];
+    int count = backtrace(frames, 32);
+    for (int k = 0; k < count; k++) {
+        Dl_info frame = {0};
+        dladdr(frames[k], &frame);
+        fprintf(stderr, "[stack] %s +0x%llx\n", frame.dli_fname ? frame.dli_fname : "?",
+                (unsigned long long)((uintptr_t)frames[k] - (uintptr_t)frame.dli_fbase));
+    }
+}
+
 void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to) {
-    (void)c;
     fflush(stdout);
     fprintf(stderr, "[RED] salto indirecto a 0x%llx (desde 0x%llx): no es una función recompilada\n",
             (unsigned long long)to, (unsigned long long)from);
+    if (getenv("NX_TRACE_BOOT")) {
+        fprintf(stderr, "[nxrt] LR invitado: 0x%llx\n", (unsigned long long)c->x[30]);
+        trace_host_stack();
+    }
     const char *pistas = getenv("NX_PISTAS");
     FILE *f = pistas && *pistas ? fopen(pistas, "a") : NULL;
     if (f) {
@@ -239,13 +257,22 @@ void nx_vigia_tocar(uint64_t addr, uint64_t size) {
 }
 
 static void on_crash(int sig, siginfo_t *si, void *uc) {
-    (void)uc;
     // Un acceso a una página vigilada: se anota (o se copia lo que estaba en la GPU), se abre y la
     // instrucción se repite.
     if (sig == SIGSEGV && si->si_code == SEGV_ACCERR && abrir((uint64_t)(uintptr_t)si->si_addr >> VPAG)) return;
     fflush(stdout);
     fprintf(stderr, "\n[nxrt] %s en la dirección 0x%llx\n", sig == SIGSEGV ? "violación de segmento" : "error de bus",
             (unsigned long long)(uintptr_t)si->si_addr);
+#if defined(__x86_64__)
+    uintptr_t ip = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+    Dl_info info = {0};
+    dladdr((void *)ip, &info);
+    fprintf(stderr, "[nxrt] instrucción host: 0x%llx; desplazamiento ELF: 0x%llx\n",
+            (unsigned long long)ip, (unsigned long long)(ip - (uintptr_t)info.dli_fbase));
+    trace_host_stack();
+#else
+    (void)uc;
+#endif
     Ctx *c = crash_ctx;
     if (c) {
         fprintf(stderr, "[nxrt] última instrucción ARM: 0x%llx (0 si no se compiló con --traza)\n", (unsigned long long)c->pc);

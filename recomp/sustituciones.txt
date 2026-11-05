@@ -1,0 +1,3 @@
+# símbolo del juego -> función del runtime que lo reemplaza (nxrecomp.py --sustituir)
+# NVN en el host (HLE): el juego pide las funciones por nombre y recibe las del runtime.
+nvnBootstrapLoader nxhle_nvnBootstrapLoader

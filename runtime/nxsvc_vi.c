@@ -7,6 +7,7 @@
 //      QUEUE_BUFFER. Al encolar, el cuadro va a la pantalla (nxdisplay.c).
 // Estructuras como en libnx (display/parcel.c, buffer_producer.c, nvidia/graphic_buffer.h).
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,18 +21,27 @@
 #define OK 0
 
 // ---------- nvmap ----------
-typedef struct {
+typedef struct NvMapObj {
     uint32_t size, align, kind, id;
     uint64_t addr;
+    uint32_t handle;
+    struct NvMapObj *next;
 } NvMapObj;
-static NvMapObj nvmaps[256];
-static int nnvmaps;
+// Stable metadata addresses: allocating another buffer must not invalidate
+// mappings being consulted by another thread. Metadata lives for the process,
+// as before; capacity is now bounded by allocation failure, not 256 buffers.
+static _Atomic(NvMapObj *) nvmaps;
+static uint32_t next_nvmap_handle = 1;
 static pthread_mutex_t nv_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static NvMapObj *nvmap_by_handle(uint32_t h) { return h >= 1 && (int)h <= nnvmaps ? &nvmaps[h - 1] : NULL; }
+static NvMapObj *nvmap_by_handle(uint32_t h) {
+    for (NvMapObj *m = nvmaps; m; m = m->next)
+        if (m->handle == h) return m;
+    return NULL;
+}
 static NvMapObj *nvmap_by_id(uint32_t id) {
-    for (int k = 0; k < nnvmaps; k++)
-        if (nvmaps[k].id == id) return &nvmaps[k];
+    for (NvMapObj *m = nvmaps; m; m = m->next)
+        if (m->id == id) return m;
     return NULL;
 }
 
@@ -43,6 +53,8 @@ typedef struct {
     uint32_t layout, pitch, offset, block_height_log2;
 } Slot;
 static Slot slots[SLOTS];
+static uint8_t slot_flat[SLOTS][0x200];
+static uint32_t slot_flat_size[SLOTS];
 static int next_slot;
 static KEvent *buffer_event;
 static uint32_t buffer_event_h;
@@ -97,9 +109,17 @@ static void transact(uint32_t code, const uint8_t *in, uint32_t in_size, Reply *
         return;
     }
     case 14: { // SET_PREALLOCATED_BUFFER(ranura, hay buffer, GraphicBuffer aplanado)
+        if (in_size < 8) { put32(out, (uint32_t)-22); return; }
         int32_t s = (int32_t)u32at(in);
         if (s >= 0 && s < SLOTS && u32at(in + 4)) {
+            if (in_size < 16 || u32at(in + 8) < 0x90 || u32at(in + 8) > sizeof slot_flat[s]
+                || u32at(in + 8) > in_size - 16) {
+                put32(out, (uint32_t)-22);
+                return;
+            }
             const uint8_t *g = in + 16; // después de ranura, hay buffer, largo y fds
+            slot_flat_size[s] = u32at(in + 8);
+            memcpy(slot_flat[s], g, slot_flat_size[s]);
             Slot *sl = &slots[s];
             memset(sl, 0, sizeof *sl);
             sl->configured = 1;
@@ -137,7 +157,18 @@ static void transact(uint32_t code, const uint8_t *in, uint32_t in_size, Reply *
         put32(out, 0);
         return;
     }
-    case 1: put32(out, 0); put32(out, 0); return; // REQUEST_BUFFER: sin buffer (libnx usa los preasignados)
+    case 1: { // REQUEST_BUFFER: devolver el GraphicBuffer registrado, también para NVN.
+        int32_t s = in_size >= 4 ? (int32_t)u32at(in) : -1;
+        if (s >= 0 && s < SLOTS && slots[s].configured && slot_flat_size[s]) {
+            put32(out, 1);
+            put_flat(out, slot_flat[s], slot_flat_size[s]);
+            put32(out, 0);
+        } else {
+            put32(out, 0);
+            put32(out, (uint32_t)-22);
+        }
+        return;
+    }
     case 7: { // QUEUE_BUFFER(ranura, entrada) → el cuadro a la pantalla
         int32_t s = (int32_t)u32at(in);
         if (s >= 0 && s < SLOTS) {
@@ -180,6 +211,7 @@ static uint32_t binder_handle(ServiceObject *self, NxRequest *r) {
         uint32_t len = u32at(payload + 4);
         uint32_t skip = 8 + ((len + 1) * 2 + 3) / 4 * 4;
         Reply rep = {.size = 0};
+        if (getenv("NX_TRAZA_NV")) fprintf(stderr, "[binder] transacción %u\n", nx_in32(r, 4));
         pthread_mutex_lock(&nv_lock);
         transact(nx_in32(r, 4), payload + skip, psize > skip ? psize - skip : 0, &rep);
         pthread_mutex_unlock(&nv_lock);
@@ -218,17 +250,20 @@ static void *vsync_thread(void *arg) {
 // ---------- vi ----------
 static void native_window(NxRequest *r, uint64_t *size) {
     // Parcel con el binder de la cola: magia 2, pid 1, id 1, relleno y "dispdrv"
-    NxBuffer *b = r->nb ? &r->b[0] : NULL;
+    NxBuffer *b = nx_out_buffer(r, 0);
     uint8_t data[0x28] = {0};
     uint32_t w[3] = {2, 1, 1};
     memcpy(data, w, 12);
     memcpy(data + 0x18, "dispdrv", 8);
-    uint32_t hdr[4] = {sizeof data, 0x10, 0, 0x10 + sizeof data};
-    if (b && b->size >= 0x10 + sizeof data) {
+    // Android Parcel requires an object-offset entry for its flattened binder.
+    // libnx reads only the payload; the Nintendo SDK also validates this table.
+    uint32_t hdr[4] = {sizeof data, 0x10, 4, 0x10 + sizeof data};
+    if (b && b->size >= 0x14 + sizeof data) {
         memcpy((void *)(uintptr_t)b->addr, hdr, 0x10);
         memcpy((void *)(uintptr_t)(b->addr + 0x10), data, sizeof data);
+        memset((void *)(uintptr_t)(b->addr + 0x10 + sizeof data), 0, 4);
     }
-    *size = 0x10 + sizeof data;
+    *size = 0x14 + sizeof data;
 }
 
 static uint32_t system_display(ServiceObject *self, NxRequest *r) {
@@ -315,22 +350,27 @@ static struct {
 static uint32_t nvmap_ioctl(uint32_t nr, uint8_t *io) {
     switch (nr) {
     case 0x01: { // CREATE(tamaño) → handle
-        if (nnvmaps >= 256) return 0xA; // NvError_InsufficientMemory
-        NvMapObj *m = &nvmaps[nnvmaps++];
-        memset(m, 0, sizeof *m);
+        if (!next_nvmap_handle) return 0xA;
+        NvMapObj *m = calloc(1, sizeof *m);
+        if (!m) return 0xA; // NvError_InsufficientMemory
         m->size = u32at(io);
-        m->id = 0x100 + (uint32_t)nnvmaps;
-        uint32_t h = (uint32_t)nnvmaps;
+        uint32_t h = next_nvmap_handle++;
+        m->handle = h;
+        // All GPU clients here belong to the same guest process. NVN may
+        // import a shared pool only once, then reuse its ID for other slots;
+        // use the same object namespace for handles and exported IDs.
+        m->id = h;
+        m->next = nvmaps;
+        nvmaps = m;
         memcpy(io + 4, &h, 4);
         return 0;
     }
     case 0x03: { // FROM_ID(id) → handle
-        for (int k = 0; k < nnvmaps; k++)
-            if (nvmaps[k].id == u32at(io)) {
-                uint32_t h = (uint32_t)k + 1;
-                memcpy(io + 4, &h, 4);
-                return 0;
-            }
+        NvMapObj *m = nvmap_by_id(u32at(io));
+        if (m) {
+            memcpy(io + 4, &m->handle, 4);
+            return 0;
+        }
         return 4; // NvError_BadParameter
     }
     case 0x04: { // ALLOC(handle, heapmask, banderas, alineación, kind, dirección)
@@ -371,18 +411,99 @@ static void io32(uint8_t *io, uint32_t off, uint32_t v) { memcpy(io + off, &v, 4
 static void io64(uint8_t *io, uint32_t off, uint64_t v) { memcpy(io + off, &v, 8); }
 static uint64_t get64(const uint8_t *io, uint32_t off) { uint64_t v; memcpy(&v, io + off, 8); return v; }
 
+// QueryEvent must refer to the same event armed by WAIT_EVENT, rather than
+// creating an unrelated event that can never become signaled.
+// ABI: https://switchbrew.org/wiki/NV_services#NVHOST_IOCTL_CTRL_SYNCPT_WAIT_EVENT
+typedef struct {
+    KEvent *event;
+    uint32_t id, threshold;
+    int allocated, armed;
+} NvSyncEvent;
+static NvSyncEvent sync_events[64];
+
+static void sync_event_clear(NvSyncEvent *e) {
+    if (e->event) {
+        nx_kernel_lock();
+        e->event->signaled = 0;
+        nx_kernel_unlock();
+    }
+}
+
+static KEvent *sync_event_object(NvSyncEvent *e) {
+    if (!e->event) nx_event_new(&e->event); // keep a driver-owned handle
+    return e->event;
+}
+
+void nx_nvdrv_syncpt_changed(uint32_t id) {
+    pthread_mutex_lock(&nv_lock);
+    for (unsigned slot = 0; slot < 64; slot++) {
+        NvSyncEvent *e = &sync_events[slot];
+        if (e->armed && e->id == id && (int32_t)(nx_syncpt_read(id) - e->threshold) >= 0) {
+            e->armed = 0;
+            nx_event_signal(sync_event_object(e));
+            if (getenv("NX_TRAZA_NV")) fprintf(stderr, "[nv-event] signal slot=%u id=%u value=%u target=%u\n", slot, id, nx_syncpt_read(id), e->threshold);
+        }
+    }
+    pthread_mutex_unlock(&nv_lock);
+}
+
+static uint32_t sync_event_query(uint32_t encoded) {
+    unsigned slot = encoded & 0x10000000 ? encoded & 0xFFFF : encoded & 15;
+    pthread_mutex_lock(&nv_lock);
+    // EX clients can also query a previously registered slot directly.
+    if (!(encoded & 0x10000000) && encoded < 64 && sync_events[encoded].allocated)
+        slot = encoded;
+    if (slot >= 64) { pthread_mutex_unlock(&nv_lock); return 0; }
+    KEvent *event = sync_event_object(&sync_events[slot]);
+    nx_kernel_lock();
+    uint32_t handle = nx_handle_new(KO_EVENT, event, 0);
+    nx_kernel_unlock();
+    pthread_mutex_unlock(&nv_lock);
+    return handle;
+}
+
 static uint32_t ctrl_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-ctrl: syncpoints
     uint32_t id = u32at(io);
     switch (nr) {
     case 0x14: io32(io, 4, nx_syncpt_read(id)); return 0;                // SyncptRead
     case 0x15: nx_syncpt_incr(id); return 0;                              // SyncptIncr
     case 0x16: return nx_syncpt_wait(id, u32at(io + 4), (int32_t)u32at(io + 8) * 1000) ? 0 : 5; // SyncptWait
-    case 0x1D: case 0x1E: { // EventWait / EventWaitAsync: con todo en orden, el valor ya llegó
-        int ok = nx_syncpt_wait(id, u32at(io + 4), nr == 0x1E ? 0 : (int32_t)u32at(io + 8));
-        io32(io, 12, nx_syncpt_read(id));
-        return ok ? 0 : 5; // NvError_Timeout
+    case 0x1D: case 0x1E: { // EventWait / EventWaitAsync
+        if (id >= 192) return 4;
+        uint32_t threshold = u32at(io + 4);
+        pthread_mutex_lock(&nv_lock);
+        unsigned slot = nr == 0x1E ? u32at(io + 12) : 0;
+        if (nr == 0x1D)
+            while (slot < 64 && sync_events[slot].armed) slot++;
+        if (slot >= 64) { pthread_mutex_unlock(&nv_lock); return 4; }
+        NvSyncEvent *e = &sync_events[slot];
+        e->allocated = 1; e->id = id; e->threshold = threshold; e->armed = 0;
+        sync_event_clear(e);
+        uint32_t current = nx_syncpt_read(id);
+        if (getenv("NX_TRAZA_NV")) fprintf(stderr, "[nv-event] arm slot=%u id=%u value=%u target=%u\n", slot, id, current, threshold);
+        if ((int32_t)(current - threshold) >= 0) {
+            io32(io, 12, current);
+            pthread_mutex_unlock(&nv_lock);
+            return 0;
+        }
+        sync_event_object(e);
+        e->armed = 1;
+        io32(io, 12, nr == 0x1D ? 0x10000000u | (id << 16) | slot : (id << 4) | slot);
+        pthread_mutex_unlock(&nv_lock);
+        return 5; // pending: guest waits on QueryEvent's handle
     }
-    case 0x1C: case 0x1F: case 0x20: return 0; // EventSignal / EventRegister / EventUnregister
+    case 0x1C: case 0x1F: case 0x20: {
+        unsigned slot = u32at(io);
+        if (nr == 0x1C && (slot & 0x10000000)) slot &= 0xFFFF;
+        if (slot >= 64) return 4;
+        pthread_mutex_lock(&nv_lock);
+        NvSyncEvent *e = &sync_events[slot];
+        e->armed = 0;
+        if (nr != 0x1C) e->allocated = nr == 0x1F;
+        sync_event_clear(e);
+        pthread_mutex_unlock(&nv_lock);
+        return 0;
+    }
     }
     return 1;
 }
@@ -416,6 +537,15 @@ static uint32_t ctrl_gpu_ioctl(uint32_t nr, uint8_t *io) { // /dev/nvhost-ctrl-g
     case 0x1C: io64(io, 0, nx_now_ns()); return 0;                    // GetGpuTime
     }
     return 1;
+}
+
+static uint32_t ctrl_gpu_inline_out(NxRequest *r, uint32_t nr, const uint8_t *io) {
+    if (nr != 0x05) return 1;
+    NxBuffer *extra = nx_out_buffer(r, 1);
+    if (!extra || extra->size < 0xA0) return 4;
+    nx_vigia_tocar(extra->addr, 0xA0);
+    memcpy((void *)(uintptr_t)extra->addr, io + 16, 0xA0);
+    return 0;
 }
 
 static uint32_t as_ioctl(uint32_t nr, uint8_t *io, uint32_t size_io) { // /dev/nvhost-as-gpu: el espacio de direcciones
@@ -475,6 +605,7 @@ static uint32_t gpu_ioctl(uint32_t canal_actual, uint32_t type, uint32_t nr, uin
         uint32_t n = u32at(io + 8);
         const uint8_t *e = nr == 0x08 ? io + 24 : extra;
         if (!e || (nr == 0x1B && extra_size < (uint64_t)n * 8)) return 4;
+        if (getenv("NX_TRAZA_NV")) fprintf(stderr, "[nv-submit] flags=0x%x increment=%u before=%u\n", u32at(io + 12), u32at(io + 20), nx_syncpt_read(chan_syncpt));
         nx_gpu_submit(canal_actual, (const uint64_t *)e, n);
         io32(io, 16, chan_syncpt);
         io32(io, 20, nx_syncpt_read(chan_syncpt));
@@ -489,7 +620,7 @@ uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
     switch (r->cmd) {
     case 0: { // Open(ruta) → fd, error
         char path[64] = {0};
-        NxBuffer *b = r->na ? &r->a[0] : r->nx ? &r->x[0] : NULL;
+        NxBuffer *b = nx_in_buffer(r, 0);
         if (b) memcpy(path, (const void *)(uintptr_t)b->addr, b->size < 63 ? b->size : 63);
         int dev = !strcmp(path, "/dev/nvmap") ? DEV_NVMAP : !strcmp(path, "/dev/nvhost-ctrl") ? DEV_CTRL
                 : !strcmp(path, "/dev/nvhost-ctrl-gpu") ? DEV_CTRL_GPU : !strcmp(path, "/dev/nvhost-as-gpu") ? DEV_AS_GPU
@@ -529,6 +660,10 @@ uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
             NxBuffer *x = r->cmd == 11 ? nx_in_buffer(r, 1) : NULL;
             err = gpu_ioctl(fd, type, nr, io, x ? (const uint8_t *)(uintptr_t)x->addr : NULL, x ? x->size : 0);
         }
+        // Ioctl3 returns GetCharacteristics in its second output buffer. The
+        // primary 16-byte ioctl structure only contains size/address fields.
+        if (!err && r->cmd == 12 && dev == DEV_CTRL_GPU && nr == 0x05)
+            err = ctrl_gpu_inline_out(r, nr, io);
         if (err == 1)
             fprintf(stderr, "[RED] nvdrv: ioctl 0x%08x en %s no implementado\n", req, fd < 64 ? fds[fd].name : "?");
         static int trace = -1;
@@ -549,7 +684,15 @@ uint32_t nx_nvdrv(ServiceObject *self, NxRequest *r) {
         return OK;
     }
     case 3: nx_out32(r, 0); return OK; // Initialize(memoria de transferencia)
-    case 4: { KEvent *e; nx_out_copy_handle(r, nx_event_new(&e)); nx_out32(r, 0); return OK; } // QueryEvent
+    case 4: { // QueryEvent(fd, encoded event id)
+        uint32_t fd = nx_in32(r, 0), encoded = nx_in32(r, 4), handle;
+        if (fd < 64 && fds[fd].dev == DEV_CTRL) handle = sync_event_query(encoded);
+        else { KEvent *event; handle = nx_event_new(&event); }
+        if (handle) nx_out_copy_handle(r, handle);
+        nx_out32(r, handle ? 0 : 4);
+        if (getenv("NX_TRAZA_NV")) fprintf(stderr, "[nv] QueryEvent fd=%u id=0x%x handle=0x%x\n", fd, encoded, handle);
+        return OK;
+    }
     case 8: case 13: nx_out32(r, 0); return OK; // SetClientPID, SetGraphicsFirmwareMemoryMarginEnabled
     }
     return NX_R_UNKNOWN_CMD;

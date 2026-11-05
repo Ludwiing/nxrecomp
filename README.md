@@ -155,3 +155,16 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 8. **Integración con Omarchy**: un lanzador `.desktop`, mandos con SDL y ventana en Hyprland.
 
 Los juegos y las llaves tienen que ser tuyos, sacados de tu propia consola. Este repositorio no incluye nada de ningún juego.
+
+### Selección gráfica en Linux
+
+En Ajustes de cada juego, «API gráfica» permite elegir **OpenGL** o
+**Vulkan (Zink)**. Se aplica en el siguiente arranque. También puede usarse
+`NX_RENDERER=opengl` o `NX_RENDERER=vulkan` al ejecutar un juego directamente.
+
+La opción Vulkan ejecuta el renderer OpenGL existente a través de Zink de Mesa;
+no es una implementación directa NVN→Vulkan como la de OpenSmash. Requiere el
+proveedor EGL de Mesa, Zink y un driver Vulkan compatible. Si no se puede
+inicializar, termina con un error explícito; no cambia silenciosamente a OpenGL.
+La selección está implementada, pero todavía falta validar esta ruta en la GPU
+del escritorio. El bloqueo gráfico de Tears of the Kingdom sigue pendiente.

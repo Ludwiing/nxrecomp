@@ -386,6 +386,11 @@ static uint32_t wait_sync(uint64_t hptr, int32_t n, int64_t timeout, uint64_t *i
     if (n < 0 || n > 0x40) return R_OUT_OF_RES;
     const uint32_t *hs = (const uint32_t *)(uintptr_t)hptr;
     pthread_mutex_lock(&G);
+    if (getenv("NX_TRACE_WAITS")) {
+        fprintf(stderr, "[wait-sync] thread=%llu timeout=%lld handles=", (unsigned long long)cur->id, (long long)timeout);
+        for (int k = 0; k < n; k++) fprintf(stderr, " %x", hs[k]);
+        fprintf(stderr, "\n");
+    }
     struct timespec dl = timeout > 0 ? deadline(timeout) : (struct timespec){0};
     for (;;) {
         if (cur->cancel) {
