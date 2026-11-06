@@ -7,6 +7,7 @@ estado inicial. Compara x0-x30, sp, NZCV, v0-v31 y la memoria de prueba.
 Unicorn solo se usa aquí, para verificar; los ejecutables no lo incluyen.
 
     .venv/bin/python tests/fuzz.py --clase simd --n 20000
+    .venv/bin/python tests/fuzz.py --clase atom --cpu switch2   # atómicos LSE de ARMv8.1+
 """
 
 import argparse
@@ -39,6 +40,9 @@ CLASES = {
     "mem": lambda w: bits(w, 27, 27) == 1 and bits(w, 25, 25) == 0 and bits(w, 26, 26) == 0,
     "memv": lambda w: bits(w, 27, 27) == 1 and bits(w, 25, 25) == 0 and bits(w, 26, 26) == 1,
     "fp": lambda w: bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0,
+    # atómicos LSE (CAS, CASP, LDADD..., SWP), LDAPR y LDLAR/STLLR: solo con --cpu switch2
+    "atom": lambda w: bits(w, 29, 24) == 0b001000 and bits(w, 21, 21) | bits(w, 23, 23) or
+                      bits(w, 29, 27) == 0b111 and bits(w, 26, 24) == 0 and bits(w, 21, 21) and not bits(w, 11, 10),
     "simd": lambda w: bits(w, 27, 25) == 0b111 and not (bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0),
 }
 
@@ -79,9 +83,17 @@ def accepted(word):
     if i.kind != "op":
         return None
     text = " ".join(i.lines)
-    if "nx_" in text:  # svc, registros de sistema, DC ZVA: dependen del entorno
+    if any(f in text for f in ("nx_svc", "nx_mrs", "nx_msr", "nx_dc_zva")):  # dependen del entorno
         return None
     return i
+
+
+def armv81(w):
+    """CAS, CASP, LDLAR/STLLR, atómicos en memoria y LDAPR: no existen en el A57 de la Switch 1."""
+    if bits(w, 29, 24) == 0b001000:
+        o2, o1, o0 = bits(w, 23, 23), bits(w, 21, 21), bits(w, 15, 15)
+        return o1 and (o2 or not bits(w, 31, 31)) or o2 and not o1 and not o0
+    return bits(w, 29, 27) == 0b111 and bits(w, 26, 24) == 0 and bits(w, 21, 21) and not bits(w, 11, 10)
 
 
 def lit_pattern():
@@ -98,6 +110,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--clase", choices=sorted(CLASES) + ["todo"], default="todo")
     ap.add_argument("--n", type=int, default=5000)
+    ap.add_argument("--cpu", choices=["switch1", "switch2"], default="switch1",
+                    help="switch1: ARMv8.0 (Cortex-A57); switch2: ARMv8.2+ con LSE, RCpc, FP16, producto punto")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--mostrar", type=int, default=25)
     ap.add_argument("--palabra", type=lambda s: int(s, 16), action="append", help="probar solo esta instrucción")
@@ -107,7 +121,8 @@ def main():
 
     uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
     try:
-        uc.ctl_set_cpu_model(A.UC_CPU_ARM64_A72)  # ARMv8.0 como el Cortex-A57 de la Switch
+        # A72 = ARMv8.0 como el Cortex-A57 de la Switch; "max" de QEMU tiene todo lo del A78C de la Switch 2
+        uc.ctl_set_cpu_model(A.UC_CPU_ARM64_MAX if args.cpu == "switch2" else A.UC_CPU_ARM64_A72)
     except Exception:
         pass
     uc.mem_map(LIT_BASE, LIT_SIZE)
@@ -127,6 +142,13 @@ def main():
             w = r.getrandbits(32)
             if not any(CLASES[k](w) for k in clases):
                 continue
+        if args.cpu == "switch1" and armv81(w):
+            continue
+        # Unicorn 2 (QEMU 5) compara sin signo LDSMAX/LDSMIN de 8, 16 y 32 bits: ahí la referencia
+        # está mal. Esos casos los cubre tests/lse_test.c con resultados conocidos.
+        if bits(w, 29, 27) == 0b111 and bits(w, 26, 24) == 0 and bits(w, 21, 21) and not bits(w, 11, 10) \
+                and bits(w, 31, 30) != 3 and not bits(w, 15, 15) and bits(w, 14, 13) == 0b10:
+            continue
         ins = accepted(w)
         if ins is None:
             continue
@@ -146,6 +168,19 @@ def main():
                 x[rn] = base
             if rm != 31:
                 x[rm] = r.randrange(0, 0x40)
+            cas = bits(w, 29, 24) == 0b001000 and bits(w, 21, 21) and (bits(w, 23, 23) or bits(w, 31, 31) == 0)
+            if cas and r.random() < 0.5:
+                pat = pattern(len(tests))
+                off = base - SCRATCH
+                if bits(w, 23, 23):  # CAS: Rs = lo que hay en memoria
+                    n = 1 << bits(w, 31, 30)
+                    if rm != 31:
+                        x[rm] = int.from_bytes(pat[off:off + n], "little")
+                else:  # CASP: Rs, Rs+1
+                    n = 8 if bits(w, 30, 30) else 4
+                    for k in range(2):
+                        if rm + k != 31 and rm + k != rn:  # sin pisar la base
+                            x[rm + k] = int.from_bytes(pat[off + k * n:off + (k + 1) * n], "little")
         nzcv = r.getrandbits(4) << 28
         v = [rnd_vec(r) for _ in range(32)]
         t = len(tests)

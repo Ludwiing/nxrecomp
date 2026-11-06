@@ -169,6 +169,68 @@ static inline int nx_cas128(uint64_t a, uint64_t lo, uint64_t hi, uint64_t nlo, 
     return __sync_bool_compare_and_swap((unsigned __int128 *)(uintptr_t)a, e, n);
 }
 
+// ---------- atómicos LSE (ARMv8.1, los usa el código de Switch 2) ----------
+// LDADD, LDCLR, LDEOR, LDSET, SWP y los máximos/mínimos: devuelven el valor que había en memoria.
+// Siempre secuencialmente consistentes: en x86 toda operación con lock ya es una barrera completa.
+#define NX_LSE(bits, sbits)                                                                          \
+    static inline uint##bits##_t nx_ldadd##bits(uint64_t a, uint64_t v) {                            \
+        return __atomic_fetch_add((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)v, __ATOMIC_SEQ_CST); \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldclr##bits(uint64_t a, uint64_t v) {                            \
+        return __atomic_fetch_and((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)~v, __ATOMIC_SEQ_CST); \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldeor##bits(uint64_t a, uint64_t v) {                            \
+        return __atomic_fetch_xor((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)v, __ATOMIC_SEQ_CST); \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldset##bits(uint64_t a, uint64_t v) {                            \
+        return __atomic_fetch_or((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)v, __ATOMIC_SEQ_CST); \
+    }                                                                                                \
+    static inline uint##bits##_t nx_swp##bits(uint64_t a, uint64_t v) {                              \
+        return __atomic_exchange_n((uint##bits##_t *)(uintptr_t)a, (uint##bits##_t)v, __ATOMIC_SEQ_CST); \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldsmax##bits(uint64_t a, uint64_t v) {                           \
+        uint##bits##_t *p = (uint##bits##_t *)(uintptr_t)a, o = __atomic_load_n(p, __ATOMIC_SEQ_CST); \
+        while (!__atomic_compare_exchange_n(p, &o, (sbits)o > (sbits)v ? o : (uint##bits##_t)v, 0,    \
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}                    \
+        return o;                                                                                    \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldsmin##bits(uint64_t a, uint64_t v) {                           \
+        uint##bits##_t *p = (uint##bits##_t *)(uintptr_t)a, o = __atomic_load_n(p, __ATOMIC_SEQ_CST); \
+        while (!__atomic_compare_exchange_n(p, &o, (sbits)o < (sbits)v ? o : (uint##bits##_t)v, 0,    \
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}                    \
+        return o;                                                                                    \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldumax##bits(uint64_t a, uint64_t v) {                           \
+        uint##bits##_t *p = (uint##bits##_t *)(uintptr_t)a, o = __atomic_load_n(p, __ATOMIC_SEQ_CST); \
+        while (!__atomic_compare_exchange_n(p, &o, o > (uint##bits##_t)v ? o : (uint##bits##_t)v, 0,  \
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}                    \
+        return o;                                                                                    \
+    }                                                                                                \
+    static inline uint##bits##_t nx_ldumin##bits(uint64_t a, uint64_t v) {                           \
+        uint##bits##_t *p = (uint##bits##_t *)(uintptr_t)a, o = __atomic_load_n(p, __ATOMIC_SEQ_CST); \
+        while (!__atomic_compare_exchange_n(p, &o, o < (uint##bits##_t)v ? o : (uint##bits##_t)v, 0,  \
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}                    \
+        return o;                                                                                    \
+    }                                                                                                \
+    /* CAS: guarda `value` si la memoria vale `expected`; devuelve siempre lo que había. */           \
+    static inline uint##bits##_t nx_casv##bits(uint64_t a, uint64_t expected, uint64_t value) {      \
+        uint##bits##_t e = (uint##bits##_t)expected;                                                 \
+        __atomic_compare_exchange_n((uint##bits##_t *)(uintptr_t)a, &e, (uint##bits##_t)value, 0,    \
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                             \
+        return e;                                                                                    \
+    }
+NX_LSE(8, int8_t)
+NX_LSE(16, int16_t)
+NX_LSE(32, int32_t)
+NX_LSE(64, int64_t)
+// CASP de 64 bits: compara y cambia 16 bytes; deja en *lo/*hi lo que había.
+static inline void nx_casp128(uint64_t a, uint64_t *lo, uint64_t *hi, uint64_t nlo, uint64_t nhi) {
+    unsigned __int128 e = *lo | (unsigned __int128)*hi << 64, n = nlo | (unsigned __int128)nhi << 64;
+    unsigned __int128 o = __sync_val_compare_and_swap((unsigned __int128 *)(uintptr_t)a, e, n);
+    *lo = (uint64_t)o;
+    *hi = (uint64_t)(o >> 64);
+}
+
 static inline V128 ldq(uint64_t a) {
     V128 v;
     memcpy(&v, (const void *)(uintptr_t)a, 16);

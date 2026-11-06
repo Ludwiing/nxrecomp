@@ -123,3 +123,18 @@ Se marca [x] lo hecho.
    del runtime (sin válvulas ni carreras). [x] -O1 con las funciones de más de 5000 líneas en optnone: TotK compila en
    17 min y va a 30 fps estables (su tope en la Switch). [ ] Congelar regiones (mem_freeze).
    [x] Traductor de shaders bajo demanda (totk_xlate; NX2Linux pasa TOTK_XLATE y la caché del juego).
+
+## Switch 2
+
+La CPU es un Cortex-A78C (ARMv8.2 con RCpc, producto punto y autenticación de punteros); la GPU es
+Ampere (NVN2). Se avanza por capas, de lo más acotado a lo más grande. Pruebas de CPU:
+`tests/fuzz.py --cpu switch2` (Unicorn con la CPU "max" de QEMU) y `tests/lse_test.c`.
+
+1. [x] Atómicos LSE (ARMv8.1): CAS/CASP, LDADD/LDCLR/LDEOR/LDSET, LD{S,U}{MAX,MIN}, SWP en todas sus
+   variantes y tamaños; LDLAR/STLLR; LDAPR (ARMv8.3). Unicorn compara sin signo LDSMAX/LDSMIN de
+   8/16/32 bits: esos casos van en lse_test.c.
+2. [ ] Autenticación de punteros: PACIASP y compañía ya son hints (no hacen nada), así que AUT*,
+   XPAC*, RETAA/BRAA/BLRAA y LDRAA/LDRAB pueden tratarse como la identidad sobre el puntero.
+3. [ ] NEON de ARMv8.1/8.2: SQRDMLAH/SQRDMLSH, SDOT/UDOT, aritmética FP16 (escalar y vectorial).
+4. [ ] Formato de los ejecutables de Switch 2 (NSO/NPDM nuevos, si cambian) y servicios nuevos.
+5. [ ] GPU: NVN2, clases de Ampere y traductor de shaders SASS de Ampere (lo más grande).

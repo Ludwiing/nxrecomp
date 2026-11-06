@@ -5,8 +5,8 @@ manual de arquitectura de Arm. El resultado es un `Insn` con el tipo de control 
 flujo y las líneas de C que implementan la instrucción sobre el contexto `c`
 (registros x0-x30, sp y banderas NZCV) que define runtime/nxrt.h.
 
-Lo que todavía no está cubierto (SIMD/FP, atómicos LSE, CRC32, autenticación de
-punteros) se traduce a una llamada a nx_trap(), que detiene el programa con la
+Lo que todavía no está cubierto (autenticación de punteros fuera de los hints, FP16 y producto
+punto de ARMv8.2) se traduce a una llamada a nx_trap(), que detiene el programa con la
 dirección y la palabra de la instrucción.
 """
 
@@ -396,13 +396,16 @@ def loadstore(i, x):
             raise Unsupported("SIMD exclusivo")
         size, o2, l, o1, rs, o0 = bits(x, 31, 30), bits(x, 23, 23), bits(x, 22, 22), bits(x, 21, 21), bits(x, 20, 16), bits(x, 15, 15)
         rt2 = bits(x, 14, 10)
+        if o1 == 1 and (o2 == 1 or size < 2):  # CAS / CASP (ARMv8.1, Switch 2)
+            if rt2 != 31:
+                raise Unsupported("CAS con Rt2 distinto de 31")
+            lse_cas(i, size, o2, rs, rt, base)
+            return
         # Rt2 y Rs "deberían ser 1" en algunas formas; el procesador los ignora, igual que aquí.
-        if o2 == 1 and o0 == 0:
-            raise Unsupported("LDLAR/STLLR (ARMv8.1)")
         # STXR/STXP: el estado no puede ser el dato (Rt2 solo cuenta en los pares) ni la base (salvo SP).
         if not l and o2 == 0 and (rs == rt or (o1 and rs == rt2) or (rs == rn and rn != 31)):
             raise Unsupported("exclusiva UNPREDICTABLE")
-        if o2 == 1 and o1 == 0:  # LDAR / STLR
+        if o2 == 1 and o1 == 0:  # LDAR / STLR, y LDLAR / STLLR (ARMv8.1: más débiles, igual de correctas así)
             # STLR lleva además una barrera después: x86 deja pasar una carga posterior por delante de
             # un store, y el ThreadedStreamBuffer de Unity 2018 (store-release y luego una carga del
             # otro lado) perdía así un aviso y se colgaba (nxnative, FFCC).
@@ -433,7 +436,7 @@ def loadstore(i, x):
                            f"nx_cas64(a, (uint32_t)c->excl_val | c->excl_val2 << 32, (uint32_t){R(rt)} | (uint64_t){R(rt2)} << 32); "
                            f"c->excl_addr = ~0ull; {setr(rs, '!ok', 32)} }}"]
         else:
-            raise Unsupported("CAS (atómicos LSE)")
+            raise Unsupported("exclusiva no asignada")
         return
 
     if bits(x, 29, 27) == 0b011 and bits(x, 25, 24) == 0:  # LDR (literal)
@@ -511,9 +514,51 @@ def loadstore(i, x):
             off = extended(bits(x, 20, 16), option, size if s else 0, 64)
             i.lines = [f"{{ uint64_t a = {base} + {off}; {mem_op(size, opc, rt)} }}"]
             return
-        raise Unsupported("atómicos LSE (LDADD, SWP...)")
+        if bits(x, 11, 10) == 0b00:  # atómicos en memoria (ARMv8.1 LSE) y LDAPR (ARMv8.3 RCpc)
+            lse_atomic(i, x, size, rt, base)
+            return
+        raise Unsupported("load/store no soportado")
 
     raise Unsupported("load/store no soportado")
+
+
+LSE_OPS = {0: "ldadd", 1: "ldclr", 2: "ldeor", 3: "ldset", 4: "ldsmax", 5: "ldsmin", 6: "ldumax", 7: "ldumin"}
+
+
+def lse_atomic(i, x, size, rt, base):
+    """LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}/SWP{A}{L}{B,H}: Rt recibe lo que había en memoria y
+    la memoria queda con la operación aplicada con Rs. Con Rt = 31 son los alias ST* (sin resultado).
+    Todo se hace secuencialmente consistente, que cubre las variantes de adquirir y liberar."""
+    o3, opc, rs = bits(x, 15, 15), bits(x, 14, 12), bits(x, 20, 16)
+    w, reg_w = 8 << size, 64 if size == 3 else 32
+    if o3 == 0:
+        fn = LSE_OPS[opc]
+    elif opc == 0:
+        fn = "swp"
+    elif opc == 0b100 and bits(x, 23, 22) == 0b10 and rs == 31:  # LDAPR: carga con adquirir
+        i.lines = [f"{{ uint64_t a = {base}; {setr(rt, f'{LD[size]}(a)')} __atomic_thread_fence(__ATOMIC_SEQ_CST); }}"]
+        return
+    else:
+        raise Unsupported("atómico no asignado")
+    i.lines = [f"{{ uint64_t a = {base}; uint64_t o = nx_{fn}{w}(a, {R(rs)}); {setr(rt, 'o', reg_w)} }}"]
+
+
+def lse_cas(i, size, o2, rs, rt, base):
+    """CAS{A}{L}{B,H} (o2 = 1) y CASP{A}{L} (o2 = 0; el bit 30 elige W o X). Rs trae el valor esperado
+    y recibe el que había; Rt trae el nuevo. En CASP, Rs/Rs+1 y Rt/Rt+1 son pares (registros pares)."""
+    if o2:
+        w = 8 << size
+        i.lines = [f"{{ uint64_t a = {base}; uint64_t o = nx_casv{w}(a, {R(rs)}, {R(rt)}); "
+                   f"{setr(rs, 'o', 64 if size == 3 else 32)} }}"]
+        return
+    if rs & 1 or rt & 1:
+        raise Unsupported("CASP con registros impares")
+    if size & 1:  # CASP X: 16 bytes
+        i.lines = [f"{{ uint64_t a = {base}; uint64_t lo = {R(rs)}, hi = {R(rs + 1)}; "
+                   f"nx_casp128(a, &lo, &hi, {R(rt)}, {R(rt + 1)}); {setr(rs, 'lo')} {setr(rs + 1, 'hi')} }}"]
+    else:  # CASP W: 8 bytes, la mitad baja en la dirección menor
+        i.lines = [f"{{ uint64_t a = {base}; uint64_t o = nx_casv64(a, (uint32_t){R(rs)} | (uint64_t){R(rs + 1)} << 32, "
+                   f"(uint32_t){R(rt)} | (uint64_t){R(rt + 1)} << 32); {setr(rs, 'o', 32)} {setr(rs + 1, 'o >> 32', 32)} }}"]
 
 
 def dp_reg(i, x):
