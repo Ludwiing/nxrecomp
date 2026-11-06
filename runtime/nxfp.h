@@ -155,6 +155,18 @@ static inline uint32_t f2u32(double x, int mode, double scale) {
     return (uint32_t)r;
 }
 
+// FCVT*S/U de vectores de half: los elementos enteros también son de 16 bits
+static inline int16_t f2s16(double x, int mode, double scale) {
+    if (x != x) return 0;
+    double r = nx_round(x * scale, mode);
+    return r >= 32767.0 ? INT16_MAX : r <= -32768.0 ? INT16_MIN : (int16_t)r;
+}
+static inline uint16_t f2u16(double x, int mode, double scale) {
+    if (x != x) return 0;
+    double r = nx_round(x * scale, mode);
+    return r >= 65535.0 ? UINT16_MAX : r <= 0 ? 0 : (uint16_t)r;
+}
+
 // ---------- conversiones entre precisiones (FPConvert) ----------
 static inline uint64_t cvt_d_s(uint32_t a) {
     if (isnan32(a)) // el NaN conserva su carga útil y queda silencioso

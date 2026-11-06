@@ -124,7 +124,7 @@ FP_SAME = {
 def fp_expr(name, w, a="a", b="b", dd="dd"):
     U = UT[w]
     A, B, D = f"({U}){a}", f"({U}){b}", f"({U}){dd}"
-    sign = "0x80000000u" if w == 32 else "0x8000000000000000ull"
+    sign = {16: "0x8000u", 32: "0x80000000u", 64: "0x8000000000000000ull"}[w]
     ones = ONES[w]
     absm = f"~({U}){sign}"
     return {
@@ -156,6 +156,10 @@ def decode(i, x):
         return three_same_extra(i, x, q, u, size, rd, rn, rm, scalar)
     if bits(x, 24, 24) == 0 and bits(x, 21, 21) and bits(x, 11, 10) == 0:  # tres distintos
         return three_diff(i, x, q, u, size, rd, rn, rm, scalar)
+    if bits(x, 24, 24) == 0 and bits(x, 22, 21) == 0b10 and bits(x, 15, 14) == 0 and bits(x, 10, 10):
+        return three_same_fp16(i, x, q, u, rd, rn, rm, scalar)
+    if bits(x, 24, 24) == 0 and bits(x, 22, 17) == 0b111100 and bits(x, 11, 10) == 0b10:  # dos registros FP16
+        return two_misc_fp(i, bits(x, 16, 12), q, u, size, rd, rn, scalar, half=True)
     if bits(x, 24, 24) == 0 and bits(x, 21, 17) == 0b10000 and bits(x, 11, 10) == 0b10:
         return two_misc(i, x, q, u, size, rd, rn, scalar)
     if bits(x, 24, 24) == 0 and bits(x, 21, 17) == 0b11000 and bits(x, 11, 10) == 0b10:
@@ -187,6 +191,20 @@ def three_same_extra(i, x, q, u, size, rd, rn, rm, scalar):
     if op == 0b0010 and size == 2 and not scalar:  # SDOT / UDOT
         return lanes(i, rd, rn, rm, 32, 4 if q else 2, f"dd + dot4(a, b, {u})", read_d=True)
     raise Unsupported("tres iguales extra no soportado (FCMLA, FCADD, USDOT...)")
+
+
+def three_same_fp16(i, x, q, u, rd, rn, rm, scalar):
+    """Tres iguales de media precisión (ARMv8.2 FP16): la misma tabla que FP de 32/64 bits."""
+    key = (u, bits(x, 23, 23), bits(x, 13, 11))
+    if key not in FP_SAME:
+        raise Unsupported("FP16 vectorial no asignado")
+    name, pw = FP_SAME[key]
+    if scalar and (pw or name in ("fmla", "fmls", "fmaxnm", "fminnm", "fadd", "fsub", "fmul", "fdiv", "fmax", "fmin")):
+        raise Unsupported("FP16 escalar no asignado")
+    count = 1 if scalar else 8 if q else 4
+    if pw:
+        return pairwise(i, rd, rn, rm, 16, count, fp_expr(name, 16))
+    return lanes(i, rd, rn, rm, 16, count, fp_expr(name, 16), read_d=name in ("fmla", "fmls"))
 
 
 def three_same(i, x, q, u, size, rd, rn, rm, scalar):
@@ -377,9 +395,13 @@ def two_misc(i, x, q, u, size, rd, rn, scalar):
     raise Unsupported("dos registros no asignado")
 
 
-def two_misc_fp(i, op, q, u, size, rd, rn, scalar):
+def two_misc_fp(i, op, q, u, size, rd, rn, scalar, half=False):
     sz, a = size & 1, size >> 1
-    w = 64 if sz else 32
+    w = 16 if half else 64 if sz else 32
+    if half:
+        sz = 0
+        if op in (0b10110, 0b10111) or op == 0b11100 and a:
+            raise Unsupported("FP16 de dos registros no asignado")
     if op in (0b10110, 0b10111):  # FCVTN / FCVTXN / FCVTL
         if a:
             raise Unsupported("conversión no asignada")
@@ -404,7 +426,7 @@ def two_misc_fp(i, op, q, u, size, rd, rn, scalar):
     count = 1 if scalar else (128 if q else 64) // w
     U = UT[w]
     A = f"({U})a"
-    sign = "0x80000000u" if w == 32 else "0x8000000000000000ull"
+    sign = {16: "0x8000u", 32: "0x80000000u", 64: "0x8000000000000000ull"}[w]
     ones = ONES[w]
     zero = f"({U})0"
     rint = {(0, 0, 0b11000): 0, (0, 0, 0b11001): 2, (0, 1, 0b11000): 1, (0, 1, 0b11001): 3,
@@ -421,7 +443,7 @@ def two_misc_fp(i, op, q, u, size, rd, rn, scalar):
     elif op == 0b11101 and not a:  # SCVTF / UCVTF
         ty = "float" if w == 32 else "double"
         it = f"{'uint' if u else 'int'}{w}_t"
-        e = f"u{w}of(({ty})({it})a)"
+        e = f"{'u' if u else 's'}cvtf_h(({it})a, 0)" if w == 16 else f"u{w}of(({ty})({it})a)"
     elif key == (0, 1, 0b01100):
         e = f"fcmp{w}({A}, {zero}) == 2 ? {ones} : 0"
     elif key == (0, 1, 0b01101):
@@ -453,6 +475,19 @@ def two_misc_fp(i, op, q, u, size, rd, rn, scalar):
 
 def across(i, x, q, u, size, rd, rn, scalar):
     op = bits(x, 16, 12)
+    if scalar and not u and not size & 1 and op in (0b01100, 0b01101, 0b01111):  # FP16 por pares escalar
+        if op == 0b01101 and size >> 1:
+            raise Unsupported("FADDP de half no asignado")
+        name = {0b01100: "fminnm" if size >> 1 else "fmaxnm", 0b01101: "fadd", 0b01111: "fmin" if size >> 1 else "fmax"}[op]
+        return lanes(i, rd, rn, None, 16, 1, fp_expr(name, 16, b=f"c->vr[{rn}].h[1]"))
+    if not scalar and not u and not size & 1 and op in (0b01100, 0b01111):  # FMAXNMV... de half
+        name = {0b01100: "fminnm" if size >> 1 else "fmaxnm", 0b01111: "fmin" if size >> 1 else "fmax"}[op]
+        # Reduce() de Arm: mitades recursivas, o sea un árbol de pares
+        out = [f"V128 A = c->vr[{rn}];", f"uint16_t t[8]; for (int e = 0; e < {8 if q else 4}; e++) t[e] = A.h[e];"]
+        for n in ((8, 4, 2) if q else (4, 2)):
+            out.append(f"for (int e = 0; e < {n // 2}; e++) t[e] = {name}16(t[2 * e], t[2 * e + 1]);")
+        out.append(f"wrv16(c, {rd}, t[0]);")
+        return block(i, out)
     if scalar:  # por pares escalar: ADDP, FADDP, FMAXP...
         if op == 0b11011 and not u:
             if size != 3:
@@ -563,8 +598,14 @@ def expand_imm(op, cmode, imm8):
 
 def modified_imm(i, x, q, op, rd):
     cmode, o2 = bits(x, 15, 12), bits(x, 11, 11)
-    if o2:
-        raise Unsupported("FMOV de media precisión (ARMv8.2)")
+    if o2:  # FMOV (vector, half) de ARMv8.2
+        if op or cmode != 0b1111:
+            raise Unsupported("inmediato con o2 no asignado")
+        from simd import vfp_expand_imm
+        h = vfp_expand_imm(bits(x, 18, 16) << 5 | bits(x, 9, 5), 16)
+        v = h * 0x0001000100010001
+        return block(i, [f"V128 Rr = {{0}}; Rr.d[0] = 0x{v:x}ull;" + (f" Rr.d[1] = 0x{v:x}ull;" if q else ""),
+                         f"c->vr[{rd}] = Rr;"])
     imm8 = bits(x, 18, 16) << 5 | bits(x, 9, 5)
     if cmode == 0b1111 and op and not q:
         raise Unsupported("FMOV double en vector de 64")
@@ -634,9 +675,15 @@ def shift_imm(i, x, q, u, rd, rn, scalar):
         n = 64 // es
         return lanes(i, rd, rn, None, es, n, f"(uint64_t)({a} * ((i128)1 << {lsh}))", res_es=2 * es, a_off=n * q)
     if op in (0b11100, 0b11111):  # SCVTF / UCVTF / FCVTZS / FCVTZU con punto fijo
-        if es not in (32, 64):
-            raise Unsupported("punto fijo de media precisión")
+        if es == 8:
+            raise Unsupported("punto fijo de 8 bits")
         fb = rsh
+        if es == 16:  # half (ARMv8.2)
+            if op == 0b11100:
+                e = f"{'u' if u else 's'}cvtf_h(({'uint' if u else 'int'}16_t)a, {fb})"
+            else:
+                e = f"f2{'u' if u else 's'}16(fval16((uint16_t)a), 3, 0x1p{fb})"
+            return lanes(i, rd, rn, None, 16, count, e)
         if op == 0b11100:
             ty = "float" if es == 32 else "double"
             e = f"u{es}of(({ty})({'uint' if u else 'int'}{es}_t)a * ({ty})0x1p-{fb})"
@@ -650,9 +697,14 @@ def by_element(i, x, q, u, size, rd, rn, scalar):
     op, l, mbit, h = bits(x, 15, 12), bits(x, 21, 21), bits(x, 20, 20), bits(x, 11, 11)
     rm4 = bits(x, 19, 16)
     fp = op in (0b0001, 0b0101, 0b1001) and not (u and op != 0b1001)
+    if fp and size == 0:  # FMLA/FMLS/FMUL/FMULX por elemento de half (ARMv8.2): índice H:L:M, Vm de 0 a 15
+        b = f"c->vr[{rm4}].h[{h << 2 | l << 1 | mbit}]"
+        name = {0b0001: "fmla", 0b0101: "fmls", 0b1001: "fmulx" if u else "fmul"}[op]
+        count = 1 if scalar else 8 if q else 4
+        return lanes(i, rd, rn, None, 16, count, fp_expr(name, 16, b=b), read_d=name in ("fmla", "fmls"))
     if fp:
         if not size >> 1:
-            raise Unsupported("FP por elemento de media precisión")
+            raise Unsupported("FP por elemento inválido")
         sz = size & 1
         w = 64 if sz else 32
         if sz and (l or (not q and not scalar)):

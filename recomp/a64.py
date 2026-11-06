@@ -6,8 +6,7 @@ flujo y las líneas de C que implementan la instrucción sobre el contexto `c`
 (registros x0-x30, sp y banderas NZCV) que define runtime/nxrt.h.
 
 La autenticación de punteros de ARMv8.3 (Switch 2) se traduce como desactivada: firmar y
-autenticar no cambian el puntero. Lo que todavía no está cubierto (PACGA, FP16 y producto punto
-de ARMv8.2) se traduce a una llamada a nx_trap(), que detiene el programa con la
+autenticar no cambian el puntero. Lo que todavía no está cubierto (PACGA, FCMLA/FCADD) se traduce a una llamada a nx_trap(), que detiene el programa con la
 dirección y la palabra de la instrucción.
 """
 

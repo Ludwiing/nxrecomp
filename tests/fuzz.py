@@ -13,6 +13,7 @@ Unicorn solo se usa aquí, para verificar; los ejecutables no lo incluyen.
 import argparse
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -50,6 +51,8 @@ CLASES = {
     "neon82": lambda w: neon82(w),
     # FP de media precisión (ARMv8.2 FP16): solo con --cpu switch2
     "fp16": lambda w: fp16(w),
+    # NEON de media precisión: se elige por la traducción (usa helpers de 16 bits), ver es_fp16()
+    "fp16v": lambda w: bits(w, 27, 25) == 0b111 and not (bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0),
     "simd": lambda w: bits(w, 27, 25) == 0b111 and not (bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0),
 }
 
@@ -104,6 +107,18 @@ def neon82(w):
         return True
     return bits(w, 24, 24) and not bits(w, 10, 10) and bits(w, 15, 12) in (0b1101, 0b1110, 0b1111) and \
         (bits(w, 29, 29) or bits(w, 15, 12) == 0b1110)
+
+
+FP16_C = re.compile(r"(fadd|fsub|fmul|fmulx|fdiv|fabd|fsqrt|fmuladd|fmax|fmin|fmaxnm|fminnm|fcmp|frint|frecps|frsqrts|"
+                    r"f2s|f2u|fval)16\(|cvtf_h\(|(frecpe|frsqrte|frecpx)\([^;]*, 16\)")
+
+
+def es_fp16(w, ins):
+    """Aritmética de half de ARMv8.2: por lo que genera la traducción, más el FMOV vectorial de half."""
+    fmov_h = bits(w, 31, 31) == 0 and bits(w, 29, 19) == 0b00111100000 and bits(w, 15, 10) == 0b111111
+    # dos registros de half (FABS/FNEG son solo máscaras de bits, sin helpers de 16 bits)
+    misc_h = bits(w, 27, 24) == 0b1110 and bits(w, 22, 17) == 0b111100 and bits(w, 11, 10) == 0b10
+    return fmov_h or misc_h or bool(FP16_C.search(" ".join(ins.lines)))
 
 
 def fp16(w):
@@ -183,6 +198,12 @@ def main():
             continue
         ins = accepted(w)
         if ins is None:
+            continue
+        if args.cpu == "switch1" and es_fp16(w, ins) or clases == ["fp16v"] and not es_fp16(w, ins):
+            continue
+        # Unicorn extiende el signo a 32 bits en FCVTZS Hd, Hn, #fbits (escalar, punto fijo); Arm deja en
+        # cero todo lo que está por encima de los 16 bits, como hace la forma vectorial que sí coincide.
+        if bits(w, 31, 23) == 0b010111110 and bits(w, 22, 20) == 0b001 and bits(w, 15, 10) == 0b111111:
             continue
         # LDR literal: los bits 9:5 y 20:16 son parte del inmediato, no registros base/índice
         literal = bits(w, 29, 27) == 0b011 and bits(w, 25, 24) == 0

@@ -137,6 +137,10 @@ Ampere (NVN2). Se avanza por capas, de lo más acotado a lo más grande. Pruebas
    hints vacíos, PAC*/AUT*/XPAC* dejan el registro igual, BRAA/BLRAA/RETAA (y las Z y B) son saltos
    normales y LDRAA/LDRAB usan la base tal cual. Unicorn trae la autenticación apagada, así que la
    clase `pac` del fuzzer la compara exacta. Falta PACGA (calcula una firma; no se ha visto usada).
-3. [ ] NEON de ARMv8.1/8.2: SQRDMLAH/SQRDMLSH, SDOT/UDOT, aritmética FP16 (escalar y vectorial).
+3. [x] NEON de ARMv8.1/8.2: SQRDMLAH/SQRDMLSH y SDOT/UDOT (vector, escalar y por elemento; clase
+   `neon82`). Aritmética FP16 escalar (clase `fp16`) y vectorial (clase `fp16v`: tres iguales, dos
+   registros, reducciones, por pares, por elemento, FMOV inmediato y punto fijo), con los mismos
+   helpers que 32/64 bits instanciados para `_Float16`. Unicorn extiende el signo en FCVTZS Hd, Hn,
+   #fbits: ese caso se salta. No están FCMLA/FCADD/FJCVTZS (ARMv8.3 opcionales que el A78 no tiene).
 4. [ ] Formato de los ejecutables de Switch 2 (NSO/NPDM nuevos, si cambian) y servicios nuevos.
 5. [ ] GPU: NVN2, clases de Ampere y traductor de shaders SASS de Ampere (lo más grande).

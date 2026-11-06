@@ -10,6 +10,7 @@
 #include <float.h>
 #define FLT_MIN_32 FLT_MIN
 #define FLT_MIN_64 DBL_MIN
+#define FLT_MIN_16 6.103515625e-05 /* 2^-14, el menor half normal */
 
 typedef __int128 i128;
 
@@ -118,10 +119,15 @@ static inline unsigned __int128 pmul128(uint64_t a, uint64_t b) {
 NX_SIMD_FP(32, uint32_t, float, 0x80000000u, 0x7F800000u, 0x3F800000u, 0x40000000u, 0x3FC00000u, 0x40400000u, f)
 NX_SIMD_FP(64, uint64_t, double, 0x8000000000000000ull, 0x7FF0000000000000ull, 0x3FF0000000000000ull,
            0x4000000000000000ull, 0x3FF8000000000000ull, 0x4008000000000000ull, )
+NX_SIMD_FP(16, uint16_t, _Float16, 0x8000u, 0x7C00u, 0x3C00u, 0x4000u, 0x3E00u, 0x4200u, h16)
 
-// FRECPE (FPRecipEstimate). `w` es 32 o 64; los bits llegan en un uint64_t.
+// bits de fracción y de exponente de un formato de `w` bits (16, 32 o 64)
+static inline int fp_fbits(int w) { return w == 16 ? 10 : w == 32 ? 23 : 52; }
+static inline int fp_ebits(int w) { return w == 16 ? 5 : w == 32 ? 8 : 11; }
+
+// FRECPE (FPRecipEstimate). `w` es 16, 32 o 64; los bits llegan en un uint64_t.
 static inline uint64_t frecpe(uint64_t op, int w) {
-    int fbits = w == 32 ? 23 : 52, ebits = w == 32 ? 8 : 11;
+    int fbits = fp_fbits(w), ebits = fp_ebits(w);
     uint64_t sign = op >> (w - 1) & 1;
     int exp = (int)(op >> fbits & ((1u << ebits) - 1));
     uint64_t frac = op & ((1ull << fbits) - 1);
@@ -139,7 +145,7 @@ static inline uint64_t frecpe(uint64_t op, int w) {
         else f52 = (f52 << 1) & ((1ull << 52) - 1);
     }
     uint64_t scaled = (1u << 8) | (f52 >> 44 & 0xFF);
-    int rexp = (w == 32 ? 253 : 2045) - exp;
+    int rexp = (w == 16 ? 29 : w == 32 ? 253 : 2045) - exp; // 2 × sesgo - 1
     uint64_t est = recip_est[scaled - 256];
     uint64_t rf = (est & 0xFF) << 44;
     if (rexp == 0) rf = (1ull << 51) | rf >> 1;
@@ -149,14 +155,14 @@ static inline uint64_t frecpe(uint64_t op, int w) {
 
 // FRSQRTE (FPRSqrtEstimate)
 static inline uint64_t frsqrte(uint64_t op, int w) {
-    int fbits = w == 32 ? 23 : 52, ebits = w == 32 ? 8 : 11;
+    int fbits = fp_fbits(w), ebits = fp_ebits(w);
     uint64_t sign = op >> (w - 1) & 1;
     int exp = (int)(op >> fbits & ((1u << ebits) - 1));
     uint64_t frac = op & ((1ull << fbits) - 1);
     uint64_t expmax = (1ull << ebits) - 1;
     if (exp == (int)expmax && frac) return op | (1ull << (fbits - 1));
     if (exp == 0 && frac == 0) return sign << (w - 1) | expmax << fbits;
-    if (sign) return w == 32 ? 0x7FC00000u : 0x7FF8000000000000ull;
+    if (sign) return w == 16 ? 0x7E00u : w == 32 ? 0x7FC00000u : 0x7FF8000000000000ull;
     if (exp == (int)expmax) return 0;
     uint64_t f52 = frac << (52 - fbits);
     if (exp == 0) {
@@ -164,7 +170,7 @@ static inline uint64_t frsqrte(uint64_t op, int w) {
         f52 = (f52 << 1) & ((1ull << 52) - 1);
     }
     uint64_t scaled = !(exp & 1) ? (1u << 8) | (f52 >> 44 & 0xFF) : (1u << 7) | (f52 >> 45 & 0x7F);
-    int num = (w == 32 ? 380 : 3068) - exp;
+    int num = (w == 16 ? 44 : w == 32 ? 380 : 3068) - exp; // 3 × sesgo - 1
     int rexp = num >= 0 ? num / 2 : -((-num + 1) / 2);
     uint64_t est = rsqrt_est[scaled - 128];
     return (uint64_t)rexp << fbits | (est & 0xFF) << (fbits - 8);
@@ -181,7 +187,7 @@ static inline uint32_t ursqrte(uint32_t op) {
 
 // FRECPX
 static inline uint64_t frecpx(uint64_t op, int w) {
-    int fbits = w == 32 ? 23 : 52, ebits = w == 32 ? 8 : 11;
+    int fbits = fp_fbits(w), ebits = fp_ebits(w);
     uint64_t expmax = (1ull << ebits) - 1;
     uint64_t exp = op >> fbits & expmax, frac = op & ((1ull << fbits) - 1), sign = op >> (w - 1) & 1;
     if (exp == expmax && frac) return op | (1ull << (fbits - 1));
