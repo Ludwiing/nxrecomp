@@ -5,8 +5,9 @@ manual de arquitectura de Arm. El resultado es un `Insn` con el tipo de control 
 flujo y las líneas de C que implementan la instrucción sobre el contexto `c`
 (registros x0-x30, sp y banderas NZCV) que define runtime/nxrt.h.
 
-Lo que todavía no está cubierto (autenticación de punteros fuera de los hints, FP16 y producto
-punto de ARMv8.2) se traduce a una llamada a nx_trap(), que detiene el programa con la
+La autenticación de punteros de ARMv8.3 (Switch 2) se traduce como desactivada: firmar y
+autenticar no cambian el puntero. Lo que todavía no está cubierto (PACGA, FP16 y producto punto
+de ARMv8.2) se traduce a una llamada a nx_trap(), que detiene el programa con la
 dirección y la palabra de la instrucción.
 """
 
@@ -312,8 +313,18 @@ def branch_sys(i, x):
         system(i, x)
     elif bits(x, 31, 25) == 0b1101011:  # saltos a registro
         opc, op2, op3, rn, op4 = bits(x, 24, 21), bits(x, 20, 16), bits(x, 15, 10), bits(x, 9, 5), bits(x, 4, 0)
-        if op2 != 0x1F or op3 != 0 or op4 != 0:
-            raise Unsupported("salto con autenticación de punteros")
+        if op2 != 0x1F:
+            raise Unsupported("salto a registro no soportado")
+        if op3 >> 1 == 0b00001:  # BRAA/BRAB(Z), BLRAA/BLRAB(Z), RETAA/RETAB (ARMv8.3, Switch 2)
+            # La autenticación de punteros va desactivada: firmar no cambia el puntero (PACIASP y
+            # compañía son hints vacíos), así que autenticar tampoco y estos son saltos normales.
+            if opc in (0, 1, 2) and op4 != 31 or opc == 2 and rn != 31 or opc not in (0, 1, 2, 8, 9):
+                raise Unsupported("salto con autenticación no asignado")
+            opc &= 3
+            if opc == 2:
+                rn = 30
+        elif op3 != 0 or op4 != 0:
+            raise Unsupported("salto a registro no soportado")
         if opc == 0:
             i.kind, i.reg, i.reg_num = "br", R(rn), rn
         elif opc == 1:
@@ -517,6 +528,13 @@ def loadstore(i, x):
         if bits(x, 11, 10) == 0b00:  # atómicos en memoria (ARMv8.1 LSE) y LDAPR (ARMv8.3 RCpc)
             lse_atomic(i, x, size, rt, base)
             return
+        if size == 3 and bits(x, 10, 10):  # LDRAA/LDRAB (ARMv8.3): la base no lleva firma, se usa tal cual
+            off = sext(bits(x, 22, 22) << 9 | bits(x, 20, 12), 10) << 3
+            wb = bits(x, 11, 11)
+            if wb and rn == rt and rn != 31:
+                raise Unsupported("writeback UNPREDICTABLE")
+            i.lines = [f"{{ uint64_t a = {base} + {off}; {f'{base} = a; ' if wb else ''}{setr(rt, 'ld64(a)')} }}"]
+            return
         raise Unsupported("load/store no soportado")
 
     raise Unsupported("load/store no soportado")
@@ -652,6 +670,13 @@ def dp_reg(i, x):
                 raise Unsupported("procesamiento de 2 fuentes no soportado")
             i.lines = [setr(rd, ops[opcode], w)]
         else:  # 1 fuente
+            if bits(x, 20, 16) == 1 and sf and not bits(x, 29, 29):  # PAC*, AUT*, XPAC* (ARMv8.3)
+                # Autenticación desactivada (ver los saltos con autenticación): el puntero no cambia.
+                # XPAC quita una firma que nunca se puso, y los punteros válidos no traen bits de más.
+                if opcode >= 18 or opcode >= 8 and rn != 31:
+                    raise Unsupported("PAC no asignado")
+                i.lines = ["/* PAC/AUT/XPAC: identidad */"]
+                return
             if bits(x, 20, 16) or bits(x, 29, 29):
                 raise Unsupported("PAC u otra instrucción de 1 fuente")
             if opcode == 0:

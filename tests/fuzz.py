@@ -43,6 +43,9 @@ CLASES = {
     # atómicos LSE (CAS, CASP, LDADD..., SWP), LDAPR y LDLAR/STLLR: solo con --cpu switch2
     "atom": lambda w: bits(w, 29, 24) == 0b001000 and bits(w, 21, 21) | bits(w, 23, 23) or
                       bits(w, 29, 27) == 0b111 and bits(w, 26, 24) == 0 and bits(w, 21, 21) and not bits(w, 11, 10),
+    # PAC*/AUT*/XPAC* y LDRAA/LDRAB: solo con --cpu switch2 (Unicorn trae la autenticación apagada)
+    "pac": lambda w: bits(w, 30, 21) == 0b1011010110 and bits(w, 20, 16) == 1 or
+                     bits(w, 31, 24) == 0b11111000 and bits(w, 21, 21) and bits(w, 10, 10),
     "simd": lambda w: bits(w, 27, 25) == 0b111 and not (bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0),
 }
 
@@ -89,7 +92,11 @@ def accepted(word):
 
 
 def armv81(w):
-    """CAS, CASP, LDLAR/STLLR, atómicos en memoria y LDAPR: no existen en el A57 de la Switch 1."""
+    """CAS, CASP, LDLAR/STLLR, atómicos en memoria, LDAPR y autenticación de punteros (PAC*, AUT*,
+    XPAC*, LDRAA): no existen en el A57 de la Switch 1."""
+    if bits(w, 30, 21) == 0b1011010110 and bits(w, 20, 16) == 1 or \
+            bits(w, 31, 24) == 0b11111000 and bits(w, 21, 21) and bits(w, 10, 10):
+        return True
     if bits(w, 29, 24) == 0b001000:
         o2, o1, o0 = bits(w, 23, 23), bits(w, 21, 21), bits(w, 15, 15)
         return o1 and (o2 or not bits(w, 31, 31)) or o2 and not o1 and not o0

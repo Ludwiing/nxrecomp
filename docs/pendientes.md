@@ -133,8 +133,10 @@ Ampere (NVN2). Se avanza por capas, de lo más acotado a lo más grande. Pruebas
 1. [x] Atómicos LSE (ARMv8.1): CAS/CASP, LDADD/LDCLR/LDEOR/LDSET, LD{S,U}{MAX,MIN}, SWP en todas sus
    variantes y tamaños; LDLAR/STLLR; LDAPR (ARMv8.3). Unicorn compara sin signo LDSMAX/LDSMIN de
    8/16/32 bits: esos casos van en lse_test.c.
-2. [ ] Autenticación de punteros: PACIASP y compañía ya son hints (no hacen nada), así que AUT*,
-   XPAC*, RETAA/BRAA/BLRAA y LDRAA/LDRAB pueden tratarse como la identidad sobre el puntero.
+2. [x] Autenticación de punteros, desactivada (como con SCTLR_EL1.EnIA = 0): PACIASP y compañía son
+   hints vacíos, PAC*/AUT*/XPAC* dejan el registro igual, BRAA/BLRAA/RETAA (y las Z y B) son saltos
+   normales y LDRAA/LDRAB usan la base tal cual. Unicorn trae la autenticación apagada, así que la
+   clase `pac` del fuzzer la compara exacta. Falta PACGA (calcula una firma; no se ha visto usada).
 3. [ ] NEON de ARMv8.1/8.2: SQRDMLAH/SQRDMLSH, SDOT/UDOT, aritmética FP16 (escalar y vectorial).
 4. [ ] Formato de los ejecutables de Switch 2 (NSO/NPDM nuevos, si cambian) y servicios nuevos.
 5. [ ] GPU: NVN2, clases de Ampere y traductor de shaders SASS de Ampere (lo más grande).
