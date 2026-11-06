@@ -1,7 +1,7 @@
 """Punto flotante escalar, NEON (Advanced SIMD) y sus cargas/guardados.
 
-La Switch usa un Cortex-A57: ARMv8.0-A, sin media precisión aritmética, sin
-productos punto ni atómicos LSE. Eso define qué se traduce aquí.
+La Switch usa un Cortex-A57 (ARMv8.0-A); la Switch 2, un Cortex-A78C (ARMv8.2-A), que suma la
+aritmética de media precisión (FP16). Las operaciones de half usan los mismos helpers con w = 16.
 """
 
 from a64 import COND, R, RW, Unsupported, bits, lit, setr
@@ -19,7 +19,7 @@ def wr(d, w, expr):
 
 
 def vfp_expand_imm(imm8, w):
-    e = 8 if w == 32 else 11
+    e = {16: 5, 32: 8, 64: 11}[w]
     f = w - e - 1
     sign = imm8 >> 7
     b6 = (imm8 >> 6) & 1
@@ -39,8 +39,8 @@ def fp_scalar(i, x):
     rd, rn, rm = bits(x, 4, 0), bits(x, 9, 5), bits(x, 20, 16)
 
     if bits(x, 28, 24) == 0b11111:  # FMADD / FMSUB / FNMADD / FNMSUB
-        if ftype not in (0, 1):
-            raise Unsupported("FMA de media precisión")
+        if ftype == 2:
+            raise Unsupported("FMA con tipo inválido")
         w = FT[ftype]
         ra, o1, o0 = bits(x, 14, 10), bits(x, 21, 21), bits(x, 15, 15)
         sign = lit(1 << (w - 1), 64 if w == 64 else 32)
@@ -55,7 +55,7 @@ def fp_scalar(i, x):
     if bits(x, 21, 21) == 0:  # conversión con punto fijo
         sf, rmode, opcode, scale = bits(x, 31, 31), bits(x, 20, 19), bits(x, 18, 16), bits(x, 15, 10)
         sf = bits(x, 31, 31)
-        if ftype not in (0, 1) or (not sf and scale < 32):
+        if ftype == 2 or (not sf and scale < 32):
             raise Unsupported("conversión de punto fijo inválida")
         fbits = 64 - scale
         w = FT[ftype]
@@ -65,6 +65,9 @@ def fp_scalar(i, x):
             i.lines = [setr(rd, f"({'uint' if iw == 64 else 'uint'}{iw}_t){fn}(fval{w}({S(rn, w)}), 3, 0x1p{fbits})", iw)]
         elif rmode == 0 and opcode in (2, 3):  # SCVTF / UCVTF
             src = f"({'uint' if opcode == 3 else 'int'}{iw}_t){R(rn)}"
+            if w == 16:
+                i.lines = [wr(rd, w, f"{'u' if opcode == 3 else 's'}cvtf_h({src}, {fbits})")]
+                return
             ty = "float" if w == 32 else "double"
             i.lines = [wr(rd, w, f"u{w}of(({ty})({ty})({src}) * ({ty})0x1p-{fbits})")]
         else:
@@ -88,8 +91,6 @@ def fp_scalar(i, x):
             suf = {16: "h", 32: "s", 64: "d"}
             i.lines = [wr(rd, tw, f"cvt_{suf[tw]}_{suf[w]}({S(rn, w)})")]
             return
-        if w == 16:
-            raise Unsupported("aritmética de media precisión (ARMv8.2)")
         sign = lit(1 << (w - 1), 64 if w == 64 else 32)
         a = S(rn, w)
         ops = {
@@ -110,7 +111,7 @@ def fp_scalar(i, x):
         i.lines = [wr(rd, w, ops[opcode])]
         return
     if bits(x, 13, 10) == 0b1000:  # FCMP / FCMPE
-        if ftype not in (0, 1) or bits(x, 15, 14) or bits(x, 2, 0):
+        if ftype == 2 or bits(x, 15, 14) or bits(x, 2, 0):
             raise Unsupported("FCMP inválido")
         w = FT[ftype]
         zero = bits(x, 3, 3)  # con cero, el campo Rm se ignora
@@ -118,13 +119,13 @@ def fp_scalar(i, x):
         i.lines = [f"{{ unsigned f = fcmp{w}({S(rn, w)}, {b}); c->n = f >> 3; c->z = f >> 2 & 1; c->c = f >> 1 & 1; c->v = f & 1; }}"]
         return
     if bits(x, 12, 10) == 0b100:  # FMOV (inmediato)
-        if ftype not in (0, 1) or bits(x, 9, 5):
+        if ftype == 2 or bits(x, 9, 5):
             raise Unsupported("FMOV inmediato inválido")
         w = FT[ftype]
         i.lines = [wr(rd, w, lit(vfp_expand_imm(bits(x, 20, 13), w), 64 if w == 64 else 32))]
         return
-    if ftype not in (0, 1):
-        raise Unsupported("FP de media precisión")
+    if ftype == 2:
+        raise Unsupported("FP con tipo inválido")
     w = FT[ftype]
     a, b = S(rn, w), S(rm, w)
     kind = bits(x, 11, 10)
@@ -156,13 +157,15 @@ def conv_int(i, x, ftype, rd, rn):
         if rmode == 0 and (sf, ftype) in ((0, 0), (1, 1)):
             w = 64 if sf else 32
             i.lines = [setr(rd, S(rn, w), w)] if opcode == 6 else [wr(rd, w, RW(rn, w))]
+        elif rmode == 0 and ftype == 3:  # FMOV Wd/Xd, Hn y Hd, Wn/Xn (ARMv8.2)
+            i.lines = [setr(rd, S(rn, 16), iw)] if opcode == 6 else [wr(rd, 16, f"(uint16_t){R(rn)}")]
         elif rmode == 1 and sf and ftype == 2:  # FMOV Xd, Vn.D[1] / Vd.D[1], Xn
             i.lines = [setr(rd, f"c->vr[{rn}].d[1]")] if opcode == 6 else [f"c->vr[{rd}].d[1] = {R(rn)};"]
         else:
             raise Unsupported("FMOV inválido")
         return
-    if ftype not in (0, 1):
-        raise Unsupported("conversión de media precisión")
+    if ftype == 2:
+        raise Unsupported("conversión con tipo inválido")
     w = FT[ftype]
     if opcode in (0, 1, 4, 5):  # FCVT{N,P,M,Z,A}{S,U}
         if opcode in (4, 5) and rmode:
@@ -173,7 +176,10 @@ def conv_int(i, x, ftype, rd, rn):
     elif opcode in (2, 3) and rmode == 0:  # SCVTF / UCVTF
         ty = "float" if w == 32 else "double"
         src = f"({'uint' if opcode == 3 else 'int'}{iw}_t){R(rn)}"
-        i.lines = [wr(rd, w, f"u{w}of(({ty})({src}))")]
+        if w == 16:
+            i.lines = [wr(rd, w, f"{'u' if opcode == 3 else 's'}cvtf_h({src}, 0)")]
+        else:
+            i.lines = [wr(rd, w, f"u{w}of(({ty})({src}))")]
     else:
         raise Unsupported("conversión FP/entero inválida")
 

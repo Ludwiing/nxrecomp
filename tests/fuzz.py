@@ -48,6 +48,8 @@ CLASES = {
                      bits(w, 31, 24) == 0b11111000 and bits(w, 21, 21) and bits(w, 10, 10),
     # NEON de ARMv8.1/8.2 (SQRDMLAH/SQRDMLSH, SDOT/UDOT): solo con --cpu switch2
     "neon82": lambda w: neon82(w),
+    # FP de media precisión (ARMv8.2 FP16): solo con --cpu switch2
+    "fp16": lambda w: fp16(w),
     "simd": lambda w: bits(w, 27, 25) == 0b111 and not (bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0),
 }
 
@@ -104,13 +106,21 @@ def neon82(w):
         (bits(w, 29, 29) or bits(w, 15, 12) == 0b1110)
 
 
+def fp16(w):
+    """FP escalar con ftype = 11 (half), salvo FCVT entre precisiones, que ya existe en ARMv8.0."""
+    if bits(w, 28, 24) not in (0b11110, 0b11111) or bits(w, 30, 30) or bits(w, 23, 22) != 3:
+        return False
+    fcvt = bits(w, 28, 24) == 0b11110 and bits(w, 21, 21) and bits(w, 14, 10) == 0b10000 and bits(w, 20, 17) == 0b0001
+    return not fcvt
+
+
 def armv81(w):
     """CAS, CASP, LDLAR/STLLR, atómicos en memoria, LDAPR y autenticación de punteros (PAC*, AUT*,
     XPAC*, LDRAA): no existen en el A57 de la Switch 1."""
     if bits(w, 30, 21) == 0b1011010110 and bits(w, 20, 16) == 1 or \
             bits(w, 31, 24) == 0b11111000 and bits(w, 21, 21) and bits(w, 10, 10):
         return True
-    if neon82(w):
+    if neon82(w) or fp16(w):
         return True
     if bits(w, 29, 24) == 0b001000:
         o2, o1, o0 = bits(w, 23, 23), bits(w, 21, 21), bits(w, 15, 15)

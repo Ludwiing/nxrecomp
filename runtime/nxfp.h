@@ -44,7 +44,7 @@ static inline uint64_t u64of(double f) { uint64_t u; memcpy(&u, &f, 8); return u
     static inline U fsqrt##W(U a) {                                                             \
         if (isnan##W(a)) return a | QBIT;                                                       \
         if ((a & SIGN) && !iszero##W(a)) return DNAN;                                           \
-        return u##W##of(sqrt(f##W##of(a)));                                                    \
+        return u##W##of(sqrt((double)f##W##of(a)));                                                    \
     }                                                                                           \
     /* FPMulAdd(addend, op1, op2): addend + op1 * op2 con un solo redondeo */                   \
     static inline U fmuladd##W(U a, U n, U m) {                                                 \
@@ -90,11 +90,11 @@ static inline uint64_t u64of(double f) { uint64_t u; memcpy(&u, &f, 8); return u
         if (isnan##W(a)) return a | QBIT;                                                       \
         F x = f##W##of(a), r;                                                                   \
         switch (mode) {                                                                         \
-        case 0: r = __builtin_roundeven(x); break;                                              \
-        case 1: r = ceil(x); break;                                                             \
-        case 2: r = floor(x); break;                                                            \
-        case 3: r = trunc(x); break;                                                            \
-        default: r = round(x); break;                                                           \
+        case 0: r = __builtin_roundeven((double)x); break;                                              \
+        case 1: r = ceil((double)x); break;                                                          \
+        case 2: r = floor((double)x); break;                                                          \
+        case 3: r = trunc((double)x); break;                                                          \
+        default: r = round((double)x); break;                                                          \
         }                                                                                       \
         return u##W##of(r) | (a & SIGN); /* conserva el signo de -0,4 → -0 */                   \
     }
@@ -103,6 +103,15 @@ NX_FP_COMMON(32, uint32_t, float, f, 0x80000000u, 0x00400000u, 0x7FC00000u, 0x7F
 NX_FP_COMMON(64, uint64_t, double, , 0x8000000000000000ull, 0x0008000000000000ull, 0x7FF8000000000000ull,
              0x7FF0000000000000ull)
 
+// Media precisión (ARMv8.2 FP16, Switch 2). _Float16 de clang calcula en float y redondea una vez al
+// guardar: suma, resta, producto y cociente salen exactos así (float tiene más de 2 × 11 + 2 bits).
+// La raíz y el FMA van por double, que también deja un solo redondeo efectivo a media precisión.
+static inline _Float16 f16of(uint16_t u) { _Float16 f; memcpy(&f, &u, 2); return f; }
+static inline uint16_t u16of(_Float16 f) { uint16_t u; memcpy(&u, &f, 2); return u; }
+static inline _Float16 fmah16(_Float16 n, _Float16 m, _Float16 a) { return (_Float16)fma((double)n, (double)m, (double)a); }
+NX_FP_COMMON(16, uint16_t, _Float16, h16, 0x8000, 0x0200, 0x7E00, 0x7C00)
+
+static inline double fval16(uint16_t a) { return (double)f16of(a); }
 static inline double fval32(uint32_t a) { return (double)f32of(a); }
 static inline double fval64(uint64_t a) { return f64of(a); }
 
@@ -209,3 +218,15 @@ static inline uint32_t cvt_s_h(uint16_t h) {
     return sign | (exp + 112) << 23 | m << 13;
 }
 static inline uint64_t cvt_d_h(uint16_t h) { return cvt_d_s(cvt_s_h(h)); }
+
+// SCVTF/UCVTF a media precisión: un solo redondeo desde el entero, con `fbits` bits fraccionarios
+// (pasar por float o double redondearía dos veces).
+static inline uint16_t cvt_h_u64(uint64_t u, int sign, int fbits) {
+    if (!u) return 0;
+    int p = 63 - __builtin_clzll(u);
+    return half_from_parts(sign, p - fbits, u & ~(1ull << p), p);
+}
+static inline uint16_t scvtf_h(int64_t v, int fbits) {
+    return v < 0 ? cvt_h_u64(-(uint64_t)v, 1, fbits) : cvt_h_u64((uint64_t)v, 0, fbits);
+}
+static inline uint16_t ucvtf_h(uint64_t v, int fbits) { return cvt_h_u64(v, 0, fbits); }
