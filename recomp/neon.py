@@ -152,6 +152,8 @@ def decode(i, x):
         return crypto(i, x, rd, rn, rm)
     if bits(x, 24, 24) == 0 and bits(x, 21, 21) and bits(x, 10, 10):  # tres iguales
         return three_same(i, x, q, u, size, rd, rn, rm, scalar)
+    if bits(x, 24, 24) == 0 and not bits(x, 21, 21) and bits(x, 15, 15) and bits(x, 10, 10):  # tres iguales extra
+        return three_same_extra(i, x, q, u, size, rd, rn, rm, scalar)
     if bits(x, 24, 24) == 0 and bits(x, 21, 21) and bits(x, 11, 10) == 0:  # tres distintos
         return three_diff(i, x, q, u, size, rd, rn, rm, scalar)
     if bits(x, 24, 24) == 0 and bits(x, 21, 17) == 0b10000 and bits(x, 11, 10) == 0b10:
@@ -173,6 +175,18 @@ def decode(i, x):
     if not scalar and bits(x, 29, 24) == 0b001110 and bits(x, 23, 21) == 0 and bits(x, 15, 15) == 0 and bits(x, 11, 10) == 0:
         return tbl(i, x, q, rd, rn, rm)
     raise Unsupported("NEON no soportado (¿cripto?)")
+
+
+def three_same_extra(i, x, q, u, size, rd, rn, rm, scalar):
+    """Tres iguales "extra" (ARMv8.1/8.2, Switch 2): SQRDMLAH/SQRDMLSH y SDOT/UDOT."""
+    op = bits(x, 14, 11)
+    if op in (0b0000, 0b0001) and u and size in (1, 2):  # SQRDMLAH / SQRDMLSH
+        es = 8 << size
+        count = 1 if scalar else (128 if q else 64) // es
+        return lanes(i, rd, rn, rm, es, count, f"sqrdmlah(dd, a, b, {es}, {op})", read_d=True)
+    if op == 0b0010 and size == 2 and not scalar:  # SDOT / UDOT
+        return lanes(i, rd, rn, rm, 32, 4 if q else 2, f"dd + dot4(a, b, {u})", read_d=True)
+    raise Unsupported("tres iguales extra no soportado (FCMLA, FCADD, USDOT...)")
 
 
 def three_same(i, x, q, u, size, rd, rn, rm, scalar):
@@ -649,6 +663,9 @@ def by_element(i, x, q, u, size, rd, rn, scalar):
         name = {0b0001: "fmla", 0b0101: "fmls", 0b1001: "fmulx" if u else "fmul"}[op]
         count = 1 if scalar else (128 if q else 64) // w
         return lanes(i, rd, rn, None, w, count, fp_expr(name, w, b=b), read_d=name in ("fmla", "fmls"))
+    if op == 0b1110 and size == 2 and not scalar:  # SDOT / UDOT por elemento (ARMv8.2): un grupo de 4 bytes
+        b = f"c->vr[{mbit << 4 | rm4}].s[{h << 1 | l}]"
+        return lanes(i, rd, rn, None, 32, 4 if q else 2, f"dd + dot4(a, {b}, {u})", read_d=True)
     if size not in (1, 2):
         raise Unsupported("por elemento inválido")
     es = 8 << size
@@ -663,6 +680,8 @@ def by_element(i, x, q, u, size, rd, rn, scalar):
             raise Unsupported("por elemento no asignado")
         e = {0b0000: f"dd + a * {b}", 0b0100: f"dd - a * {b}", 0b1000: f"a * {b}"}[op]
         return lanes(i, rd, rn, None, es, count, e, read_d=op != 0b1000)
+    if op in (0b1101, 0b1111) and u:  # SQRDMLAH / SQRDMLSH por elemento (ARMv8.1)
+        return lanes(i, rd, rn, None, es, count, f"sqrdmlah(dd, a, {b}, {es}, {op >> 1 & 1})", read_d=True)
     if op in (0b1100, 0b1101):  # SQDMULH / SQRDMULH
         if u:
             raise Unsupported("por elemento no asignado")

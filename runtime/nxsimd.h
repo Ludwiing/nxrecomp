@@ -56,6 +56,21 @@ static inline uint64_t sqdmulh(uint64_t a, uint64_t b, int esize, int round) {
     return ssat(p >> esize, esize) & emask(esize);
 }
 
+// SQRDMLAH / SQRDMLSH (ARMv8.1 RDM): acumula el producto doblado sobre dd ensanchado, redondea y satura
+static inline uint64_t sqrdmlah(uint64_t dd, uint64_t a, uint64_t b, int esize, int sub) {
+    i128 p = 2 * sval(a, esize) * sval(b, esize);
+    i128 acc = sval(dd, esize) * ((i128)1 << esize) + (sub ? -p : p) + ((i128)1 << (esize - 1));
+    return ssat(acc >> esize, esize) & emask(esize);
+}
+
+// SDOT / UDOT (ARMv8.2 DotProd): suma de los cuatro productos de bytes de una palabra de 32 bits
+static inline uint32_t dot4(uint32_t a, uint32_t b, int uns) {
+    int32_t s = 0;
+    for (int k = 0; k < 32; k += 8)
+        s += uns ? (int32_t)((a >> k & 0xFF) * (b >> k & 0xFF)) : (int8_t)(a >> k) * (int8_t)(b >> k);
+    return (uint32_t)s;
+}
+
 // PMUL de 8 bits y PMULL (polinomios sobre GF(2))
 static inline uint64_t pmul(uint64_t a, uint64_t b, int esize) {
     unsigned __int128 r = 0;

@@ -46,6 +46,8 @@ CLASES = {
     # PAC*/AUT*/XPAC* y LDRAA/LDRAB: solo con --cpu switch2 (Unicorn trae la autenticación apagada)
     "pac": lambda w: bits(w, 30, 21) == 0b1011010110 and bits(w, 20, 16) == 1 or
                      bits(w, 31, 24) == 0b11111000 and bits(w, 21, 21) and bits(w, 10, 10),
+    # NEON de ARMv8.1/8.2 (SQRDMLAH/SQRDMLSH, SDOT/UDOT): solo con --cpu switch2
+    "neon82": lambda w: neon82(w),
     "simd": lambda w: bits(w, 27, 25) == 0b111 and not (bits(w, 28, 24) in (0b11110, 0b11111) and bits(w, 30, 30) == 0),
 }
 
@@ -91,11 +93,24 @@ def accepted(word):
     return i
 
 
+def neon82(w):
+    """Tres iguales extra (bit 21 = 0, bits 15 y 10 = 1) y por elemento con op 1101/1110/1111."""
+    if bits(w, 31, 31) or bits(w, 27, 25) != 0b111 or bits(w, 28, 24) in (0b11110, 0b11111) and not bits(w, 30, 30):
+        return False
+    if not bits(w, 24, 24) and bits(w, 28, 28) in (0, 1) and bits(w, 26, 25) == 0b11 and bits(w, 27, 27) and \
+            not bits(w, 21, 21) and bits(w, 15, 15) and bits(w, 10, 10):
+        return True
+    return bits(w, 24, 24) and not bits(w, 10, 10) and bits(w, 15, 12) in (0b1101, 0b1110, 0b1111) and \
+        (bits(w, 29, 29) or bits(w, 15, 12) == 0b1110)
+
+
 def armv81(w):
     """CAS, CASP, LDLAR/STLLR, atómicos en memoria, LDAPR y autenticación de punteros (PAC*, AUT*,
     XPAC*, LDRAA): no existen en el A57 de la Switch 1."""
     if bits(w, 30, 21) == 0b1011010110 and bits(w, 20, 16) == 1 or \
             bits(w, 31, 24) == 0b11111000 and bits(w, 21, 21) and bits(w, 10, 10):
+        return True
+    if neon82(w):
         return True
     if bits(w, 29, 24) == 0b001000:
         o2, o1, o0 = bits(w, 23, 23), bits(w, 21, 21), bits(w, 15, 15)
