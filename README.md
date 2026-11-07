@@ -4,6 +4,24 @@ Prueba de concepto: convertir código de Nintendo Switch (ARM64) en ejecutables 
 
 La idea es la de [nxnative](https://github.com/seedds/nxnative), llevada a una PC con Linux. nxnative puede ejecutar el código del juego tal cual porque los chips de Apple son ARM64. Un Ryzen o un Intel no lo son, así que aquí el código se traduce **una sola vez, antes de jugar** (recompilación estática, como N64Recomp o XenonRecomp). Al jugar no hay intérprete ni JIT: corre un programa normal de Linux.
 
+## Qué ya corre en Linux
+
+Estado al 6 de noviembre de 2026, en una laptop con Ryzen 7 7735HS, RTX 4060 Laptop y Omarchy/Arch. Todos los programas de esta tabla son ejecutables x86_64 nativos: se recompilaron una vez y corren sin emulador.
+
+| Programa | Cómo se convierte | Estado |
+|---|---|---|
+| Programas de prueba de `guest/` (`hola`, `vm`, `multi`, `neon`, `hilos`, `servicios`) | nxrecomp | Salida idéntica a la del mismo código compilado directo para x86_64 (`make test`) |
+| Homebrew con libnx 4.12 sin modificar: `basico`, `sistema`, `mandos`, `hello-world`, `simplegfx` | nxrecomp | Funcionan: arranque de libnx, archivos de la SD, mandos y pantalla |
+| Audio con libnx: `playtone`, `audren-simple`, `audren_rev` | nxrecomp | Sonido idéntico muestra por muestra |
+| deko3d: `deko_basic`, `deko_console` y los 9 `deko_examples` | nxrecomp | Dibujan lo esperado con OpenGL 4.6: triángulos, texturas BC y ASTC, teselación, MSAA, deferred shading y cómputo |
+| *The Legend of Zelda: Tears of the Kingdom* 1.2.1 | nxrecomp, camino genérico (NVN sobre Vulkan) | Llega a la escena de introducción a 30 fps estables, que es su tope ahí. Más allá de la introducción todavía no está probado |
+| *The Legend of Zelda: Tears of the Kingdom* 1.2.1 | Motor especial de NX2Linux: [totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) | Jugable a ~60 fps |
+| *Super Smash Bros. Ultimate* 13.0.2 | Motor especial de NX2Linux: [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) (GPLv3, se llama como programa aparte) | Jugable |
+
+Los dos motores especiales son proyectos de otros autores. NX2Linux los compila y los lanza desde la misma interfaz que el resto de los juegos. El objetivo es que el camino genérico, nxrecomp con NVN sobre Vulkan, sirva para cualquier juego. Hoy todavía no es así: cada juego nuevo puede necesitar servicios, instrucciones de GPU o arreglos que faltan.
+
+Switch 2: ya funcionan las instrucciones nuevas de la CPU (Cortex-A78C) y la lectura de ejecutables NSO en ZBIC y del NPDM nuevo. Todavía no se lee el contenedor de los juegos ni existe la GPU (NVN2/Ampere), así que ningún juego de Switch 2 corre todavía.
+
 ## Qué hace hoy
 
 ```
@@ -167,12 +185,13 @@ no es una implementación directa NVN→Vulkan como la de OpenSmash. Requiere el
 proveedor EGL de Mesa, Zink y un driver Vulkan compatible. Si no se puede
 inicializar, termina con un error explícito; no cambia silenciosamente a OpenGL.
 La selección está implementada, pero todavía falta validar esta ruta en la GPU
-del escritorio. El bloqueo gráfico de Tears of the Kingdom sigue pendiente.
+del escritorio. Los juegos NVN usan otro camino: NVN sobre Vulkan directamente (ver «Qué ya corre en Linux»).
 
 ## Origen y créditos
 
 - **La idea** viene de [nxnative](https://github.com/seedds/nxnative) (seedds, MIT), que ejecuta juegos de Switch de forma nativa en Mac con Apple Silicon. nxrecomp lleva esa idea a PC con Linux x86_64. Como el procesador ya no es ARM64, el código se recompila de forma estática en lugar de ejecutarse tal cual. Aquí se usa su extractor `nx_extract`, basado en LibHac (`tools/nx_extract/LICENSE.nxnative`).
 - **[totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)** (Valiantsin Dzerakh, MIT): la capa NVN sobre Vulkan de `runtime/nvn/` viene de ese proyecto, que también sirvió de referencia para el arranque de juegos NVN (`LICENSE.totk-pc-recomp`).
+- **[ssbu-recomp](https://github.com/Denkishi/ssbu-recomp)** (Denkishi, GPLv3): NX2Linux lo usa como motor especial para *Super Smash Bros. Ultimate*. No se incluye su código: NX2Linux lo llama como programa aparte.
 - **[Ryujinx](https://git.ryujinx.app/ryubing/ryujinx)** (MIT): de ahí salen las tablas de codificación de las instrucciones Maxwell (`tools/gen_maxwell.py` las genera) y el renderizador de audio REV1-REV15 portado a C (`third_party/LICENSE.ryujinx`). Ryujinx solo aporta datos y código portado: nxrecomp no lleva ningún emulador dentro.
 - **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** (AMD, MIT), en `runtime/nvn/third_party/`.
 - **[deko3d](https://github.com/devkitPro/deko3d) y sus ejemplos** (fincs, zlib), y **libnx/devkitPro**: con ellos se hacen los programas de prueba de `guest/libnx/`.
