@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extrae el ExeFS (los módulos de código) y el RomFS de un juego tuyo: NSP, NSZ, XCI o XCZ.
+"""Extrae el ExeFS (los módulos de código) y el RomFS de un juego tuyo: NSP, NSZ, XCI, XCZ, NCA o carpeta de NCA.
 
     python3 tools/extraer.py --keys ~/.switch/prod.keys juego.nsp [--update actualizacion.nsp] -o ~/Juegos/juego
 
@@ -34,7 +34,7 @@ def build_tool():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("juego", help="NSP, NSZ, XCI o XCZ del juego base")
+    ap.add_argument("juego", help="NSP, NSZ, XCI, XCZ, NCA o carpeta de NCA del juego base")
     ap.add_argument("--update", help="NSP de la actualización (opcional)")
     ap.add_argument("--keys", required=True, help="prod.keys sacadas de tu consola")
     ap.add_argument("-o", "--salida", required=True, help="carpeta de salida (fuera del repositorio)")

@@ -1,6 +1,7 @@
 // Tomado de nxnative (https://github.com/seedds/nxnative, dm/tools/nx_extract, commit 5474c6f),
 // licencia MIT (ver LICENSE.nxnative). Único cambio: en Linux la copia de archivos idénticos usa
-// File.Copy en lugar de clonefile de macOS; además acepta NCA sueltas y lee title.keys junto a prod.keys.
+// File.Copy en lugar de clonefile de macOS; además acepta NCA sueltas o en carpeta, lee title.keys junto a prod.keys
+// y arma el RomFS.img de un juego ya extraído (--romfs-dir).
 // NSP extraction: nx_extract <prod.keys> <base NSP> <update NSP or -> <output dir> [base RomFS dir to compare against] [--manifest] [--romfs-image]
 // --romfs-image streams the merged RomFS directly to <output dir>/RomFS.img (the packing script's default); only ExeFS is expanded. Without it, legacy folder extraction remains available.
 // With a base RomFS dir in legacy mode, files whose content matches it become APFS clones (no new space).
@@ -40,8 +41,9 @@ static class P {
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
         bool image = Array.IndexOf(a, "--romfs-image") >= 0; a = Array.FindAll(a, s => s != "--romfs-image");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
+        if (a.Length == 3 && a[0] == "--romfs-dir") return RomfsFromDir(a[1], a[2]);
         if (a.Length == 3 && a[1] == "--title") return Title(ReadKeys(a[0]), a[2]);
-        if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [--romfs-image]\n       nx_extract <prod.keys> --title <nsp|nsz|xci|xcz>"); return 2; }
+        if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [--romfs-image]\n       nx_extract <prod.keys> --title <nsp|nsz|xci|xcz|nca|folder of NCAs>\n       nx_extract --romfs-dir <RomFS folder or raw romfs.bin> <out RomFS.img>"); return 2; }
         KeySet ks = ReadKeys(a[0]);
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], image);
         var basePkg = OpenNsp(ks, a[1], ContentMetaType.Application); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
@@ -92,8 +94,11 @@ static class P {
 
     static int Title(KeySet ks, string path) {
         ulong? id = null;
-        foreach (Nca n in OpenNsp(ks, path)) if (n.Header.ContentType == NcaContentType.Meta && (id == null || n.Header.TitleId < id)) id = n.Header.TitleId;
-        if (id == null) { Console.WriteLine($"[RED] no meta NCA in {Path.GetFileName(path)}"); return 5; }
+        var ncas = OpenNsp(ks, path);
+        foreach (Nca n in ncas) if (n.Header.ContentType == NcaContentType.Meta && (id == null || n.Header.TitleId < id)) id = n.Header.TitleId;
+        // nxrecomp: a lone Program NCA (or a folder of NCAs without their meta NCA) has no content meta: its program's title ID
+        if (id == null) foreach (Nca n in ncas) if (n.Header.ContentType == NcaContentType.Program && (id == null || n.Header.TitleId < id)) id = n.Header.TitleId;
+        if (id == null) { Console.WriteLine($"[RED] no meta or program NCA in {Path.GetFileName(path)}"); return 5; }
         Console.WriteLine($"title {id:x16}");
         return 0;
     }
@@ -136,10 +141,25 @@ static class P {
         return ExternalKeyReader.ReadKeyFile(prod, File.Exists(tk) ? tk : null);
     }
 
-    static List<Nca> OpenNsp(KeySet ks, string path, ContentMetaType? only = null) {
+    // nxrecomp: the package's files as (name, storage): an NSP's or an XCI secure partition's entries, or the files of a folder of NCAs
+    // (a game dumped as loose NCAs, with its tickets if any). In a folder, an NCA may also be a folder named *.nca holding its parts 00, 01...
+    // (a FAT32 SD card splits files over 4 GB that way).
+    static List<(string Name, IStorage St)> PackageFiles(KeySet ks, string path) {
+        var files = new List<(string, IStorage)>();
+        if (Directory.Exists(path)) {
+            string[] names = Directory.GetFileSystemEntries(path); Array.Sort(names, StringComparer.Ordinal);
+            foreach (string f in names) {
+                string n = Path.GetFileName(f);
+                if (File.Exists(f)) { files.Add((n, new LocalStorage(f, FileAccess.Read))); continue; }
+                if (!n.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) continue;
+                string[] parts = Directory.GetFiles(f); Array.Sort(parts, StringComparer.Ordinal);
+                if (parts.Length == 0) continue;
+                var list = new List<IStorage>(); foreach (string q in parts) list.Add(new LocalStorage(q, FileAccess.Read));
+                files.Add((n, list.Count == 1 ? list[0] : new ConcatenationStorage(list, true)));
+            }
+            return files;
+        }
         IFileSystem pfs; var st0 = new LocalStorage(path, FileAccess.Read);
-        // nxrecomp: a bare NCA (decrypted from the SD card's NAX0) is a package of one
-        if (path.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) return new List<Nca> { new Nca(ks, st0) };
         byte[] magic = new byte[4]; st0.Read(0x100, magic).ThrowIfFailure();
         if (System.Text.Encoding.ASCII.GetString(magic) == "HEAD") {   // XCI: the card header's magic at 0x100
             var xci = new Xci(ks, st0);
@@ -148,16 +168,24 @@ static class P {
         } else {
             var p = new PartitionFileSystem(); p.Initialize(st0).ThrowIfFailure(); pfs = p;
         }
-        var ncas = new List<Nca>(); var ids = new List<string>();   // ids: content IDs (the file names' hex)
         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default)) {
             using var f = new UniqueRef<IFile>();
             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
-            IStorage st = f.Release().AsStorage();
-            if (e.Name.EndsWith(".tik", StringComparison.OrdinalIgnoreCase)) {
+            files.Add((e.Name, f.Release().AsStorage()));
+        }
+        return files;
+    }
+
+    static List<Nca> OpenNsp(KeySet ks, string path, ContentMetaType? only = null) {
+        // nxrecomp: a bare NCA (decrypted from the SD card's NAX0) is a package of one
+        if (File.Exists(path) && path.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) return new List<Nca> { new Nca(ks, new LocalStorage(path, FileAccess.Read)) };
+        var ncas = new List<Nca>(); var ids = new List<string>();   // ids: content IDs (the file names' hex)
+        foreach (var (name, st) in PackageFiles(ks, path)) {
+            if (name.EndsWith(".tik", StringComparison.OrdinalIgnoreCase)) {
                 byte[] t = new byte[0x2c0]; st.Read(0, t).ThrowIfFailure();
-                if (t[0x281] != 0) { Console.Error.WriteLine($"[RED] {e.Name} is not a common ticket; supply the title key separately"); continue; }
+                if (t[0x281] != 0) { Console.Error.WriteLine($"[RED] {name} is not a common ticket; supply the title key separately"); continue; }
                 ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
-            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) { ncas.Add(new Nca(ks, st)); ids.Add(e.Name[..e.Name.IndexOf('.')].ToLowerInvariant()); }
+            } else if (name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) { ncas.Add(new Nca(ks, st)); ids.Add(name[..name.IndexOf('.')].ToLowerInvariant()); }
         }
         if (only == null) return ncas;
         var listed = new HashSet<string>();
@@ -225,6 +253,16 @@ static class P {
             if (len > 0) return System.Text.Encoding.UTF8.GetString(t, i * 0x300, len);
         }
         return "";
+    }
+
+    // nxrecomp: the RomFS image of a game that is already extracted (a folder with romfs/, or a raw romfs.bin), with no keys
+    static int RomfsFromDir(string src, string img) {
+        IFileSystem fs;
+        if (Directory.Exists(src)) fs = new LocalFileSystem(Path.GetFullPath(src));
+        else if (File.Exists(src)) fs = new RomFsFileSystem(new LocalStorage(src, FileAccess.Read));
+        else { Console.Error.WriteLine($"no RomFS at {src}"); return 2; }
+        WriteImage(fs, img);
+        return 0;
     }
 
     sealed class ImageEntry {

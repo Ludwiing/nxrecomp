@@ -153,20 +153,21 @@ class Ventana(Adw.ApplicationWindow):
 
     def agregar_juego(self):
         llaves = motor.llaves_conocidas()
-        if not llaves:
-            self.toast("Primero elige tu archivo prod.keys")
-            self.preferencias()
-            return
         d = Adw.AlertDialog(heading="Agregar un juego",
                             body="Elige la carpeta con el juego (y su actualización y DLC), o los archivos "
-                                 "sueltos. Tienen que ser copias de tus propios juegos.")
-        # Las llaves con que se abre este juego (por ejemplo, las de otra consola); el juego las recuerda.
-        selector = Gtk.DropDown.new_from_strings([abreviar(r) for r in llaves])
-        selector.set_tooltip_text("El prod.keys de la consola de la que sacaste este juego")
-        caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        caja.append(Gtk.Label(label="Llaves de la consola (prod.keys)", xalign=0, css_classes=["dim-label"]))
-        caja.append(selector)
-        d.set_extra_child(caja)
+                                 "sueltos: NSP, NSZ, XCI, XCZ, NCA, NRO, una carpeta de NCA o un juego ya "
+                                 "extraído (con su ExeFS). Tienen que ser copias de tus propios juegos." +
+                                 ("" if llaves else "\n\nSin prod.keys solo se pueden agregar homebrew NRO y "
+                                                    "juegos ya extraídos; elígelo en Preferencias para lo demás."))
+        selector = None
+        if llaves:
+            # Las llaves con que se abre este juego (por ejemplo, las de otra consola); el juego las recuerda.
+            selector = Gtk.DropDown.new_from_strings([abreviar(r) for r in llaves])
+            selector.set_tooltip_text("El prod.keys de la consola de la que sacaste este juego")
+            caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            caja.append(Gtk.Label(label="Llaves de la consola (prod.keys)", xalign=0, css_classes=["dim-label"]))
+            caja.append(selector)
+            d.set_extra_child(caja)
         d.add_response("cancelar", "Cancelar")
         d.add_response("archivos", "Elegir archivos")
         d.add_response("carpeta", "Elegir carpeta")
@@ -174,7 +175,7 @@ class Ventana(Adw.ApplicationWindow):
         d.set_default_response("carpeta")
 
         def resp(_d, r):
-            elegidas = llaves[selector.get_selected()]
+            elegidas = llaves[selector.get_selected()] if selector else None
             self._pedir_archivos(r, lambda rutas: self._elegido(rutas, elegidas))
         d.connect("response", resp)
         d.present(self)
@@ -213,7 +214,7 @@ class Ventana(Adw.ApplicationWindow):
         threading.Thread(target=trabajo, daemon=True).start()
 
     def _confirmar(self, origen):
-        partes = [f"Juego: {os.path.basename(origen['base'])}"]
+        partes = [f"Juego: {os.path.basename(origen['base'].rstrip(os.sep))}"]
         partes.append(f"Actualización: {os.path.basename(origen['update'])}" if origen["update"]
                       else "Sin actualización")
         if origen["dlc"]:

@@ -15,6 +15,7 @@ Cada juego vive en su propia carpeta, fuera del repositorio:
         registro.txt    lo que dijo cada paso
 """
 
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,8 @@ CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("
 DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "nx2linux")
 APPS_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "applications")
 EXTRACTOR_DIR = os.path.join(ROOT, "build", "tools", "nx_extract")
-EXTENSIONES = (".nsp", ".nsz", ".xci", ".xcz")
+EXTENSIONES = (".nsp", ".nsz", ".xci", ".xcz", ".nca", ".nro")
+CIFRADOS = (".nsp", ".nsz", ".xci", ".xcz", ".nca")  # los que se abren con las llaves (nx_extract)
 
 # Los pasos de una construcción, en orden: (clave, nombre para mostrar, peso en la barra de progreso).
 PASOS = [
@@ -227,7 +229,8 @@ def biblioteca():
 def extractor():
     """El extractor (nx_extract, de nxnative, con LibHac); se compila la primera vez."""
     exe = os.path.join(EXTRACTOR_DIR, "nx_extract")
-    if os.path.exists(exe):
+    fuente = os.path.join(ROOT, "tools", "nx_extract", "Program.cs")
+    if os.path.exists(exe) and os.path.getmtime(exe) >= os.path.getmtime(fuente):
         return exe
     r = subprocess.run(["dotnet", "build", os.path.join(ROOT, "tools", "nx_extract"), "-c", "Release", "-o",
                         EXTRACTOR_DIR, "-v", "quiet", "-nologo"], capture_output=True, text=True)
@@ -266,8 +269,69 @@ def _primera_linea_error(texto):
     return texto.strip()[:400]
 
 
+def _carpeta_exefs(d):
+    """Los módulos de un juego ya extraído: la carpeta misma (main y main.npdm) o su subcarpeta exefs/ExeFS."""
+    try:
+        subs = [os.path.join(d, n) for n in sorted(os.listdir(d)) if n.lower() == "exefs"]
+    except OSError:
+        return None
+    for c in subs + [d]:
+        main = os.path.join(c, "main")
+        if os.path.isfile(main) and (c != d or os.path.isfile(os.path.join(c, "main.npdm"))):
+            with open(main, "rb") as f:
+                cab = f.read(0x14)
+            if cab[:4] == b"NSO0" or cab[0x10:0x14] == b"NRO0":
+                return c
+    return None
+
+
+def tipo(ruta):
+    """Qué es lo elegido: "paquete" (NSP, NSZ, XCI, XCZ o un NCA), "ncas" (carpeta de NCA sueltos), "extraido"
+    (carpeta de un juego ya extraído: ExeFS y, si tiene, romfs) o "nro" (homebrew). None si no es nada de eso."""
+    if os.path.isdir(ruta):
+        if _carpeta_exefs(ruta):
+            return "extraido"
+        try:
+            return "ncas" if any(n.lower().endswith(".nca") for n in os.listdir(ruta)) else None
+        except OSError:
+            return None
+    bajo = ruta.lower()
+    if bajo.endswith(".nro"):
+        return "nro"
+    return "paquete" if bajo.endswith(CIFRADOS) else None
+
+
+def _id_local(datos):
+    """Un title ID para lo que no trae uno (un NRO, un juego extraído sin NPDM): 05 + parte de su SHA-256, terminado
+    en 000 para que cuente como juego base. Es estable: el mismo archivo da siempre el mismo id."""
+    return 0x0500000000000000 | (int.from_bytes(hashlib.sha256(datos).digest()[:5], "big") << 12)
+
+
 def title_id(archivo, llaves):
-    revisar_archivo(archivo)
+    t = tipo(archivo)
+    if t == "nro":
+        with open(archivo, "rb") as f:
+            datos = f.read()
+        if datos[0x10:0x14] != b"NRO0":
+            raise RuntimeError(f"{os.path.basename(archivo)} no es un NRO (no tiene la cabecera NRO0)")
+        return _id_local(datos)
+    if t == "extraido":
+        exefs = _carpeta_exefs(archivo)
+        npdm = os.path.join(exefs, "main.npdm")
+        if os.path.isfile(npdm):
+            sys.path.insert(0, os.path.join(ROOT, "recomp"))
+            from nso import parse_npdm
+            with open(npdm, "rb") as f:
+                programa = parse_npdm(f.read())["programa"]
+            if programa:
+                return programa
+        with open(os.path.join(exefs, "main"), "rb") as f:
+            return _id_local(f.read())
+    if not llaves:
+        raise RuntimeError(f"para abrir {os.path.basename(archivo)} hace falta el prod.keys de tu consola "
+                           "(Preferencias); sin llaves solo se pueden agregar homebrew NRO y juegos ya extraídos")
+    if t == "paquete" and not archivo.lower().endswith(".nca"):
+        revisar_archivo(archivo)
     t = _title_del_nombre(os.path.basename(archivo))
     if t is not None:
         return t
@@ -279,14 +343,18 @@ def title_id(archivo, llaves):
 
 
 def _archivos(rutas):
+    """Lo que hay que reconocer: cada archivo elegido y, en una carpeta, lo que tiene adentro. Una carpeta de NCA
+    sueltos o de un juego extraído cuenta como una sola cosa, igual que una subcarpeta así."""
     archivos = []
     for r in rutas:
-        if os.path.isdir(r):
-            archivos += [os.path.join(r, f) for f in sorted(os.listdir(r)) if f.lower().endswith(EXTENSIONES)]
-        elif r.lower().endswith(EXTENSIONES):
+        t = tipo(r)
+        if t in ("ncas", "extraido") or (t and not os.path.isdir(r)):
             archivos.append(r)
+        elif os.path.isdir(r):
+            archivos += [p for p in (os.path.join(r, f) for f in sorted(os.listdir(r))) if tipo(p)]
     if not archivos:
-        raise RuntimeError("no hay archivos .nsp, .nsz, .xci ni .xcz")
+        raise RuntimeError("no hay nada que se pueda agregar: se aceptan NSP, NSZ, XCI, XCZ, NCA, NRO, carpetas de "
+                           "NCA y carpetas de juegos ya extraídos (con ExeFS)")
     return archivos
 
 
@@ -347,7 +415,8 @@ def nuevo_juego(origen, llaves=None):
     j = Juego(os.path.join(carpeta_juegos(), origen["title"]))
     j.datos["origen"] = {k: origen[k] for k in ("base", "update", "dlc")}
     j.datos["pasos"] = {}
-    j.datos.setdefault("nombre", os.path.splitext(os.path.basename(origen["base"]))[0])
+    base = os.path.normpath(origen["base"])
+    j.datos.setdefault("nombre", os.path.basename(base) if os.path.isdir(base) else os.path.splitext(os.path.basename(base))[0])
     if llaves:
         j.datos["llaves"] = llaves
         recordar_llaves(llaves)
@@ -379,7 +448,7 @@ def aplicar_contenido(juego, nuevo):
     """Anota la actualización y los DLC en el juego. Devuelve "extraer" si hay que reconstruirlo (una actualización
     cambia el código) o la lista de índices de DLC que basta con extraer."""
     o = juego.datos.setdefault("origen", {})
-    if nuevo["update"] and not (o.get("base") and os.path.isfile(o["base"])):
+    if nuevo["update"] and not (o.get("base") and os.path.exists(o["base"])):
         raise RuntimeError("para aplicar una actualización hace falta el archivo del juego base con que se agregó, "
                            "y ya no está: agrega el juego de nuevo junto con la actualización")
     actuales = {d["indice"]: d for d in o.get("dlc") or [] if isinstance(d, dict)}
@@ -398,6 +467,52 @@ def quitar(juego):
         os.remove(os.path.join(APPS_DIR, f"nx2linux-{juego.id}.desktop"))
     except OSError:
         pass
+
+
+# ---------- NACP y ASET (nombre e ícono de lo que no pasa por nx_extract) ----------
+
+ICONOS_NACP = ("AmericanEnglish", "BritishEnglish", "LatinAmericanSpanish", "Spanish", "Japanese", "French", "German",
+               "Italian", "Dutch", "CanadianFrench", "Portuguese", "Russian", "Korean", "TraditionalChinese",
+               "SimplifiedChinese", "BrazilianPortuguese")
+
+
+def leer_nacp(nacp):
+    """(nombre, versión) de un control.nacp. Los títulos son 16 entradas de 0x300 bytes (nombre 0x200 + editor
+    0x100); los SDK nuevos comprimen esos 0x3000 bytes (u16 tamaño + deflate a 32 idiomas), como en nx_extract."""
+    import zlib
+    if len(nacp) < 0x3070:
+        return "", ""
+    tabla, n = nacp, nacp[0] | nacp[1] << 8
+    if 0 < n <= 0x2FFE:
+        try:
+            d = zlib.decompress(nacp[2:2 + n], -15)
+            if len(d) == 0x6000:
+                tabla = d
+        except zlib.error:
+            pass
+    nombre = ""
+    for i in range(len(tabla) // 0x300 if tabla is not nacp else 16):
+        crudo = tabla[i * 0x300:i * 0x300 + 0x200].split(b"\0")[0]
+        if crudo:
+            nombre = crudo.decode("utf-8", "replace")
+            break
+    version = nacp[0x3060:0x3070].split(b"\0")[0].decode("ascii", "replace")
+    return nombre, version
+
+
+def leer_aset(nro):
+    """(ícono JPEG, NACP) de la sección ASET que va después del código de un NRO; (None, None) si no tiene."""
+    if len(nro) < 0x20 or nro[0x10:0x14] != b"NRO0":
+        return None, None
+    fin = int.from_bytes(nro[0x18:0x1C], "little")
+    if nro[fin:fin + 4] != b"ASET" or len(nro) < fin + 0x38:
+        return None, None
+
+    def parte(k):
+        off = int.from_bytes(nro[fin + 8 + 16 * k:fin + 16 + 16 * k], "little")
+        tam = int.from_bytes(nro[fin + 16 + 16 * k:fin + 24 + 16 * k], "little")
+        return nro[fin + off:fin + off + tam] if tam else None
+    return parte(0), parte(1)
 
 
 # ---------- construir ----------
@@ -507,8 +622,13 @@ class Construccion:
     # Paso 1: extraer ExeFS, RomFS (con la actualización), ícono y nombre; los DLC aparte.
     def _extraer(self):
         j = self.juego
-        llaves = self._llaves()
         o = j.datos["origen"]
+        t = tipo(o["base"])
+        if t == "extraido":
+            return self._extraer_extraido(o["base"])
+        if t == "nro":
+            return self._extraer_nro(o["base"])
+        llaves = self._llaves()
         self._linea("extraer", 0.02, "Preparando el extractor (la primera vez se compila)...")
         exe = extractor()
         for d in ("ExeFS",):
@@ -526,6 +646,78 @@ class Construccion:
         self._ejecutar("extraer", [exe, llaves, o["base"], o.get("update") or "-", j.carpeta, "--romfs-image"], info)
         j.guardar()
         self._extraer_dlc(o.get("dlc") or [])
+
+    def _nuevo_exefs(self):
+        exefs = os.path.join(self.juego.carpeta, "ExeFS")
+        shutil.rmtree(exefs, ignore_errors=True)
+        os.makedirs(exefs)
+        return exefs
+
+    def _anotar_nacp(self, nacp):
+        nombre, version = leer_nacp(nacp)
+        if nombre:
+            self.juego.datos["nombre"] = nombre
+        if version:
+            self.juego.datos["version"] = version
+        self._linea("extraer", 0.9, f"{nombre or 'sin nombre'} {version}".strip())
+
+    # Un juego ya extraído (por nxdumptool, hactool, un emulador...): se copian los módulos y el RomFS se arma con
+    # nx_extract --romfs-dir; no hacen falta llaves.
+    def _extraer_extraido(self, carpeta):
+        j = self.juego
+        origen = _carpeta_exefs(carpeta)
+        if not origen:
+            raise RuntimeError(f"{carpeta} ya no tiene los módulos del juego (main, main.npdm...)")
+        exefs = self._nuevo_exefs()
+        for n in sorted(os.listdir(origen)):
+            if os.path.isfile(os.path.join(origen, n)):
+                shutil.copyfile(os.path.join(origen, n), os.path.join(exefs, n))
+        self._linea("extraer", 0.2, f"Módulos copiados de {origen}")
+        imagen = os.path.join(j.carpeta, "RomFS.img")
+        for viejo in (imagen, imagen + ".native"):
+            if os.path.exists(viejo):
+                os.remove(viejo)
+        hijos = {n.lower(): os.path.join(carpeta, n) for n in os.listdir(carpeta)}
+        if os.path.isfile(hijos.get("romfs.img", "")) and open(hijos["romfs.img"], "rb").read(8) == b"DMROMFS1":
+            subprocess.run(["cp", "--reflink=auto", hijos["romfs.img"], imagen], check=True)
+            self._linea("extraer", 0.8, "RomFS copiado")
+        else:
+            fuente = next((hijos[n] for n in ("romfs", "romfs.bin", "romfs.img") if n in hijos), None)
+            if fuente:
+                self._ejecutar("extraer", [extractor(), "--romfs-dir", fuente, imagen])
+            else:
+                self._linea("extraer", 0.8, "El juego no trae RomFS")
+        control = next((c for c in (carpeta, hijos.get("control", "")) if os.path.isfile(os.path.join(c, "control.nacp"))), None)
+        if control:
+            with open(os.path.join(control, "control.nacp"), "rb") as f:
+                self._anotar_nacp(f.read())
+            icono = next((os.path.join(control, f"icon_{l}.dat") for l in ICONOS_NACP
+                          if os.path.isfile(os.path.join(control, f"icon_{l}.dat"))), None)
+            if icono:
+                shutil.copyfile(icono, os.path.join(j.carpeta, "icon.jpg"))
+        for n in ("icon.jpg", "icon.png"):
+            if n in hijos:
+                shutil.copyfile(hijos[n], os.path.join(j.carpeta, n))
+        j.guardar()
+
+    # Un homebrew NRO: el recompilador lo toma tal cual (su RomFS, si tiene, queda dentro del ejecutable); el nombre
+    # y el ícono salen de su sección ASET.
+    def _extraer_nro(self, ruta):
+        j = self.juego
+        exefs = self._nuevo_exefs()
+        shutil.copyfile(ruta, os.path.join(exefs, "main"))
+        for viejo in ("RomFS.img", "RomFS.img.native"):
+            if os.path.exists(os.path.join(j.carpeta, viejo)):
+                os.remove(os.path.join(j.carpeta, viejo))
+        with open(ruta, "rb") as f:
+            datos = f.read()
+        icono, nacp = leer_aset(datos)
+        if nacp:
+            self._anotar_nacp(nacp)
+        if icono:
+            with open(os.path.join(j.carpeta, "icon.jpg"), "wb") as f:
+                f.write(icono)
+        j.guardar()
 
     def _llaves(self):
         llaves = llaves_de(self.juego)

@@ -220,6 +220,7 @@ test: all test-startup
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
 	python3 tests/nso_test.py || ok=0; \
+	python3 tests/app_entradas_test.py 2>/dev/null || ok=0; \
 	$(B)/astc_test 20000 >/dev/null 2>$(B)/astc.err; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el decodificador ASTC da lo mismo que Mesa en 560 mil bloques (14 tamaños, lineal y sRGB)"; \
 	elif [ $$r = 77 ]; then echo "(sin el llvmpipe de Mesa no se prueba ASTC)"; else echo "MAL: ASTC distinto de Mesa"; ok=0; fi; \
