@@ -181,7 +181,7 @@ del escritorio. El bloqueo gráfico de Tears of the Kingdom sigue pendiente.
 
 ## Cómo se hizo
 
-Ludwing Hernández ([@Ludwiing](https://github.com/Ludwiing)) dirigió el proyecto, que se desarrolló con asistentes de IA, sobre todo Claude Code de Anthropic. Ludwing decidió el rumbo, las prioridades y las pruebas en su equipo, una laptop con Ryzen 7 7735HS y RTX 4060 con Omarchy/Arch. La IA escribió casi todo el código y lo verificó contra referencias independientes: Unicorn/QEMU para la CPU, Mesa para ASTC y la salida nativa de los mismos programas. Cada parte tiene sus pruebas en `make test`.
+Ludwing Hernández ([@Ludwiing](https://github.com/Ludwiing)) dirigió el proyecto, que se desarrolló con asistentes de IA: Claude Code de Anthropic y Codex de OpenAI. Ludwing decidió el rumbo, las prioridades y las pruebas en su equipo, una laptop con Ryzen 7 7735HS y RTX 4060 con Omarchy/Arch. La IA escribió casi todo el código y lo verificó contra referencias independientes: Unicorn/QEMU para la CPU, Mesa para ASTC y la salida nativa de los mismos programas. Cada parte tiene sus pruebas en `make test`.
 
 ## Aviso legal
 
