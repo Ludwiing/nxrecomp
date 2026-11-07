@@ -200,7 +200,7 @@ del escritorio. Los juegos NVN usan otro camino: NVN sobre Vulkan directamente (
 
 ## Cómo se hizo
 
-Ludwing Hernández ([@Ludwiing](https://github.com/Ludwiing)) dirigió el proyecto, que se desarrolló con asistentes de IA: Claude Code de Anthropic y Codex de OpenAI. Ludwing decidió el rumbo, las prioridades y las pruebas en su equipo, una laptop con Ryzen 7 7735HS y RTX 4060 con Omarchy/Arch. La IA escribió casi todo el código y lo verificó contra referencias independientes: Unicorn/QEMU para la CPU, Mesa para ASTC y la salida nativa de los mismos programas. Cada parte tiene sus pruebas en `make test`.
+El proyecto lo dirigió su autor y se desarrolló con asistentes de IA: Claude Code de Anthropic y Codex de OpenAI. El autor decidió el rumbo, las prioridades y las pruebas en su equipo, una laptop con Ryzen 7 7735HS y RTX 4060 con Omarchy/Arch. La IA escribió casi todo el código y lo verificó contra referencias independientes: Unicorn/QEMU para la CPU, Mesa para ASTC y la salida nativa de los mismos programas. Cada parte tiene sus pruebas en `make test`.
 
 ## Aviso legal
 
