@@ -168,3 +168,25 @@ proveedor EGL de Mesa, Zink y un driver Vulkan compatible. Si no se puede
 inicializar, termina con un error explícito; no cambia silenciosamente a OpenGL.
 La selección está implementada, pero todavía falta validar esta ruta en la GPU
 del escritorio. El bloqueo gráfico de Tears of the Kingdom sigue pendiente.
+
+## Origen y créditos
+
+- **La idea** viene de [nxnative](https://github.com/seedds/nxnative) (seedds, MIT), que ejecuta juegos de Switch de forma nativa en Mac con Apple Silicon. nxrecomp lleva esa idea a PC con Linux x86_64. Como el procesador ya no es ARM64, el código se recompila de forma estática en lugar de ejecutarse tal cual. Aquí se usa su extractor `nx_extract`, basado en LibHac (`tools/nx_extract/LICENSE.nxnative`).
+- **[totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)** (Valiantsin Dzerakh, MIT): la capa NVN sobre Vulkan de `runtime/nvn/` viene de ese proyecto, que también sirvió de referencia para el arranque de juegos NVN (`LICENSE.totk-pc-recomp`).
+- **[Ryujinx](https://git.ryujinx.app/ryubing/ryujinx)** (MIT): de ahí salen las tablas de codificación de las instrucciones Maxwell (`tools/gen_maxwell.py` las genera) y el renderizador de audio REV1-REV15 portado a C (`third_party/LICENSE.ryujinx`). Ryujinx solo aporta datos y código portado: nxrecomp no lleva ningún emulador dentro.
+- **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** (AMD, MIT), en `runtime/nvn/third_party/`.
+- **[deko3d](https://github.com/devkitPro/deko3d) y sus ejemplos** (fincs, zlib), y **libnx/devkitPro**: con ellos se hacen los programas de prueba de `guest/libnx/`.
+- **[zbic](https://github.com/kinnay/zbic)** (kinnay, GPLv2, código de Atmosphère) descomprime los NSO en ZBIC. No viene en el repositorio: lo instala aparte `make pydeps`.
+- También sirvieron de referencia [Switchbrew](https://switchbrew.org), N64Recomp y XenonRecomp.
+
+## Cómo se hizo
+
+Ludwing Hernández ([@Ludwiing](https://github.com/Ludwiing)) dirigió el proyecto, que se desarrolló con asistentes de IA, sobre todo Claude Code de Anthropic. Ludwing decidió el rumbo, las prioridades y las pruebas en su equipo, una laptop con Ryzen 7 7735HS y RTX 4060 con Omarchy/Arch. La IA escribió casi todo el código y lo verificó contra referencias independientes: Unicorn/QEMU para la CPU, Mesa para ASTC y la salida nativa de los mismos programas. Cada parte tiene sus pruebas en `make test`.
+
+## Aviso legal
+
+nxrecomp no trae juegos, llaves, firmware ni código de Nintendo. Para usarlo hacen falta tus propias copias, sacadas de tu consola (cartucho o compra digital, con herramientas como nxdumptool o DBI), y las `prod.keys` de esa misma consola. No ayuda a conseguir copias de ninguna otra forma. No tiene relación con Nintendo, que no lo respalda; «Nintendo Switch» es una marca de Nintendo.
+
+## Licencia
+
+El código propio de nxrecomp tiene licencia MIT (ver `LICENSE`). Las partes de terceros conservan su licencia, indicada en los archivos `LICENSE.*` mencionados arriba.

@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 graphify-out/
 .pydeps/
+tools/nx_extract/obj/
+tools/nx_extract/bin/
