@@ -219,6 +219,7 @@ test: all test-startup
 		if [ "$$(sha256sum < $(B)/$$p.ppm | cut -d' ' -f1)" = "$$(cat guest/esperado/$$p.sha256)" ]; then \
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
+	python3 tests/nso_test.py || ok=0; \
 	$(B)/astc_test 20000 >/dev/null 2>$(B)/astc.err; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el decodificador ASTC da lo mismo que Mesa en 560 mil bloques (14 tamaños, lineal y sRGB)"; \
 	elif [ $$r = 77 ]; then echo "(sin el llvmpipe de Mesa no se prueba ASTC)"; else echo "MAL: ASTC distinto de Mesa"; ok=0; fi; \
@@ -279,4 +280,10 @@ clean:
 	rm -rf $(B)
 
 .PRECIOUS: $(M)/%.o $(M)/%.so $(B)/%.o $(B)/%.elf $(B)/%.nro $(B)/%_rec/programa.c
-.PHONY: all test clean
+# ZBIC (compresión de NSO del sistema 22.0.0+ y de Switch 2): paquete zbic de kinnay (GPLv2, de
+# Atmosphère) en .pydeps/, que recomp/nso.py agrega solo a sys.path; sirve al Python del sistema y al de .venv.
+pydeps:
+	test -x $(B)/pip-venv/bin/pip || python3 -m venv $(B)/pip-venv
+	$(B)/pip-venv/bin/pip install --target .pydeps zbic==1.0.1.post1
+
+.PHONY: all test clean pydeps

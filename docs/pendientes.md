@@ -142,5 +142,11 @@ Ampere (NVN2). Se avanza por capas, de lo más acotado a lo más grande. Pruebas
    registros, reducciones, por pares, por elemento, FMOV inmediato y punto fijo), con los mismos
    helpers que 32/64 bits instanciados para `_Float16`. Unicorn extiende el signo en FCVTZS Hd, Hn,
    #fbits: ese caso se salta. No están FCMLA/FCADD/FJCVTZS (ARMv8.3 opcionales que el A78 no tiene).
-4. [ ] Formato de los ejecutables de Switch 2 (NSO/NPDM nuevos, si cambian) y servicios nuevos.
+4. [~] Formato de los ejecutables de Switch 2. Hecho: NSO con compresión ZBIC (bit 7 de las banderas,
+   sistema 22.0.0+ y Switch 2; zstd 1.5.7 con magia `ZBIC` y tablas de entropía BIC) vía el paquete
+   `zbic` de kinnay (GPLv2, de Atmosphère) instalado con `make pydeps` en `.pydeps/`; NPDM con espacio
+   de 42 bits, Flags1 (pila sombra), RemoteMemorySize y ACID de RSA-3072 (0x180 bytes; el ACI0 se busca
+   siempre por los offsets del META). `tests/nso_test.py` reempaqueta `multi` en ZBIC y exige el mismo C.
+   Falta: el contenedor de los juegos de Switch 2 y los servicios nuevos (sin documentación pública ni un
+   dump propio para probar), y la carga de wkc0-wkc9 (LoadBrowserCoreDll, bit 7 del ACID).
 5. [ ] GPU: NVN2, clases de Ampere y traductor de shaders SASS de Ampere (lo más grande).

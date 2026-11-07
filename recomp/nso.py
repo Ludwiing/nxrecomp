@@ -1,13 +1,21 @@
 """Formatos de módulo de la Switch: NSO (ExeFS de los juegos) y NRO (homebrew), y LZ4.
 
 Un módulo es la imagen en memoria de .text + .rodata + .data (el .bss es solo un
-tamaño). En el NSO cada segmento puede venir comprimido con LZ4 y tiene un SHA-256
-en la cabecera; si la bandera de verificación está puesta, se comprueba igual que
-el cargador de Horizon.
+tamaño). En el NSO cada segmento puede venir comprimido con LZ4 o, desde el sistema
+22.0.0 (y en Switch 2), con ZBIC (bit 7 de las banderas), y tiene un SHA-256 en la
+cabecera; si la bandera de verificación está puesta, se comprueba igual que el
+cargador de Horizon.
+
+ZBIC es zstd 1.5.7 con la magia b"ZBIC" y las tablas de entropía en codificación
+interpolativa binaria. Se usa el paquete `zbic` (kinnay/zbic, GPLv2, código de
+Atmosphère), que se instala aparte con `make pydeps` en .pydeps/ para que lo vean
+tanto el Python del sistema (NX2Linux) como el de .venv.
 """
 
 import hashlib
+import os
 import struct
+import sys
 
 PAGE = 0x1000
 
@@ -26,6 +34,40 @@ def lz4_decompress(src, size):
     if len(out) != size:
         raise FormatError(f"LZ4 dio {len(out)} bytes y se esperaban {size}")
     return out
+
+
+_PYDEPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".pydeps")
+ZBIC = 0x80  # bandera del NSO: segmentos comprimidos con ZBIC en vez de LZ4
+
+
+def _zbic():
+    try:
+        import zbic
+    except ImportError:
+        if os.path.isdir(_PYDEPS) and _PYDEPS not in sys.path:
+            sys.path.append(_PYDEPS)
+        try:
+            import zbic
+        except ImportError:
+            raise FormatError("el NSO usa compresión ZBIC (sistema 22.0.0+ o Switch 2) y falta el paquete zbic: "
+                              "corre `make pydeps` en nxrecomp") from None
+    return zbic
+
+
+def zbic_decompress(src, size):
+    try:
+        out = _zbic().decompress(bytes(src))
+    except FormatError:
+        raise
+    except Exception as e:
+        raise FormatError(f"ZBIC: {e}") from None
+    if len(out) != size:
+        raise FormatError(f"ZBIC dio {len(out)} bytes y se esperaban {size}")
+    return out
+
+
+def zbic_compress(data):
+    return _zbic().compress(bytes(data))
 
 
 def _lz4_decompress_py(src):
@@ -144,8 +186,7 @@ def load_nso(raw, name="main"):
         segs.append((file_off, mem_off, size, file_size))
     bss = struct.unpack_from("<I", raw, 0x3C)[0]
     build_id = raw[0x40:0x60]
-    if flags & 0x80:
-        raise FormatError(f"{name}: segmentos ZBIC (zstd, sistema 22.0.0 o posterior) todavía no soportados")
+    decompress = zbic_decompress if flags & ZBIC else lz4_decompress
     end = max(m + s for _, m, s, _ in segs)
     image = bytearray(end)
     names = ("text", "ro", "data")
@@ -153,7 +194,10 @@ def load_nso(raw, name="main"):
         if mem_off % PAGE:
             raise FormatError(f"{name}: segmento {names[k]} no alineado a página")
         stored = raw[file_off:file_off + (file_size if flags & (1 << k) else size)]
-        seg = lz4_decompress(stored, size) if flags & (1 << k) else bytes(stored)
+        try:
+            seg = decompress(stored, size) if flags & (1 << k) else bytes(stored)
+        except FormatError as e:
+            raise FormatError(f"{name}: segmento {names[k]}: {e}") from None
         if len(seg) != size:
             raise FormatError(f"{name}: segmento {names[k]} truncado")
         if flags & (8 << k):
@@ -187,21 +231,21 @@ def load_module(raw, name):
     raise FormatError(f"{name}: no es NSO ni NRO")
 
 
-def write_nso(path, image):
-    """Escribe un NSO con los tres segmentos comprimidos con LZ4 y sus hashes verificables."""
+def write_nso(path, image, zbic=False):
+    """Escribe un NSO con los tres segmentos comprimidos (LZ4, o ZBIC si zbic) y sus hashes verificables."""
     segs = [image.text, image.ro, image.rw]
     hdr = bytearray(0x100)
     hdr[0:4] = b"NSO0"
     blobs, off = [], 0x100
     for k, (moff, size) in enumerate(segs):
         raw = bytes(image.data[moff:moff + size])
-        comp = lz4_compress(raw)
+        comp = zbic_compress(raw) if zbic else lz4_compress(raw)
         struct.pack_into("<III", hdr, 0x10 + 0x10 * k, off, moff, size)
         struct.pack_into("<I", hdr, 0x60 + 4 * k, len(comp))
         hdr[0xA0 + 0x20 * k:0xC0 + 0x20 * k] = hashlib.sha256(raw).digest()
         blobs.append(comp)
         off += len(comp)
-    struct.pack_into("<I", hdr, 0x0C, 0b111111)  # comprimido y con hash en los tres
+    struct.pack_into("<I", hdr, 0x0C, 0b111111 | (ZBIC if zbic else 0))  # comprimido y con hash en los tres
     struct.pack_into("<I", hdr, 0x3C, image.bss)
     hdr[0x40:0x60] = image.build_id.ljust(0x20, b"\0")[:0x20]
     with open(path, "wb") as fh:
@@ -211,7 +255,10 @@ def write_nso(path, image):
 
 
 def parse_npdm(raw):
-    """Lo que sirve del main.npdm: nombre, pila del hilo principal, prioridad, espacio de direcciones."""
+    """Lo que sirve del main.npdm: nombre, pila del hilo principal, prioridad, espacio de direcciones.
+
+    Vale también para Switch 2: allí la firma y la llave del ACID son RSA-3072 (0x180 bytes en vez
+    de 0x100), así que el ACID y el ACI0 se ubican siempre por los offsets del META, nunca fijos."""
     if raw[:4] != b"META":
         raise FormatError("main.npdm sin META")
     flags = raw[0x0C]
@@ -219,7 +266,10 @@ def parse_npdm(raw):
     return {
         "nombre": raw[0x20:0x30].split(b"\0")[0].decode(errors="replace"),
         "64 bits": bool(flags & 1),
-        "espacio de direcciones": {0: "32 bits", 1: "36 bits", 2: "32 bits sin reserva", 3: "39 bits"}.get(aspace, str(aspace)),
+        "espacio de direcciones": {0: "32 bits", 1: "36 bits", 2: "32 bits sin reserva", 3: "39 bits",
+                                   4: "42 bits"}.get(aspace, str(aspace)),
+        "pila sombra": bool(raw[0x0D] & 1),  # Flags1 bit 0 (23.0.0+): EnableShadowStack
+        "memoria remota": struct.unpack_from("<I", raw, 0x10)[0],  # RemoteMemorySize, solo Switch 2
         "prioridad": raw[0x0E],
         "núcleo": raw[0x0F],
         "pila": struct.unpack_from("<I", raw, 0x1C)[0],

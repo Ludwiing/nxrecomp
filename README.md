@@ -134,7 +134,7 @@ Unicorn solo se usa para estas pruebas. Los ejecutables no lo incluyen.
 ## Límites conocidos
 
 - **Arranque de un juego real**: después de los constructores se salta directo a `nnMain`. Un juego con el SDK de Nintendo necesita antes la secuencia de `nn::init::Start` (`nnosInitialize`, `nninitStartup`...), y esa secuencia necesita hilos, SVC y servicios de Horizon. Es el siguiente paso.
-- **Formatos**: todavía no se leen los segmentos ZBIC (zstd, sistema 22.0.0 o posterior) ni las reubicaciones de TLS. Si aparecen, se avisa.
+- **Formatos**: los segmentos ZBIC (zstd con tablas BIC, sistema 22.0.0+ y Switch 2) se leen con el paquete `zbic` (`make pydeps`, lo instala también `app/instalar.sh`); el NPDM entiende los campos de Switch 2 (42 bits, RemoteMemorySize, ACID RSA-3072). Todavía no se leen las reubicaciones de TLS ni el contenedor de los juegos de Switch 2. Si aparecen, se avisa.
 - **Tamaño**: con un `main` de decenas de MB, el recompilador (en Python) y la compilación del C van a tardar. Falta medirlo con un juego.
 - **Audio**: el ADPCM y el remuestreo con tono distinto de 1 están escritos, pero ningún ejemplo los prueba todavía. Delay, reverb, reverb 3D y compresor dejan pasar la señal sin procesarla. No hay `hwopus`.
 - **Servicios**: la GPU ya dibuja los 9 ejemplos de deko3d (ver arriba), pero no se ha probado con un juego real, y faltan `acc` (cuentas), las partidas guardadas y otros. El orden de arranque del SDK de Nintendo (`nn::init::Start`) está en `runtime/nxmain.c`, pero sin probar con un juego real.
