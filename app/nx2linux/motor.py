@@ -30,7 +30,7 @@ CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("
 DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "nx2linux")
 APPS_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "applications")
 EXTRACTOR_DIR = os.path.join(ROOT, "build", "tools", "nx_extract")
-EXTENSIONES = (".nsp", ".nsz", ".xci", ".xcz", ".nca", ".nro")
+EXTENSIONES = (".nsp", ".nsz", ".xci", ".xcz", ".nca", ".nro", ".nup")
 CIFRADOS = (".nsp", ".nsz", ".xci", ".xcz", ".nca")  # los que se abren con las llaves (nx_extract)
 
 # Los pasos de una construcción, en orden: (clave, nombre para mostrar, peso en la barra de progreso).
@@ -287,7 +287,8 @@ def _carpeta_exefs(d):
 
 def tipo(ruta):
     """Qué es lo elegido: "paquete" (NSP, NSZ, XCI, XCZ o un NCA), "ncas" (carpeta de NCA sueltos), "extraido"
-    (carpeta de un juego ya extraído: ExeFS y, si tiene, romfs) o "nro" (homebrew). None si no es nada de eso."""
+    (carpeta de un juego ya extraído: ExeFS y, si tiene, romfs), "nro" (homebrew) o "nup" (dump de Switch 2, ya
+    descifrado: no necesita llaves). None si no es nada de eso."""
     if os.path.isdir(ruta):
         if _carpeta_exefs(ruta):
             return "extraido"
@@ -298,6 +299,8 @@ def tipo(ruta):
     bajo = ruta.lower()
     if bajo.endswith(".nro"):
         return "nro"
+    if bajo.endswith(".nup"):
+        return "nup"
     return "paquete" if bajo.endswith(CIFRADOS) else None
 
 
@@ -315,6 +318,13 @@ def title_id(archivo, llaves):
         if datos[0x10:0x14] != b"NRO0":
             raise RuntimeError(f"{os.path.basename(archivo)} no es un NRO (no tiene la cabecera NRO0)")
         return _id_local(datos)
+    if t == "nup":
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "nup_extraer.py"), archivo, "--info"],
+                           capture_output=True, text=True)
+        m = re.search(r"^base ([0-9a-f]{16})$", r.stdout, re.M)
+        if not m:
+            raise RuntimeError(f"no se pudo leer {os.path.basename(archivo)}: " + _primera_linea_error(r.stderr or r.stdout))
+        return int(m.group(1), 16)
     if t == "extraido":
         exefs = _carpeta_exefs(archivo)
         npdm = os.path.join(exefs, "main.npdm")
@@ -353,7 +363,7 @@ def _archivos(rutas):
         elif os.path.isdir(r):
             archivos += [p for p in (os.path.join(r, f) for f in sorted(os.listdir(r))) if tipo(p)]
     if not archivos:
-        raise RuntimeError("no hay nada que se pueda agregar: se aceptan NSP, NSZ, XCI, XCZ, NCA, NRO, carpetas de "
+        raise RuntimeError("no hay nada que se pueda agregar: se aceptan NSP, NSZ, XCI, XCZ, NCA, NRO, NUP, carpetas de "
                            "NCA y carpetas de juegos ya extraídos (con ExeFS)")
     return archivos
 
@@ -623,11 +633,16 @@ class Construccion:
     def _extraer(self):
         j = self.juego
         o = j.datos["origen"]
+        e = motor_especial(j)
+        if e and hasattr(e, "extraer"):  # el port lee el juego a su manera (Hookshot: el dump tal cual)
+            return e.extraer(self, j)
         t = tipo(o["base"])
         if t == "extraido":
             return self._extraer_extraido(o["base"])
         if t == "nro":
             return self._extraer_nro(o["base"])
+        if t == "nup":
+            return self._extraer_nup(o["base"])
         llaves = self._llaves()
         self._linea("extraer", 0.02, "Preparando el extractor (la primera vez se compila)...")
         exe = extractor()
@@ -699,6 +714,22 @@ class Construccion:
             if n in hijos:
                 shutil.copyfile(hijos[n], os.path.join(j.carpeta, n))
         j.guardar()
+
+    # Un dump de Switch 2 (.nup, ya descifrado): tools/nup_extraer.py saca exefs/ y romfs/ del título más nuevo a una
+    # carpeta temporal; de ahí sigue como un juego ya extraído y la carpeta se borra al final (el RomFS queda en la imagen).
+    def _extraer_nup(self, ruta):
+        j = self.juego
+        tmp = os.path.join(j.carpeta, "nup")
+        self._ejecutar("extraer", [sys.executable, os.path.join(ROOT, "tools", "nup_extraer.py"), ruta, tmp],
+                       lambda l: (lambda m: 0.7 * int(m.group(1)) / max(1, int(m.group(2))) if m else None)(
+                           re.match(r"progreso (\d+)/(\d+)", l)))
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "nup_extraer.py"), ruta, "--info"],
+                           capture_output=True, text=True)
+        m = re.search(r"^display version (.+)$", r.stdout, re.M)
+        if m:
+            j.datos["version"] = m.group(1).strip()
+        self._extraer_extraido(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
 
     # Un homebrew NRO: el recompilador lo toma tal cual (su RomFS, si tiene, queda dentro del ejecutable); el nombre
     # y el ícono salen de su sección ASET.

@@ -150,7 +150,96 @@ class Ssbu(Especial):
                                 cwd=self.repo(), start_new_session=True)
 
 
-ESPECIALES = {"0100f2c0115b6000": Totk(), "01006a800016e000": Ssbu()}
+class Hookshot(Especial):
+    """Hookshot Builder (NotRexed/Hookshot, GPL-3.0): Ocarina of Time de Switch 2 nativo. Se usa como programa aparte
+    (hookshot-builder --cli, es decir nx2/make_game.py del AppImage), así cada uno se actualiza
+    por su lado. Toma el juego de un dump propio, como .nup o como carpeta con exefs/ y romfs/; el --check de Hookshot
+    dice si es el juego y la versión que sabe construir. La carpeta que arma queda en <juego>/hookshot y se abre con su lanzador."""
+    nombre, clave_config = "Hookshot", "hookshot_builder"
+
+    def builder(self):
+        return motor.leer_config().get(self.clave_config) or os.path.expanduser("~/Applications/Hookshot/hookshot-builder")
+
+    def repo(self):
+        return os.path.dirname(self.builder())
+
+    def sirve(self, j):
+        # La versión la revisa make_game.py --check; aquí basta con que Hookshot esté instalado.
+        return os.access(self.builder(), os.X_OK)
+
+    def salida(self, j):
+        return os.path.join(j.carpeta, "hookshot")
+
+    def exe(self, j):
+        return os.path.join(self.salida(j), "bin", "hookshot")
+
+    def _cli(self, *args):
+        return [self.builder(), "--cli", *args]
+
+    def _fuentes(self, j):
+        """Los argumentos de make_game.py que dicen dónde está el juego."""
+        h = j.datos.get("hookshot") or {}
+        if h.get("nup"):
+            if not os.path.isfile(h["nup"]):
+                raise RuntimeError(f"ya no está {h['nup']}; agrega el juego otra vez")
+            return ["--nup", h["nup"]]
+        if not (os.path.isdir(h.get("exefs", "")) and os.path.isdir(h.get("romfs", ""))):
+            raise RuntimeError("falta la carpeta del juego (exefs/ y romfs/); agrégalo otra vez")
+        return ["--romfs", h["romfs"], "--exefs", h["exefs"]]
+
+    def extraer(self, c, j):
+        """Sin copiar nada: Hookshot lee el dump directamente. Solo se anotan sus carpetas, el nombre y el ícono."""
+        carpeta = j.datos["origen"]["base"]
+        if motor.tipo(carpeta) == "nup":
+            j.datos["hookshot"] = {"nup": carpeta}
+            if j.datos.get("nombre") in (None, "", os.path.splitext(os.path.basename(carpeta))[0]):
+                j.datos["nombre"] = "The Legend of Zelda: Ocarina of Time"
+            j.guardar()
+            c._linea("extraer", 1, f"Dump: {carpeta} (Hookshot lo lee directamente)")
+            return
+        exefs = motor._carpeta_exefs(carpeta) if os.path.isdir(carpeta) else None
+        hijos = {n.lower(): os.path.join(carpeta, n) for n in os.listdir(carpeta)} if exefs else {}
+        romfs = hijos.get("romfs")
+        if not exefs or not romfs or not os.path.isdir(romfs):
+            raise RuntimeError("Hookshot necesita el juego como carpeta de tu dump, con exefs/ y romfs/ adentro")
+        j.datos["hookshot"] = {"exefs": exefs, "romfs": romfs}
+        if j.datos.get("nombre") in (None, "", os.path.basename(os.path.normpath(carpeta))):
+            j.datos["nombre"] = "The Legend of Zelda: Ocarina of Time"
+        for n in ("icon.jpg", "icon.png"):
+            if n in hijos:
+                shutil.copyfile(hijos[n], os.path.join(j.carpeta, n))
+        j.guardar()
+        c._linea("extraer", 1, f"Dump: {exefs} y {romfs}")
+
+    def recompilar(self, c, j):
+        fuentes = self._fuentes(j)
+        malo = []
+
+        def revisar(linea):
+            m = re.match(r"@@check (ok|bad) (.*)", linea)
+            if m and m.group(1) == "bad":
+                malo.append(m.group(2))
+            return None
+        # --check mira solo el código: el .nup, o el exefs de la carpeta (sin --romfs)
+        revisar_con = fuentes if fuentes[0] == "--nup" else fuentes[2:]
+        c._ejecutar("recompilar", self._cli("--check", *revisar_con), revisar)
+        if malo:
+            raise RuntimeError("Hookshot no puede construir este juego: " + malo[0])
+
+    def compilar(self, c, j):
+        fuentes = self._fuentes(j)
+        idioma = j.datos["ajustes"].get("idioma", "es-419")
+        c._ejecutar("compilar", self._cli(*fuentes, "--out", self.salida(j), "--language", idioma),
+                    lambda l: float(l.split()[1]) if l.startswith("@@progress ") else None)
+
+    def lanzar(self, j, log):
+        # El lanzador de la carpeta (hookshot) abre el juego como lo haría Hookshot Builder.
+        lanzador = os.path.join(self.salida(j), "hookshot")
+        cmd = [lanzador] if os.access(lanzador, os.X_OK) else [self.exe(j)]
+        return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=self.salida(j), start_new_session=True)
+
+
+ESPECIALES = {"0100f2c0115b6000": Totk(), "01006a800016e000": Ssbu(), "0400486024dec000": Hookshot()}
 
 
 def para(j):

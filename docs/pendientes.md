@@ -147,6 +147,7 @@ Ampere (NVN2). Se avanza por capas, de lo más acotado a lo más grande. Pruebas
    `zbic` de kinnay (GPLv2, de Atmosphère) instalado con `make pydeps` en `.pydeps/`; NPDM con espacio
    de 42 bits, Flags1 (pila sombra), RemoteMemorySize y ACID de RSA-3072 (0x180 bytes; el ACI0 se busca
    siempre por los offsets del META). `tests/nso_test.py` reempaqueta `multi` en ZBIC y exige el mismo C.
-   Falta: el contenedor de los juegos de Switch 2 y los servicios nuevos (sin documentación pública ni un
+   Contenedor `.nup` (dumps de Switch 2 ya descifrados): `tools/nup.py` (propio, MIT), y NX2Linux lo acepta.
+   Ocarina of Time `0400486024dec000` lo construye Hookshot (motor especial). Falta: los servicios nuevos (sin documentación pública ni un
    dump propio para probar), y la carga de wkc0-wkc9 (LoadBrowserCoreDll, bit 7 del ACID).
 5. [ ] GPU: NVN2, clases de Ampere y traductor de shaders SASS de Ampere (lo más grande).

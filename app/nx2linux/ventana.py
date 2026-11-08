@@ -96,7 +96,7 @@ class Ventana(Adw.ApplicationWindow):
         self.flow.set_filter_func(self._filtro)
         self.flow.connect("child-activated", lambda _f, hijo: self.abrir_juego(hijo.juego))
         self.vacio = Adw.StatusPage(icon_name="applications-games-symbolic", title="Tu biblioteca está vacía",
-                                    description="Agrega la copia de un juego tuyo (NSP, NSZ, XCI o XCZ), con su "
+                                    description="Agrega la copia de un juego tuyo (NSP, NSZ, XCI, XCZ o NUP de Switch 2), con su "
                                                 "actualización y DLC si los tienes. NX2Linux lo convierte en un "
                                                 "programa de Linux que corre nativo, sin emulador.")
         b = Gtk.Button(label="Agregar un juego", halign=Gtk.Align.CENTER)
@@ -155,7 +155,7 @@ class Ventana(Adw.ApplicationWindow):
         llaves = motor.llaves_conocidas()
         d = Adw.AlertDialog(heading="Agregar un juego",
                             body="Elige la carpeta con el juego (y su actualización y DLC), o los archivos "
-                                 "sueltos: NSP, NSZ, XCI, XCZ, NCA, NRO, una carpeta de NCA o un juego ya "
+                                 "sueltos: NSP, NSZ, XCI, XCZ, NCA, NRO, NUP, una carpeta de NCA o un juego ya "
                                  "extraído (con su ExeFS). Tienen que ser copias de tus propios juegos." +
                                  ("" if llaves else "\n\nSin prod.keys solo se pueden agregar homebrew NRO y "
                                                     "juegos ya extraídos; elígelo en Preferencias para lo demás."))
