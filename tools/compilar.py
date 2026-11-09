@@ -145,7 +145,7 @@ def main():
     signal.signal(signal.SIGTERM, cancel_compilation)
     signal.signal(signal.SIGINT, cancel_compilation)
     prepare_dispatch(os.path.join(args.carpeta, "programa.c"))
-    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c",
+    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c", "nxhle.c",
                ]
     # La capa NVN y el backend Vulkan de totk-pc-recomp (runtime/nvn/, con sus archivos de adaptación)
     nvn = os.path.join(ROOT, "runtime", "nvn")

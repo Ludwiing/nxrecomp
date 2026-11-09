@@ -49,7 +49,7 @@ static void wait_until(uint64_t at) {
 
 static void present_main(void *arg) {
     (void)arg;
-    uint64_t last = 0, last_queued = 0;
+    uint64_t last = 0, last_queued = 0, prev_at = 0;
     plat_mutex_lock(&pl);
     for (;;) {
         while (!pending) plat_cond_wait(&pcv, &pl);
@@ -59,7 +59,19 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         if (flight_on) vk_thumbs_frame(j.frame);
-        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        // Frame generation (TOTK_FRAMEGEN=on, vk_framegen.c): with the game between 10 and 40 fps (25 to 100 ms from its
+        // last display time to this one) a picture between the two goes out halfway, before this frame
+        uint64_t mid = 0;
+        if (vk_framegen_on() && j.at && prev_at && j.at > prev_at) {
+            uint64_t iv = j.at - prev_at;
+            if (iv >= 25000000ull && iv <= 100000000ull) mid = j.at - iv / 2;
+        }
+        if (mid)
+            vk_present_blit_fg(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL, j.frame, 1);
+        if (vk_framegen_on())
+            vk_present_blit_fg(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL, j.frame, 0);
+        else
+            vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
@@ -69,6 +81,11 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         uint64_t t0 = kern_now_ns();
+        if (mid) {
+            wait_until(mid);
+            vk_present_flip();
+        }
+        prev_at = j.at;
         wait_until(j.at);
         uint64_t t1 = kern_now_ns();
         vk_present_flip();

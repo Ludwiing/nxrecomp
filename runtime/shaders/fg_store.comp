@@ -1,0 +1,13 @@
+#version 450
+// Generación de cuadros, paso 1: guarda el recorte del cuadro del juego (color, RGBA16F) en la historia.
+// Push: x, y del recorte en la fuente, ancho, alto, ancho y alto de la fuente.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D fuente;
+layout(binding = 3, rgba16f) uniform writeonly image2D salida;
+layout(push_constant) uniform P { vec2 origen; vec2 tam; vec2 fuente_tam; vec2 _r; } p;
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, ivec2(p.tam)))) return;
+    vec2 uv = (p.origen + vec2(g) + 0.5) / p.fuente_tam;
+    imageStore(salida, g, vec4(textureLod(fuente, uv, 0.0).rgb, 1.0));
+}

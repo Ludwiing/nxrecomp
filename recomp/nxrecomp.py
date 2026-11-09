@@ -233,6 +233,62 @@ def emit_function(mod, f, strong, out, stats):
 _EMITIR = None   # (prog, strong, sustituidas, bloques): lo heredan por fork los procesos de emitir_bloque
 
 
+def cuerpo_sustituida(nombre, que):
+    """El C de una función del juego sustituida: ("c", funcion_c) llama al runtime, ("valor", n) devuelve n en x0 y
+    ("aviso", símbolo) devuelve 0 y anota la primera llamada (nxhle_aviso, runtime/nxhle.c)."""
+    tipo, v = que
+    if tipo == "valor":
+        return f"void {nombre}(Ctx *c) {{ nx_enter(c); c->x[0] = {v}ull; }}"
+    if tipo == "aviso":
+        return (f"void nxhle_aviso(Ctx *c, const char *simbolo);\n"
+                f"void {nombre}(Ctx *c) {{ nx_enter(c); nxhle_aviso(c, \"{v}\"); }}")
+    return f"void {v}(Ctx *c);\nvoid {nombre}(Ctx *c) {{ nx_enter(c); {v}(c); }}"
+
+
+def leer_sustituciones(rutas, simbolos, en_texto):
+    """{dirección: (tipo, valor)} de los archivos de sustituciones, en orden (un archivo posterior manda sobre uno
+    anterior). Cada línea: "símbolo funcion_c", "símbolo =VALOR" (devuelve VALOR), "símbolo !" (devuelve 0 y avisa la
+    primera vez). Un símbolo que termina en * es un prefijo: vale para todas las funciones del juego que empiezan así,
+    salvo las que tienen su propia línea exacta. Devuelve también los símbolos exactos que el juego no tiene."""
+    exactas, prefijos, faltan = {}, [], []
+    for ruta in rutas:
+        if not ruta or not os.path.exists(ruta):
+            continue
+        for linea in open(ruta):
+            campos = linea.split("#")[0].split()
+            if len(campos) != 2:
+                continue
+            sim, acc = campos
+            if acc == "!":
+                que = ("aviso", None)
+            elif acc.startswith("="):
+                que = ("valor", int(acc[1:], 0) & 0xFFFFFFFFFFFFFFFF)
+            elif acc.isidentifier():
+                que = ("c", acc)
+            else:
+                print(f"sustituir: no se entiende la línea \"{linea.strip()}\" (se ignora)")
+                continue
+            if sim.endswith("*"):
+                prefijos.append((sim[:-1], que))
+            else:
+                exactas[sim] = que
+    resultado = {}
+    if prefijos:
+        for sim, a in simbolos.items():
+            if not en_texto(a) or sim in exactas:
+                continue
+            for pre, que in prefijos:   # el último prefijo que coincide manda
+                if sim.startswith(pre):
+                    resultado[a] = (que[0], sim if que[0] == "aviso" else que[1])
+    for sim, que in exactas.items():
+        a = simbolos.get(sim)
+        if a is None or not en_texto(a):
+            faltan.append(sim)
+            continue
+        resultado[a] = (que[0], sim if que[0] == "aviso" else que[1])
+    return resultado, faltan
+
+
 def emitir_bloque(k):
     """Escribe en memoria el C del bloque k: [(nombre de archivo, texto)], las estadísticas y cuántas funciones tiene."""
     prog, strong, sustituidas, bloques = _EMITIR
@@ -247,9 +303,8 @@ def emitir_bloque(k):
 
     for f in bloques[k]:
         if f in sustituidas:
-            buf.append(f"void {sustituidas[f]}(Ctx *c);")
             # nx_enter consume un salto de cola pendiente: el juego suele llegar aquí con B/BR.
-            buf.append(f"void {fname(f)}(Ctx *c) {{ nx_enter(c); {sustituidas[f]}(c); }}")
+            buf.append(cuerpo_sustituida(fname(f), sustituidas[f]))
         else:
             desde = len(buf)
             emit_function(prog, f, strong, buf, stats)
@@ -288,8 +343,10 @@ def main():
     ap.add_argument("--traza", action="store_true", help="guardar en c->pc la dirección de cada instrucción")
     ap.add_argument("--pistas", help="archivo con direcciones (una por línea) que también son funciones: las "
                     "que el runtime anotó en NX_PISTAS al saltar a código sin recompilar")
-    ap.add_argument("--sustituir", help="archivo con líneas \"símbolo funcion_c\": la función del juego con ese "
-                    "símbolo no se recompila; su cuerpo llama a void funcion_c(Ctx *) del runtime (HLE, p. ej. NVN)")
+    ap.add_argument("--sustituir", action="append", default=[],
+                    help="archivo con líneas \"símbolo funcion_c\" (la función del juego con ese símbolo no se "
+                    "recompila: su cuerpo llama a void funcion_c(Ctx *) del runtime, HLE), \"símbolo =VALOR\" o "
+                    "\"símbolo !\"; un símbolo terminado en * es un prefijo. Se puede repetir (el último manda)")
     ap.add_argument("--progreso", action="store_true", help="líneas \"progreso i/n\" al escribir las funciones (para la app)")
     ap.add_argument("--hilos", type=int, default=0, help="procesos que escriben el C (por defecto, según núcleos y memoria)")
     ap.add_argument("--sin-optimizar-desde", type=int, default=SIN_OPTIMIZAR_DESDE,
@@ -314,19 +371,15 @@ def main():
             if prog.in_text(a) and not a & 3:
                 pistas.add(a)
         print(f"pistas: {len(pistas)} direcciones extra")
-    sustituidas = {}   # dirección -> función C del runtime que la reemplaza
-    if args.sustituir and os.path.exists(args.sustituir):
-        for linea in open(args.sustituir):
-            campos = linea.split("#")[0].split()
-            if len(campos) != 2:
-                continue
-            a = prog.symbols.get(campos[0])
-            if a is None or not prog.in_text(a):
-                print(f"sustituir: el símbolo {campos[0]} no existe en el juego (se ignora)")
-                continue
-            sustituidas[a] = campos[1]
-            pistas.add(a)
-        print(f"sustituir: {len(sustituidas)} funciones del juego reemplazadas por el runtime")
+    # dirección -> (tipo, valor): lo que reemplaza a esa función del juego (cuerpo_sustituida)
+    sustituidas, faltan = leer_sustituciones(args.sustituir, prog.symbols, prog.in_text)
+    if args.sustituir:
+        for sim in faltan:
+            print(f"sustituir: el símbolo {sim} no existe en el juego (se ignora)")
+        pistas.update(sustituidas)
+        cuenta = {t: sum(1 for q in sustituidas.values() if q[0] == t) for t in ("c", "valor", "aviso")}
+        print(f"sustituir: {len(sustituidas)} funciones del juego reemplazadas por el runtime "
+              f"({cuenta['c']} en C, {cuenta['valor']} con un valor fijo, {cuenta['aviso']} con aviso)")
     strong, entries = discover(prog, prog.entry_points() | set(boot["inits"]) | pistas)
 
     os.makedirs(args.output, exist_ok=True)

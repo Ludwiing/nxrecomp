@@ -1,0 +1,43 @@
+#version 450
+// Block-linear -> lineal en la GPU (vk_deswizzle.c): la misma dirección que nvn_bl_offset / tex_bl_copy de
+// runtime/nvn/tex_deswizzle.c, de a 16 bytes. Cada invocación toma un segmento de 16 bytes (x % 16 = 0) de una fila
+// de bloques y lo copia a la fila lineal. Los 16 bytes de un segmento están juntos en el GOB (x % 16 y la fila no
+// se mezclan), así que basta un uvec4 por invocación.
+//
+//   GOB = 64 bytes x 8 filas; dentro del GOB (x % 64 / 32) * 256 + (y % 8 / 2) * 64 + (x % 32 / 16) * 32 + (y % 2) * 16;
+//   Switch 2 (p.switch2): el mismo con los bits 5 y 6 intercambiados.
+//   bloque = 1 GOB de ancho x 2^th GOBs de alto x 2^td de profundidad, primero y y luego z dentro del bloque; los bloques
+//   llenan el nivel en orden x -> y -> z.
+// Fila parcial: la última columna de 16 bytes se copia entera; los bytes de más caen en el relleno de la fila de
+// salida (pitch16 >= cols), que la copia a la imagen no lee.
+//
+// Despacho: (gx, gy, cortes) grupos de 64; el índice plano (grupo y * gx * 64 + x global) recorre cols * rows.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Entrada { uvec4 bl[]; };
+layout(std430, binding = 1) writeonly buffer Salida { uvec4 lin[]; };
+layout(push_constant) uniform P {
+    uint in_base, out_base;   // en unidades de 16 bytes: inicio del nivel (entrada) y de su primera fila (salida)
+    uint cols, rows;          // columnas de 16 bytes por fila, filas de bloques
+    uint pitch16;             // paso de la fila de salida, en unidades de 16 bytes
+    uint gobs_x, blocks_y;    // GOBs por fila, filas de bloques del nivel
+    uint th, td;              // alto y profundidad del bloque en GOBs (log2)
+    uint switch2;             // 1: GOB de Switch 2
+    uint gx;                  // grupos en x
+} p;
+
+void main() {
+    uint i = gl_WorkGroupID.y * p.gx * 64u + gl_GlobalInvocationID.x;
+    if (i >= p.cols * p.rows) return;
+    uint y = i / p.cols, col = i - y * p.cols, z = gl_WorkGroupID.z;
+    uint x = col * 16u;
+    uint bh = 1u << p.th, bd = 1u << p.td;
+    uint block = 32u << (p.th + p.td);   // un bloque en unidades de 16 bytes (512 bytes por GOB)
+    uint g = (x % 64u / 32u) * 256u + (y % 8u / 2u) * 64u + (x % 32u / 16u) * 32u + (y % 2u) * 16u;
+    if (p.switch2 != 0u) g = (g & ~0x60u) | ((g & 0x20u) << 1) | ((g & 0x40u) >> 1);
+    uint off = (z / bd) * p.gobs_x * p.blocks_y * block      // capa de bloques (profundidad)
+             + (y / (8u * bh)) * p.gobs_x * block              // fila de bloques
+             + (x / 64u) * block                               // columna de bloques
+             + ((z % bd) * bh + (y % (8u * bh)) / 8u) * 32u    // GOB dentro del bloque
+             + g / 16u;
+    lin[p.out_base + (z * p.rows + y) * p.pitch16 + col] = bl[p.in_base + off];
+}

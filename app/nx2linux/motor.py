@@ -53,6 +53,7 @@ AJUSTES_POR_DEFECTO = {
     "idioma": "es-419",
     "pantalla_completa": False,
     "audio": True,
+    "generacion_cuadros": False,   # TOTK_FRAMEGEN del runtime NVN (vk_framegen.c)
     "variables": "",          # líneas CLAVE=VALOR extra para el entorno del juego
 }
 
@@ -261,6 +262,12 @@ def revisar_archivo(archivo):
         raise RuntimeError(f"{nombre} no parece un NSP, NSZ, XCI ni XCZ (no empieza como uno). ¿Está completo?")
 
 
+def _ultima_linea(texto):
+    """La línea que explica un error de Python: la última de su traceback (la primera es "Traceback ...")."""
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+    return lineas[-1][:400] if lineas else "error desconocido"
+
+
 def _primera_linea_error(texto):
     for linea in texto.splitlines():
         linea = linea.strip()
@@ -323,7 +330,7 @@ def title_id(archivo, llaves):
                            capture_output=True, text=True)
         m = re.search(r"^base ([0-9a-f]{16})$", r.stdout, re.M)
         if not m:
-            raise RuntimeError(f"no se pudo leer {os.path.basename(archivo)}: " + _primera_linea_error(r.stderr or r.stdout))
+            raise RuntimeError(f"no se pudo leer {os.path.basename(archivo)}: " + _ultima_linea(r.stderr or r.stdout))
         return int(m.group(1), 16)
     if t == "extraido":
         exefs = _carpeta_exefs(archivo)
@@ -634,7 +641,7 @@ class Construccion:
         j = self.juego
         o = j.datos["origen"]
         e = motor_especial(j)
-        if e and hasattr(e, "extraer"):  # el port lee el juego a su manera (Hookshot: el dump tal cual)
+        if e and hasattr(e, "extraer"):  # el port lee el juego a su manera (p. ej. el dump tal cual)
             return e.extraer(self, j)
         t = tipo(o["base"])
         if t == "extraido":
@@ -770,6 +777,7 @@ class Construccion:
     # faltan en el runtime (solo informa: el registro dice qué arreglar si no arranca).
     def _recompilar(self):
         j = self.juego
+        self._anotar_plataforma()
         e = motor_especial(j)
         if e:
             self._linea("recompilar", 0, f"Motor especial para este juego: {e.nombre} ({e.repo()})")
@@ -790,9 +798,26 @@ class Construccion:
         self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "recomp", "nxrecomp.py"),
                                       os.path.join(j.carpeta, "ExeFS"), "-o", os.path.join(j.carpeta, "c"), "--progreso",
                                       "--pistas", pistas,
-                                      "--sustituir", os.path.join(ROOT, "recomp", "sustituciones.txt")], prog)
+                                      "--sustituir", os.path.join(ROOT, "recomp", "sustituciones.txt")]
+                      + (["--sustituir", os.path.join(ROOT, "recomp", "sustituciones-switch2.txt")]
+                         if j.datos.get("plataforma") == "switch2" else []), prog)
         j.datos["pistas_usadas"] = _contar_pistas(pistas)
         j.guardar()
+
+    def _anotar_plataforma(self):
+        """Switch 1 o Switch 2 (recomp/nso.py plataforma), según el ExeFS extraído; queda en juego.json."""
+        j = self.juego
+        exefs = os.path.join(j.carpeta, "ExeFS")
+        if not os.path.isdir(exefs):
+            return
+        sys.path.insert(0, os.path.join(ROOT, "recomp"))
+        from nso import plataforma
+        cual, razones = plataforma(exefs)
+        j.datos["plataforma"] = cual
+        j.guardar()
+        if cual == "switch2":
+            self._linea("recompilar", 0, "Juego de Switch 2 (" + ", ".join(razones) + "). El código se recompila, pero "
+                        "la GPU de Switch 2 (NVN2) todavía no está en el runtime: sin un motor especial no se va a ver.")
 
     # Paso 3: clang en todos los núcleos.
     def _compilar(self):
@@ -858,6 +883,7 @@ def entorno_juego(j):
     env["NX_SDMC"] = os.path.join(j.carpeta, "guardado", "sdmc")
     env["NX_GUARDADO"] = os.path.join(j.carpeta, "guardado")
     env["NX_TITLE_ID"] = j.id
+    env["NX_PLATAFORMA"] = j.datos.get("plataforma", "switch1")   # runtime/nvn/tex_deswizzle.c: GOB de Switch 2
     env["NX_PISTAS"] = os.path.join(j.carpeta, "pistas.txt")
     env["NX_TITULO"] = j.nombre
     if leer_config().get("usuario"):
@@ -870,6 +896,8 @@ def entorno_juego(j):
         env["NX_PANTALLA_COMPLETA"] = "1"
     if not aj["audio"]:
         env["NX_SIN_AUDIO"] = "1"
+    if aj.get("generacion_cuadros"):
+        env["TOTK_FRAMEGEN"] = "on"
     for linea in (aj.get("variables") or "").splitlines():
         if "=" in linea and not linea.strip().startswith("#"):
             k, v = linea.split("=", 1)

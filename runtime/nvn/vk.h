@@ -145,6 +145,20 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
                   VkImage dst, const int out[4]);
 void vk_fsr_release(void);   // before the device goes away
+// Frame generation on the present (vk_framegen.c, TOTK_FRAMEGEN=on). vk_framegen_store records the copy of src's crop
+// {x, y, w, h} (and its luma) into the history, once per game frame; vk_framegen_interp, after it, records the picture
+// at t between the previous frame and this one and returns it (RGBA16F, GENERAL, the crop's size), or VK_NULL_HANDLE
+// while the history holds less than two frames.
+int vk_framegen_on(void);
+int vk_framegen_store(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int rect[4],
+                      uint64_t frame);
+VkImage vk_framegen_interp(VkCommandBuffer cb, float t);
+void vk_framegen_reset(void);
+void vk_framegen_release(void);   // before the device goes away
+// vk_present_blit for game frame `frame` with frame generation: the frame goes into its history; interp = 1 presents the
+// in-between picture instead (vk_present_flip then sends the waiting presents one by one, oldest first).
+void vk_present_blit_fg(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], uint64_t frame,
+                        int interp);
 // Colour adjustment on the present (vk_color.c): with TOTK_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
 // scales that one instead, crop {0, 0, w, h}); VK_NULL_HANDLE = nothing recorded. src is in GENERAL, fmt its format.
@@ -352,6 +366,22 @@ void vk_astc_time_enable(int on);
 int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us);   // totals so far
 void vk_astc_time_summary(void);        // logs the totals
 void vk_astc_release(void);             // vk_device.c, before the device goes: frees the decoder's objects
+// ---- deswizzle en la GPU (vk_deswizzle.c). TOTK_DESWIZZLE = auto | gpu | cpu; ver vk_deswizzle.c.
+enum { VK_DESWIZZLE_CPU, VK_DESWIZZLE_GPU, VK_DESWIZZLE_AUTO };
+int vk_deswizzle_mode(void);            // se decide una vez por dispositivo (crea el pipeline); CPU si falló
+int vk_deswizzle_wants(VkDeviceSize linear_bytes);   // 1: una parte de subida de ese tamaño va a la GPU
+// Un nivel y capa: sus bytes block-linear (bloques enteros) en src del buffer de entrada; sus filas lineales, de pitch
+// bytes cada una (múltiplo de 16, >= row_bytes redondeado a 16), en dst de la salida, los cortes uno detrás de otro.
+typedef struct { VkDeviceSize src, dst; uint32_t row_bytes, rows, slices, pitch; uint8_t th, td; } VkDeswizzleRegion;
+// 1 cuando vk_deswizzle_record aceptaría estas regiones (tamaños y límites del dispositivo); no graba nada.
+int vk_deswizzle_fits(const VkDeswizzleRegion *rg, int n, VkDeviceSize in_size, VkDeviceSize out_size);
+// Graba en cb, el lote de subida abierto: src (TRANSFER_SRC, src_size bytes) va a un buffer de trabajo del
+// dispositivo y un despacho por región escribe las filas lineales. Al volver, *out (TRANSFER_SRC, vive hasta que el
+// lote termine) tiene la salida desde *out_off, y una barrera deja las escrituras visibles para copias y cómputo.
+// 0 si no se puede (modo cpu, sin pipeline, fuera de límites o sin memoria): no grabó nada y toca el procesador.
+int vk_deswizzle_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkDeswizzleRegion *rg, int n,
+                        VkDeviceSize out_size, VkBuffer *out, VkDeviceSize *out_off);
+void vk_deswizzle_release(void);        // vk_device.c, antes de que se vaya el dispositivo
 void vk_mem_note_submit(uint64_t timeline_value);  // vk_sync.c: after each submit that signals ctx->timeline with this value
 void vk_mem_collect(void);                         // frees what has completed
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;

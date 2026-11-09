@@ -1,0 +1,37 @@
+#version 450
+// Paso 3: búsqueda simétrica por bloques sobre el cuadro intermedio. Cada hilo toma un bloque de lado×lado de luma (4×4
+// = 16x16 píxeles reales) en la posición del cuadro que se va a armar y busca el v (hasta ±R) con el que el anterior en x - v/2
+// y el actual en x + v/2 menos difieren (suma de diferencias absolutas; medio píxel con muestreo bilineal). Los
+// vectores largos pagan un poco más, para que una zona plana no elija un salto al azar. Sale v en píxeles de luma: lo
+// que estaba en x en el anterior está en x + v en el actual.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D actual;
+layout(binding = 1) uniform sampler2D anterior;
+layout(binding = 3, rgba16f) uniform writeonly image2D vectores;
+layout(push_constant) uniform P { vec2 bloques; vec2 luma_tam; float radio; float castigo; float lado; float _r; } p;
+float sad(vec2 base, vec2 v) {
+    int B = int(p.lado);
+    float s = 0.0;
+    vec2 m = 0.5 * v;
+    for (int y = 0; y < B; y++)
+        for (int x = 0; x < B; x++) {
+            vec2 q = base + vec2(x, y) + 0.5;
+            s += abs(textureLod(actual, (q + m) / p.luma_tam, 0.0).r - textureLod(anterior, (q - m) / p.luma_tam, 0.0).r);
+        }
+    return s;
+}
+void main() {
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(b, ivec2(p.bloques)))) return;
+    vec2 base = vec2(b) * p.lado;
+    int R = int(p.radio);
+    vec2 mejor = vec2(0.0);
+    float costo = sad(base, vec2(0.0)) * 0.98;   // quieto gana los empates
+    for (int dy = -R; dy <= R; dy++)
+        for (int dx = -R; dx <= R; dx++) {
+            vec2 v = vec2(dx, dy);
+            float c = sad(base, v) + p.castigo * length(v);
+            if (c < costo) { costo = c; mejor = v; }
+        }
+    imageStore(vectores, b, vec4(mejor, 0.0, 0.0));
+}

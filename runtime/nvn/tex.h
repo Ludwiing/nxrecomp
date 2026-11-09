@@ -9,6 +9,8 @@
 #include "vk.h"
 
 // ---- tex_deswizzle.c (MacNativeGames nvn_deswizzle.c, MIT) ----
+int nvn_gob_switch2(void);              // 1 con NX_PLATAFORMA=switch2: GOB de Switch 2 (bits 5 y 6 cambiados)
+uint32_t nvn_gob_swap56(uint32_t o);    // intercambia los bits 5 y 6 de un offset dentro del GOB
 // Block-linear <-> linear for one level and layer of a texture. The linear side is laid out by block rows: dst_pitch
 // bytes per row (>= row bytes of the level), compressed formats one block row per row, 3D textures slice k at
 // dst + k * dst_pitch * block rows. LINEAR / LINEAR_RENDER_TARGET storage is copied by pitch. Multisampled and BUFFER
@@ -30,6 +32,31 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer, uin
 // The copy loop on its own, for callers that know the level geometry (bl points at the level's first byte).
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
                  unsigned th, unsigned td, int to_linear);
+// Bytes que ocupa un nivel block-linear (bloques enteros): lo que el deswizzle de la GPU sube por nivel y capa.
+static inline uint64_t nvn_bl_level_size(uint32_t row_bytes, uint32_t rows, uint32_t slices, unsigned th, unsigned td) {
+    uint64_t bh = 1ull << th, bd = 1ull << td;
+    return (row_bytes + 63) / 64 * ((rows + 8 * bh - 1) / (8 * bh)) * ((slices + bd - 1) / bd) * (512ull << th << td);
+}
+// Constantes de runtime/shaders/deswizzle.comp (vk_deswizzle.c y tests/deswizzle_gpu_test.c), en unidades de 16 bytes.
+typedef struct {
+    uint32_t in_base, out_base, cols, rows, pitch16, gobs_x, blocks_y, th, td, switch2, gx;
+} NvnDeswizzlePush;
+// Llena las constantes de un nivel (entrada en in_off, salida en out_off con filas de pitch bytes; los tres múltiplos
+// de 16 y pitch >= row_bytes redondeado a 16) y da los grupos del despacho: (*gx, *gy, slices).
+static inline NvnDeswizzlePush nvn_deswizzle_push(uint64_t in_off, uint64_t out_off, uint32_t pitch, uint32_t row_bytes,
+                                                  uint32_t rows, unsigned th, unsigned td, int switch2, uint32_t *gx,
+                                                  uint32_t *gy) {
+    uint32_t cols = (row_bytes + 15) / 16;
+    uint64_t groups = ((uint64_t)cols * rows + 63) / 64;
+    *gx = groups < 65535 ? (uint32_t)groups : 65535;
+    if (!*gx) *gx = 1;
+    *gy = (uint32_t)((groups + *gx - 1) / *gx);
+    if (!*gy) *gy = 1;
+    return (NvnDeswizzlePush){.in_base = (uint32_t)(in_off / 16), .out_base = (uint32_t)(out_off / 16), .cols = cols,
+                              .rows = rows, .pitch16 = pitch / 16, .gobs_x = (row_bytes + 63) / 64,
+                              .blocks_y = (rows + (8u << th) - 1) / (8u << th), .th = th, .td = td,
+                              .switch2 = (uint32_t)(switch2 != 0), .gx = *gx};
+}
 
 // ---- tex_astc.c (LAS Recomp runtime/nvn/astc.c, MIT) ----
 // ASTC LDR 2D to RGBA8, bit-exact with astcenc's 8-bit decode. blocks: row-major 16-byte blocks covering

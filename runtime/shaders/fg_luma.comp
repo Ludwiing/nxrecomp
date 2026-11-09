@@ -1,0 +1,18 @@
+#version 450
+// Paso 2: luma a un cuarto de resolución (promedio de 4x4), lo que compara la búsqueda de movimiento.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D color;
+layout(binding = 3, rgba16f) uniform writeonly image2D salida;
+layout(push_constant) uniform P { vec2 tam; vec2 _r[3]; } p;   // tamaño de la luma (cuarto)
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, ivec2(p.tam)))) return;
+    ivec2 full = textureSize(color, 0);
+    float s = 0.0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            vec3 c = texelFetch(color, min(g * 4 + ivec2(x, y), full - 1), 0).rgb;
+            s += dot(c, vec3(0.2126, 0.7152, 0.0722));
+        }
+    imageStore(salida, g, vec4(s / 16.0));
+}

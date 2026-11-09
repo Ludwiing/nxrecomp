@@ -663,6 +663,36 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // 8 GB of shared memory and the game closed before the title screen.
 #define UPLOAD_PART (32ull << 20)   // fits the staging pool (vk_staging takes up to half of its 64 MiB block)
 
+// Regiones k0..k1 de una subida para vk_deswizzle_record: dónde va cada nivel y capa block-linear en el staging
+// (*din bytes) y sus filas lineales en la salida (*dout bytes), con filas de 16 bytes. 0 si una región no tiene la
+// geometría que la subida espera o el shader no la cubre: la parte sigue en el procesador.
+static int deswizzle_plan(const Tex *e, const VkBufferImageCopy *rg, uint32_t k0, uint32_t k1, int bw, int bh, int bpb,
+                          VkDeswizzleRegion *dr, VkDeviceSize *din, VkDeviceSize *dout) {
+    const nvn_texdesc *d = &e->t.d;
+    VkDeviceSize in = 0, out = 0;
+    for (uint32_t k = k0; k < k1; k++) {
+        uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
+        uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
+        uint32_t rb, rows, slices, gbpb;
+        uint64_t base;
+        unsigned th, td;
+        if (nvn_deswizzle_geom(d, lv, ly, &rb, &rows, &slices, &base, &th, &td, &gbpb) || gbpb != (uint32_t)bpb ||
+            rb != (w + bw - 1) / bw * (uint32_t)bpb || rows != (h + bh - 1) / bh || slices != sl ||
+            base != nvn_tex_level_offset(d, lv) + (uint64_t)ly * e->t.L.layer_size)
+            return 0;
+        // Profundidad / esténcil: la copia a la imagen mide la fila con el tamaño del aspecto, no con bpb; solo filas
+        // sin relleno (pitch = rb), para que lean exactamente lo mismo que con nvn_deswizzle.
+        if ((e->f.depth || e->f.stencil) && rb % 16) return 0;
+        uint32_t pitch = (rb + 15) & ~15u;
+        dr[k] = (VkDeswizzleRegion){.src = in, .dst = out, .row_bytes = rb, .rows = rows, .slices = slices, .pitch = pitch,
+                                    .th = (uint8_t)th, .td = (uint8_t)td};
+        in += (nvn_bl_level_size(rb, rows, slices, th, td) + 15) & ~15ull;
+        out += ((VkDeviceSize)pitch * rows * slices + 15) & ~15ull;
+    }
+    *din = in, *dout = out;
+    return vk_deswizzle_fits(dr + k0, (int)(k1 - k0), in, out);
+}
+
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded, n_split;
@@ -693,6 +723,12 @@ static void upload(Tex *e) {
     VmaAllocation ralloc = NULL;
     uint8_t *rmap = NULL, *raw_copy = NULL;
     int checked = 0, parts = 1;
+    // Deswizzle en la GPU (vk_deswizzle.c, TOTK_DESWIZZLE): cuando los bytes del nivel van tal cual a la imagen o al
+    // decodificador ASTC de la GPU. Expandir RGB, ASTC en el procesador y TOTK_ASTC=check necesitan las filas lineales
+    // en el procesador; las texturas lineales no se reacomodan, y texel de 3 componentes (12 bytes) no cabe en las
+    // filas de 16 bytes del shader. Esos casos, o una parte que el shader no cubra, siguen con nvn_deswizzle.
+    int dpart = !(astc && !agpu) && !rgb && !acheck && !linear && !(bpb & (bpb - 1)) && vk_deswizzle_mode() != VK_DESWIZZLE_CPU;
+    VkDeswizzleRegion *dr = dpart ? calloc(n, sizeof *dr) : NULL;
     // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a region larger than that alone) and
     // records one copy per buffer; every part stays in the same upload batch, submitted as before. The GPU decoder
     // takes the raw blocks of every region from one buffer.
@@ -702,9 +738,35 @@ static void upload(Tex *e) {
         size = (k1 < n ? rg[k1].bufferOffset : total) - base;
         if (k0) parts++;
         VkCommandBuffer cb = vk_upload_begin();
-        uint8_t *stg = vk_staging(size, &sb, NULL);
+        VkDeviceSize din = 0, dout = 0, loff = 0;
+        int gdsw = dpart && vk_deswizzle_wants(size) && deswizzle_plan(e, rg, k0, k1, bw, bh, bpb, dr, &din, &dout);
+        if (gdsw) {   // los bytes block-linear de cada nivel y capa al staging; la GPU los reacomoda
+            VkBuffer bsb;
+            uint8_t *bst = vk_staging(din, &bsb, NULL);
+            for (k = k0; k < k1; k++) {
+                uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
+                uint64_t base = nvn_tex_level_offset(d, lv) + (uint64_t)ly * t->L.layer_size;
+                uint64_t ls = nvn_bl_level_size(dr[k].row_bytes, dr[k].rows, dr[k].slices, dr[k].th, dr[k].td);
+                uint64_t have = base < t->L.size ? t->L.size - base : 0;   // bloques que pasan del final del almacenamiento: ceros
+                if (have > ls) have = ls;
+                memcpy(bst + dr[k].src, (const uint8_t *)t->mem + base, have);
+                memset(bst + dr[k].src + have, 0, ls - have);
+            }
+            VkBuffer lbuf;
+            gdsw = vk_deswizzle_record(cb, bsb, din, dr + k0, (int)(k1 - k0), dout, &lbuf, &loff);
+            if (gdsw) sb = lbuf;
+        }
+        uint8_t *stg = gdsw ? NULL : vk_staging(size, &sb, NULL);
         if (acheck) rmap = vk_staging(decoded, &rbuf, &ralloc);
-        for (k = k0; k < k1; k++) {
+        for (k = k0; k < k1 && gdsw; k++) {   // las filas lineales quedaron en sb desde loff
+            uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height;
+            rg[k].bufferOffset = loff + dr[k].dst;
+            rg[k].bufferRowLength = dr[k].pitch / (uint32_t)bpb * (uint32_t)bw, rg[k].bufferImageHeight = dr[k].rows * (uint32_t)bh;
+            if (agpu)
+                ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = rg[k].imageExtent.depth,
+                                       .level = rg[k].imageSubresource.mipLevel, .layer = rg[k].imageSubresource.baseArrayLayer};
+        }
+        for (k = k0; k < k1 && !gdsw; k++) {
             uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
@@ -733,6 +795,7 @@ static void upload(Tex *e) {
             }
             free(tmp);
         }
+        if (gdsw) size = loff + dout;
         if (acheck) {
             raw_copy = malloc(size);
             memcpy(raw_copy, stg, size);
@@ -766,6 +829,7 @@ static void upload(Tex *e) {
     }
     free(raw_copy);
     free(ar);
+    free(dr);
     free(rg);
     uint64_t dt = kern_now_ns() - u0;
     if (e->uploaded) {

@@ -588,6 +588,12 @@ class AjustesJuego(Adw.PreferencesDialog):
         s = Adw.SwitchRow(title="Sonido", active=aj["audio"])
         s.connect("notify::active", lambda r, _p: self._poner("audio", r.get_active()))
         g.add(s)
+        s = Adw.SwitchRow(title="Generación de cuadros",
+                          subtitle="Si el juego va entre 10 y 40 fps (p. ej. 30), muestra un cuadro intermedio entre "
+                                   "cada dos: se mueve como a 60. Agrega medio cuadro de retraso. Solo juegos NVN.",
+                          active=aj.get("generacion_cuadros", False))
+        s.connect("notify::active", lambda r, _p: self._poner("generacion_cuadros", r.get_active()))
+        g.add(s)
         pag.add(g)
         g = Adw.PreferencesGroup(title="Avanzado",
                                  description="Variables de entorno extra, una CLAVE=VALOR por línea "

@@ -278,6 +278,38 @@ def parse_npdm(raw):
     }
 
 
+def plataforma(exefs):
+    """("switch2" o "switch1", [razones]) de un ExeFS extraído (carpeta con main.npdm y los NSO).
+
+    Señales de Switch 2, de más a menos firmes: el ACID firmado con RSA-3072 (su firma y su llave miden 0x180 bytes, así
+    que la magia "ACID" queda en +0x300 en vez de +0x200), RemoteMemorySize distinto de 0 (solo existe en Switch 2) y el
+    espacio de direcciones de 42 bits. Con alguna de las dos primeras es Switch 2; el espacio de 42 bits o un NSO en
+    ZBIC solos no alcanzan (ZBIC también lo usa el sistema 22.0.0+ de Switch 1)."""
+    import os
+    razones, firmes = [], 0
+    npdm = os.path.join(exefs, "main.npdm")
+    if os.path.isfile(npdm):
+        raw = open(npdm, "rb").read()
+        if raw[:4] == b"META" and len(raw) >= 0x80:
+            off, size = struct.unpack_from("<II", raw, 0x78)
+            if size >= 0x304 and raw[off + 0x300:off + 0x304] == b"ACID":
+                razones.append("ACID con firma RSA-3072")
+                firmes += 1
+            if struct.unpack_from("<I", raw, 0x10)[0]:
+                razones.append("RemoteMemorySize")
+                firmes += 1
+            if (raw[0x0C] >> 1) & 7 == 4:
+                razones.append("espacio de direcciones de 42 bits")
+    for n in ("main", "rtld", "sdk"):
+        f = os.path.join(exefs, n)
+        if os.path.isfile(f):
+            cab = open(f, "rb").read(0x10)
+            if cab[:4] == b"NSO0" and struct.unpack_from("<I", cab, 0x0C)[0] & ZBIC:
+                razones.append(f"{n} comprimido con ZBIC")
+                break
+    return ("switch2" if firmes else "switch1"), razones
+
+
 def _aci0_programa(raw):
     """El id de programa del ACI0 (su offset y tamaño están en 0x70 del META)."""
     off, size = struct.unpack_from("<II", raw, 0x70)

@@ -1,0 +1,44 @@
+#version 450
+// Paso 5: el cuadro intermedio en t (0..1). Los vectores ya están sobre el cuadro intermedio (búsqueda simétrica, un
+// vector por bloque). Cada píxel prueba el de su bloque, los de los 8 bloques vecinos y el cero, y se queda con el que
+// mejor hace coincidir los dos cuadros en una cruz de 5 píxeles a su alrededor: así un borde de objeto no se lleva el
+// vector del fondo ni al revés. Con v (píxeles reales): lo que en t está en x venía de x - t·v en el anterior y llega a
+// x + (1 - t)·v en el actual. Se mezclan las dos muestras; si aun así no se parecen (la zona se tapó o se destapó), gana
+// la del cuadro más cercano en el tiempo.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D anterior;
+layout(binding = 1) uniform sampler2D actual;
+layout(binding = 2) uniform sampler2D vectores;
+layout(binding = 3, rgba16f) uniform writeonly image2D salida;
+// escala: píxeles reales por unidad de vector; lado: del bloque, en luma
+layout(push_constant) uniform P { vec2 tam; float t; float escala; float lado; float _r[3]; } p;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+float costo(vec2 x, vec2 v) {
+    const vec2 cruz[5] = vec2[](vec2(0), vec2(2, 0), vec2(-2, 0), vec2(0, 2), vec2(0, -2));
+    float s = 0.0;
+    for (int i = 0; i < 5; i++) {
+        vec2 q = x + cruz[i];
+        s += abs(dot(textureLod(anterior, (q - p.t * v) / p.tam, 0.0).rgb, LUMA) -
+                 dot(textureLod(actual, (q + (1.0 - p.t) * v) / p.tam, 0.0).rgb, LUMA));
+    }
+    return s;
+}
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, ivec2(p.tam)))) return;
+    vec2 x = vec2(g) + 0.5;
+    ivec2 n = textureSize(vectores, 0), b = min(ivec2(x / (p.lado * p.escala)), n - 1);
+    vec2 v = vec2(0.0);
+    float mejor = costo(x, v) * 0.95;   // sin movimiento gana los empates (fondo quieto)
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            vec2 c = texelFetch(vectores, clamp(b + ivec2(dx, dy), ivec2(0), n - 1), 0).rg * p.escala;
+            float k = costo(x, c);
+            if (k < mejor) { mejor = k; v = c; }
+        }
+    vec3 a = textureLod(anterior, (x - p.t * v) / p.tam, 0.0).rgb;
+    vec3 c = textureLod(actual, (x + (1.0 - p.t) * v) / p.tam, 0.0).rgb;
+    float dif = dot(abs(a - c), vec3(0.333));
+    float w = mix(p.t, p.t < 0.5 ? 0.0 : 1.0, smoothstep(0.08, 0.3, dif));
+    imageStore(salida, g, vec4(mix(a, c, w), 1.0));
+}

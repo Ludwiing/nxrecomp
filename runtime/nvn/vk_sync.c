@@ -314,6 +314,7 @@ void vk_sync_start(void) {
         if (!completion_thread) rt_fatal("vk: cannot start the completion thread");
         __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
         vk_astc_mode();   // decides TOTK_ASTC and builds the ASTC decoder now, not at the first ASTC upload
+        vk_deswizzle_mode();   // TOTK_DESWIZZLE y el pipeline de deswizzle, también antes de la primera subida
     }
     plat_mutex_unlock(&start_lock);
 }

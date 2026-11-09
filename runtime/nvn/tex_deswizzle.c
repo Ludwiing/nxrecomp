@@ -8,11 +8,27 @@
 //   in x -> y -> z row-major order.
 // Level and layer start offsets and the block height and depth of a level come from nvn_tex.c; this file only does the
 // addressing inside a level and the copy.
+//
+// Switch 2 (NX_PLATAFORMA=switch2, que pone NX2Linux): el mismo GOB con los bits 5 y 6 de la dirección intercambiados,
+// es decir (x%32/16) va a +64 y el bit bajo de (y%8/2) a +32. El resto (bloques, niveles) es igual.
 #include "tex.h"
+#include <stdlib.h>
 #include <string.h>
 
+int nvn_gob_switch2(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("NX_PLATAFORMA");
+        v = e && !strcmp(e, "switch2");
+    }
+    return v;
+}
+
+uint32_t nvn_gob_swap56(uint32_t o) { return (o & ~0x60u) | ((o & 0x20u) << 1) | ((o & 0x40u) >> 1); }
+
 static uint32_t gob_off(uint32_t x, uint32_t y) {
-    return (x % 64 / 32) * 256 + (y % 8 / 2) * 64 + (x % 32 / 16) * 32 + (y % 2) * 16 + x % 16;
+    uint32_t o = (x % 64 / 32) * 256 + (y % 8 / 2) * 64 + (x % 32 / 16) * 32 + (y % 2) * 16 + x % 16;
+    return nvn_gob_switch2() ? nvn_gob_swap56(o) : o;
 }
 
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td) {
@@ -47,10 +63,11 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
 }
 
 // nvn_bl_offset per row instead of per 16 bytes: within a row, GOB column k starts k blocks further, and the four
-// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 32, 256 and 288 of it.
+// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 32, 256 and 288 of it (Switch 2: 0, 64, 256, 320).
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
                  unsigned th, unsigned td, int to_linear) {
-    static const uint32_t seg[4] = {0, 32, 256, 288};
+    static const uint32_t seg1[4] = {0, 32, 256, 288}, seg2[4] = {0, 64, 256, 320};
+    const uint32_t *seg = nvn_gob_switch2() ? seg2 : seg1;
     uint64_t block = 512ull << th << td;
     for (uint32_t z = 0; z < slices; z++)
         for (uint32_t y = 0; y < rows; y++) {

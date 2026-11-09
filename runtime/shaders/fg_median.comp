@@ -1,0 +1,25 @@
+#version 450
+// Paso 4: mediana 3x3 de los vectores (cada componente), quita los bloques sueltos que eligieron mal.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D entrada;
+layout(binding = 3, rgba16f) uniform writeonly image2D salida;
+layout(push_constant) uniform P { vec2 bloques; vec2 _r[3]; } p;
+float med9(float a[9]) {
+    for (int i = 0; i < 5; i++)
+        for (int j = i + 1; j < 9; j++)
+            if (a[j] < a[i]) { float t = a[i]; a[i] = a[j]; a[j] = t; }
+    return a[4];
+}
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 n = ivec2(p.bloques);
+    if (any(greaterThanEqual(g, n))) return;
+    float xs[9], ys[9];
+    int k = 0;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            vec2 v = texelFetch(entrada, clamp(g + ivec2(x, y), ivec2(0), n - 1), 0).rg;
+            xs[k] = v.x; ys[k] = v.y; k++;
+        }
+    imageStore(salida, g, vec4(med9(xs), med9(ys), 0.0, 0.0));
+}

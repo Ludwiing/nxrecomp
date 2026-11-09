@@ -1,0 +1,12 @@
+# Sustituciones para juegos de Switch 2 (NX2Linux las agrega a recomp/sustituciones.txt cuando detecta Switch 2).
+# En Switch 2 no se imitan los servicios del sistema por IPC: las funciones nn:: del SDK que el juego trae enlazadas
+# se reemplazan por las del runtime (o por un valor fijo) al recompilar. Formato (nxrecomp.py --sustituir):
+#   símbolo funcion_c    el cuerpo llama a void funcion_c(Ctx *) del runtime
+#   símbolo =VALOR       devuelve VALOR en x0
+#   símbolo !            devuelve 0 y avisa en stderr la primera vez ([hle] ...)
+#   prefijo* ...         todas las funciones cuyo símbolo empieza así (las líneas exactas mandan)
+# Los símbolos van como el juego los trae (C++ sin demangle). tools/sdk_simbolos.py lista los de un ExeFS y marca
+# los que ya tienen línea aquí.
+#
+# Fase 1: todavía vacío a propósito. Se llena con los nombres reales que salgan de tools/sdk_simbolos.py sobre un
+# dump propio, empezando por nn::gs (BootGraphicsSystem), nn::syncpt y nn::vi de Switch 2.

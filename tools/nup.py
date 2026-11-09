@@ -56,29 +56,34 @@ class Paquete:
         p_nom = 0x80 + onom
         self.f.seek(0)
         meta = self.f.read(p_nom + tnom)
-        nombres = meta[p_nom:p_nom + tnom]
-        nom = lambda o, n: nombres[o:o + n].decode("utf-8")
+        self.nombres = meta[p_nom:p_nom + tnom]
         self.titulos = []
         for i in range(nt):
             tid, raiz, exefs, romfs, ver = struct.unpack_from("<QIIII", meta, 0xb0 + 0x40 * i)
             self.titulos.append({"id": tid, "exefs": exefs, "romfs": romfs, "version": ver, "indice": i})
-        self.carpetas = [(nom(o, n), primero, cant) for o, n, primero, cant
-                         in (struct.unpack_from("<4I", meta, p_carp + 24 * i) for i in range(nc))]
+        # Los nombres se leen recién al recorrer (la raíz no tiene uno que sirva y no se usa nunca).
+        self.carpetas = [struct.unpack_from("<4I", meta, p_carp + 24 * i) for i in range(nc)]
         self.archivos = []
         for i in range(na):
             o, n, tam, off, guard = struct.unpack_from("<IIQQQ", meta, p_arch + 80 * i)
-            self.archivos.append(Archivo(nom(o, n), tam, off, guard, meta[p_arch + 80 * i + 64]))
+            self.archivos.append(Archivo((o, n), tam, off, guard, meta[p_arch + 80 * i + 64]))
         self.hijos = struct.unpack_from(f"<{(p_nom - p_hijos) // 4}I", meta, p_hijos)
         self.nc = nc
 
+    def _nombre(self, o, n):
+        return self.nombres[o:o + n].decode("utf-8", errors="replace")
+
     def recorrer(self, carpeta, prefijo=""):
         """(ruta relativa, Archivo) de todo lo que hay bajo una carpeta."""
-        _, primero, cant = self.carpetas[carpeta]
+        _, _, primero, cant = self.carpetas[carpeta]
         for h in self.hijos[primero:primero + cant]:
             if h < self.nc:
-                yield from self.recorrer(h, prefijo + self.carpetas[h][0] + "/")
+                o, n = self.carpetas[h][:2]
+                yield from self.recorrer(h, prefijo + self._nombre(o, n) + "/")
             else:
                 a = self.archivos[h - self.nc]
+                if isinstance(a.nombre, tuple):
+                    a.nombre = self._nombre(*a.nombre)
                 yield prefijo + a.nombre, a
 
     def mas_nuevo(self):

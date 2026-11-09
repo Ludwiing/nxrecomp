@@ -201,7 +201,35 @@ test-startup: $(B)/ipc_tipc_test $(B)/applet_startup_test $(B)/native_window_tes
 	python3 tests/compile_cache_test.py
 	python3 tests/compile_cancel_test.py
 
-test: all test-startup
+$(B)/framegen_test: tests/framegen_test.c runtime/nvn/fg_store_spv.h runtime/nvn/fg_luma_spv.h runtime/nvn/fg_motion_spv.h runtime/nvn/fg_median_spv.h runtime/nvn/fg_interp_spv.h | $(B)
+	$(CLANG) -O1 -Iruntime/nvn tests/framegen_test.c -lvulkan -lm -o $@
+
+# Los SPIR-V de la generación de cuadros (runtime/shaders/fg_*.comp), con glslc
+runtime/nvn/fg_%_spv.h: runtime/shaders/fg_%.comp tools/spv_header.py
+	python3 tools/spv_header.py $<
+
+$(B)/nvn2_program_test: tests/nvn2_program_test.c runtime/nvn/nvn2_program.h | $(B)
+	$(CLANG) -O1 -Iruntime/nvn tests/nvn2_program_test.c -o $@
+
+# Decodificador SM86 (Switch 2) en C contra el de Python; sm86_tablas.h se regenera a mano con tools/sm86_c.py
+$(B)/sm86_dec_test: tests/sm86_dec_test.c runtime/nvn/sm86_dec.c runtime/nvn/sm86_dec.h runtime/nvn/sm86_tablas.h | $(B)
+	$(CLANG) -O2 -march=x86-64-v3 -Wall -Wextra -Iruntime/nvn tests/sm86_dec_test.c runtime/nvn/sm86_dec.c -o $@
+
+# Corre en la GPU el SPIR-V de cómputo de un programa SM86 bajado a Maxwell (tests/sm86_programa_test.py)
+$(B)/sm86_programa_vk: tests/sm86_programa_vk.c | $(B)
+	$(CLANG) -O1 -Wall tests/sm86_programa_vk.c -lvulkan -o $@
+
+$(B)/gob_test: tests/gob_test.c runtime/nvn/tex_deswizzle.c runtime/nvn/tex.h | $(B)
+	$(CLANG) -O1 -Iruntime -Iruntime/nvn -Iruntime/nvn/third_party/vma tests/gob_test.c runtime/nvn/tex_deswizzle.c -o $@
+
+# El deswizzle en la GPU (runtime/shaders/deswizzle.comp) contra tex_bl_copy / nvn_bl_offset, Switch 1 y Switch 2
+$(B)/deswizzle_gpu_test: tests/deswizzle_gpu_test.c runtime/nvn/deswizzle_spv.h runtime/nvn/tex_deswizzle.c runtime/nvn/tex.h | $(B)
+	$(CLANG) -O1 -Iruntime -Iruntime/nvn -Iruntime/nvn/third_party/vma tests/deswizzle_gpu_test.c runtime/nvn/tex_deswizzle.c -lvulkan -o $@
+
+runtime/nvn/deswizzle_spv.h: runtime/shaders/deswizzle.comp tools/spv_header.py
+	python3 tools/spv_header.py $<
+
+test: all test-startup $(B)/framegen_test $(B)/nvn2_program_test $(B)/gob_test $(B)/deswizzle_gpu_test $(B)/sm86_dec_test $(B)/sm86_programa_vk
 	@ok=1; for p in $(PROGS) $(PROGS_ESPERADO); do \
 		NX_ROMFS=$(B)/romfs_prueba.img $(B)/$$p > $(B)/$$p.salida.txt; \
 		if [ -f guest/esperado/$$p.txt ]; then cp guest/esperado/$$p.txt $(B)/$$p.referencia.txt; \
@@ -220,10 +248,26 @@ test: all test-startup
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
 	python3 tests/nso_test.py || ok=0; \
+	python3 tests/plataforma_test.py || ok=0; \
+	$(B)/gob_test >$(B)/gob.txt 2>&1 && echo "OK: acomodo block-linear de Switch 1 y de Switch 2 (GOB con bits 5 y 6 cambiados)" || { echo "MAL: gob_test (ver $(B)/gob.txt)"; ok=0; }; \
+	python3 tests/sustituir_test.py >$(B)/sustituir.txt 2>&1 && echo "OK: sustituciones HLE (valor fijo, aviso, prefijo, varios archivos)" || { echo "MAL: sustituir_test (ver $(B)/sustituir.txt)"; ok=0; }; \
+	$(B)/nvn2_program_test >/dev/null && echo "OK: secciones de control de NVN2 (Switch 2)" || { echo "MAL: nvn2_program_test"; ok=0; }; \
+	python3 tests/sm86_dec_test.py $(B)/sm86_dec_test >$(B)/sm86_dec.txt 2>&1; r=$$?; \
+	if [ $$r = 0 ]; then echo "OK: el decodificador SM86 en C da lo mismo que el de Python ($$(head -1 $(B)/sm86_dec.txt | cut -d: -f1))"; \
+	elif [ $$r = 77 ]; then echo "(sin build/sm86_spec.json no se prueba el decodificador SM86 en C)"; else echo "MAL: decodificador SM86 en C (ver $(B)/sm86_dec.txt)"; ok=0; fi; \
+	python3 tests/sm86_programa_test.py >$(B)/sm86_programa.txt 2>&1; r=$$?; \
+	if [ $$r = 0 ]; then grep -h "^OK\|^(sin" $(B)/sm86_programa.txt; \
+	elif [ $$r = 77 ]; then echo "(sin totk_xlate o sin CUDA no se prueba la bajada de programas SM86)"; else echo "MAL: bajada de programas SM86 (ver $(B)/sm86_programa.txt)"; ok=0; fi; \
 	python3 tests/app_entradas_test.py 2>/dev/null || ok=0; \
 	$(B)/astc_test 20000 >/dev/null 2>$(B)/astc.err; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el decodificador ASTC da lo mismo que Mesa en 560 mil bloques (14 tamaños, lineal y sRGB)"; \
 	elif [ $$r = 77 ]; then echo "(sin el llvmpipe de Mesa no se prueba ASTC)"; else echo "MAL: ASTC distinto de Mesa"; ok=0; fi; \
+	$(B)/framegen_test >$(B)/framegen.txt 2>&1; r=$$?; \
+	if [ $$r = 0 ]; then echo "OK: la generación de cuadros pone el objeto a mitad de camino (vectores exactos, error < 1/2 de la mezcla)"; \
+	elif [ $$r = 77 ]; then echo "(sin Vulkan no se prueba la generación de cuadros)"; else echo "MAL: generación de cuadros (ver $(B)/framegen.txt)"; ok=0; fi; \
+	$(B)/deswizzle_gpu_test >$(B)/deswizzle_gpu.txt 2>&1; r=$$?; \
+	if [ $$r = 0 ]; then echo "OK: el deswizzle en la GPU da lo mismo que el del procesador byte a byte (Switch 1 y Switch 2, 400 geometrías)"; \
+	elif [ $$r = 77 ]; then echo "(sin Vulkan no se prueba el deswizzle en la GPU)"; else echo "MAL: deswizzle en la GPU (ver $(B)/deswizzle_gpu.txt)"; ok=0; fi; \
 	if [ -n "$(LIBNX_GPU)" ]; then \
 		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/deko_astc.ppm NX_CAPTURA_CUADRO=3 timeout 60 $(B)/libnx_deko_astc >/dev/null 2>&1; \
 		$(B)/astc_test --captura guest/libnx/deko_astc/romfs $(B)/deko_astc.ppm 2>>$(B)/astc.err; r=$$?; \
