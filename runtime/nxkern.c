@@ -15,6 +15,10 @@
 #define _GNU_SOURCE
 #include "nxkern.h"
 
+// GSV's host-side request event is signaled by the guest through SVC. The weak
+// hook keeps the kernel independent of applet services in minimal test builds.
+void nx2_syncpt_event_signaled(KEvent *event) __attribute__((weak));
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fs.h>
@@ -40,7 +44,7 @@
 #define R_CANCELLED 0xEC01u         // 118
 #define R_INVALID_ENUM 0xF001u      // 120
 #define R_INVALID_STATE 0xFA01u     // 125
-#define R_INVALID_CMB 0xE001u       // 112 InvalidCombination
+#define R_INVALID_CMB 0xE801u       // 116 InvalidCombination (Atmosphère svc_results.hpp; antes 0xE001 = 112, InvalidPriority)
 #define R_OUT_OF_MEMORY 0xD001u     // 104: el SDK solo acepta este (o el de límite) al pedir heap de más
 #define WAITERS 0x40000000u
 #define H_CUR_THREAD 0xFFFF8000u
@@ -50,6 +54,9 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sync_cv;          // se avisa con cualquier señal: WaitSynchronization lo escucha
 static __thread KThread *cur;
 static uint64_t wait_seq;
+static int tls_hooks_ready;
+
+void nx_tls_hooks_ready(void) { __atomic_store_n(&tls_hooks_ready, 1, __ATOMIC_RELEASE); }
 
 static struct timespec deadline(int64_t timeout_ns) {
     uint64_t t = nx_now_ns() + (uint64_t)timeout_ns;
@@ -88,6 +95,20 @@ static HandleEntry *handle_entry(uint32_t h) {
 // ---------- hilos ----------
 #define MAX_THREADS 512
 static KThread *threads[MAX_THREADS];
+// Límite de hilos del proceso (LimitableResource ThreadCountMax), el que dice GetResourceLimitLimitValue. pm le da 96 a
+// una aplicación y 256 con el aumento (Atmosphère pm_spec.cpp, citado por NXnative threads.md); aquí se mantiene 256,
+// el valor que el runtime ya informaba.
+#define LIMITE_HILOS 256
+
+// Hilos que ocupan el límite: creados y no terminados. En Horizon la reserva se libera al destruir el KThread (terminado
+// y sin handles abiertos); aquí al terminar, así que un hilo terminado con su handle aún abierto ya no cuenta.
+static uint64_t hilos_vivos(void) {
+    uint64_t n = 0;
+    pthread_mutex_lock(&G);
+    for (int i = 0; i < MAX_THREADS; i++) n += threads[i] && threads[i]->state != TS_EXITED;
+    pthread_mutex_unlock(&G);
+    return n;
+}
 
 // ---------- núcleos virtuales ----------
 // En Horizon un hilo corre solo en un núcleo de su máscara de afinidad, y dos hilos no comparten un núcleo a la vez: el
@@ -280,6 +301,60 @@ void nx_core_back(int away) {
 }
 static uint64_t next_thread_id = 0x50;
 static uint64_t tls_next = NX_TLS_BASE;
+static uint8_t tls_slot_used[NX_TLS_SLOTS];
+
+void nx_tls_allocate(Ctx *c) {
+    uint32_t *out = (uint32_t *)(uintptr_t)c->x[0];
+    pthread_mutex_lock(&G);
+    for (uint32_t i = 0; i < NX_TLS_SLOTS; i++) {
+        if (!tls_slot_used[i]) {
+            tls_slot_used[i] = 1;
+            pthread_mutex_unlock(&G);
+            if (out) *out = i;
+            c->x[0] = 0;
+            return;
+        }
+    }
+    pthread_mutex_unlock(&G);
+    c->x[0] = 0x2c01;
+}
+
+void nx_tls_free(Ctx *c) {
+    uint32_t slot = (uint32_t)c->x[0];
+    if (slot < NX_TLS_SLOTS) {
+        pthread_mutex_lock(&G);
+        tls_slot_used[slot] = 0;
+        pthread_mutex_unlock(&G);
+    }
+}
+
+void nx_tls_get(Ctx *c) {
+    uint32_t slot = (uint32_t)c->x[0];
+    KThread *t = nx_current_thread();
+    c->x[0] = t && slot < NX_TLS_SLOTS ? t->tls_slots[slot] : 0;
+}
+
+void nx_tls_set(Ctx *c) {
+    uint32_t slot = (uint32_t)c->x[0];
+    KThread *t = nx_current_thread();
+    if (t && slot < NX_TLS_SLOTS) {
+        t->tls_slots[slot] = c->x[1];
+        if (getenv("NX_TRAZA_TLS") && slot == 3) {
+            uint64_t field = 0;
+            if (c->x[1]) memcpy(&field, (const void *)(uintptr_t)(c->x[1] + 0x88), sizeof field);
+            fprintf(stderr, "[tls] set tid=%llu slot=3 value=0x%llx field+88=0x%llx lr=0x%llx\n",
+                    (unsigned long long)t->id, (unsigned long long)c->x[1], (unsigned long long)field, (unsigned long long)c->x[30]);
+        }
+    }
+}
+
+void nx_tls_used(Ctx *c) {
+    uint32_t n = 0;
+    pthread_mutex_lock(&G);
+    for (uint32_t i = 0; i < NX_TLS_SLOTS; i++) n += tls_slot_used[i] != 0;
+    pthread_mutex_unlock(&G);
+    c->x[0] = n;
+}
 
 static KThread *thread_new(void) {
     KThread *t = calloc(1, sizeof *t);
@@ -291,13 +366,15 @@ static KThread *thread_new(void) {
     t->ctx->excl_addr = ~0ull;
     t->vcore = t->last_vcore = -1;
     t->id = next_thread_id++;
-    t->tls = tls_next;
-    tls_next += 0x200;
-    memset((void *)(uintptr_t)t->tls, 0, 0x200);
-    // El id del hilo en ThreadLocalRegion+0x110: los mutex del SDK 22 comparan su dueño con él
-    // (si queda en 0, todo mutex libre parece del hilo actual y el SDK aborta; nxnative, Well Dweller).
-    *(uint32_t *)(uintptr_t)(t->tls + 0x110) = (uint32_t)t->id;
+    uint64_t tls_region = tls_next;
+    t->tls = tls_region + NX_THREAD_TLR_OFFSET;
+    t->tp = tls_region + NX_THREAD_TP_OFFSET;
+    tls_next += NX_THREAD_TLS_STRIDE;
+    memset((void *)(uintptr_t)tls_region, 0, NX_THREAD_TLS_STRIDE);
     t->ctx->tpidrro = t->tls;
+    // Hookshot reserva un bloque TLS de 4 KiB por hilo y sitúa TP en el centro.
+    // El SDK usa TPIDR_EL0 para TLS estático y construye su DTV desde este bloque.
+    t->ctx->tpidr = t->tp;
     for (int k = 0; k < MAX_THREADS; k++)
         if (!threads[k]) {
             threads[k] = t;
@@ -320,6 +397,13 @@ KThread *nx_kernel_main_thread(void) {
     t->mask = 1ull << t->core;
     t->state = TS_RUNNING;
     t->handle = nx_handle_new(KO_THREAD, t, 1);
+    *(uint32_t *)(uintptr_t)(t->tls + 0x110) = (uint32_t)t->id; // id del kernel (GetThreadId), no el handle: nxnative threads.md, SDK 22
+    // Horizon's SDK looks up the current nn::os::ThreadType through TLR+0x1f8.
+    // Hookshot creates this object for its main thread because the guest SDK does
+    // not. Keep it in the runtime-owned TLS mapping, outside the game's heap.
+    t->thread_type = t->tls - NX_THREAD_TLR_OFFSET + 0x400;
+    st32(t->thread_type + 0x1b0, t->handle);
+    st64(t->tls + 0x1f8, t->thread_type);
     cur = t;
     pthread_mutex_unlock(&G);
     return t;
@@ -340,6 +424,21 @@ void nx_kernel_adopt(KThread *t) {
     sigaltstack(&ss, NULL);
 }
 
+// Hook de nnmusl al iniciar (k = 0) o terminar (k = 1) un hilo creado por nx_thread_create. La entrada de la
+// GOT la halla el recompilador en la imagen (recomp/program.py thread_hook_gots); no hay direcciones de un juego
+// aquí. Sin entrada (C generado viejo o sin la firma de la entrada de hilo del SDK) no se llama ningún hook.
+static uint64_t thread_hook(int k) {
+    uint64_t got = &nx_thread_hook_got[0] ? nx_thread_hook_got[k] : 0;
+    uint64_t slot = got ? ld64(got) : 0;
+    uint64_t hook = slot ? ld64(slot) : 0;
+    if (getenv("NX_TRACE_THREAD_CREATE"))
+        fprintf(stderr, "[thread] hook %d: got=%#llx slot=%#llx function=%#llx\n", k, (unsigned long long)got,
+                (unsigned long long)slot, (unsigned long long)hook);
+    // En algunas imágenes SDK 22 el slot débil apunta a un thunk de BSS lleno de ceros: no es código traducido.
+    if (hook && !ld32(hook) && !ld32(hook + 4)) hook = 0;
+    return hook;
+}
+
 static void *thread_main(void *arg) {
     KThread *t = arg;
     cur = t;
@@ -351,9 +450,66 @@ static void *thread_main(void *arg) {
     static __thread char altstack[64 * 1024];
     stack_t ss = {.ss_sp = altstack, .ss_size = sizeof altstack};
     sigaltstack(&ss, NULL);
-    nx_en_host = 0;   // desde aquí, código del juego
-    nx_dispatch(t->ctx, t->entry);
-    nx_en_host = 1;
+    if (nx_main_addr)
+        while (!__atomic_load_n(&tls_hooks_ready, __ATOMIC_ACQUIRE)) sched_yield();
+    if (t->thread_type) {
+        if (getenv("NX_TRACE_THREAD_CREATE"))
+        {
+            uint64_t args[4] = {0};
+            int readable = nx_leer_seguro(t->thread_arg, args, sizeof args);
+            fprintf(stderr, "[thread] HLE dispatch tid=%llu tt=%#llx entry=%#llx arg=%#llx arg_words=%s",
+                    (unsigned long long)t->id, (unsigned long long)t->thread_type,
+                    (unsigned long long)t->entry, (unsigned long long)t->thread_arg,
+                    readable ? "" : "unreadable");
+            if (readable)
+                for (unsigned i = 0; i < 4; i++) fprintf(stderr, "%s%#llx", i ? "," : " ",
+                                                            (unsigned long long)args[i]);
+            fputc('\n', stderr);
+        }
+        // Técnica descrita por Hookshot (GPL-3.0; solo la idea, implementación propia): sin MapAliasStack,
+        // run nnmusl's per-thread TLS hooks, then enter the requested function.
+        st32(t->thread_type + 0x1b0, t->handle);
+        st64(t->tls + 0x1f8, t->thread_type);
+        st32(t->tls + 0x110, (uint32_t)t->id); // id del kernel, como GetThreadId
+        uint64_t hook = thread_hook(0);
+        if (hook && getenv("NX_TRACE_THREAD_CREATE"))
+            fprintf(stderr, "[thread] start-hook=%#llx words=%08x %08x %08x %08x\n",
+                    (unsigned long long)hook, ld32(hook), ld32(hook + 4), ld32(hook + 8), ld32(hook + 12));
+        if (hook) {
+            t->ctx->x[0] = t->thread_type;
+            t->ctx->x[30] = 0;
+            nx_dispatch(t->ctx, hook);
+        }
+        uint64_t tp = ld64(t->tls + 0x1f0);
+        if (tp) t->ctx->tpidr = tp;
+        t->ctx->sp = t->stack_top;
+        t->ctx->x[0] = t->thread_arg;
+        t->ctx->x[30] = 0;
+        nx_en_host = 0;
+        nx_dispatch(t->ctx, t->entry);
+        nx_en_host = 1;
+        hook = thread_hook(1);
+        if (hook) {
+            t->ctx->x[0] = t->thread_type;
+            t->ctx->x[30] = 0;
+            nx_en_host = 0;
+            nx_dispatch(t->ctx, hook);
+            nx_en_host = 1;
+        }
+    } else {
+        // SVC-created SDK trampolines still publish their ThreadType handle here.
+        if (t->entry && ld32(t->entry + 0x10) == 0xD53BD061u &&
+        ld32(t->entry + 0x14) == 0x9107E021u && ld32(t->entry + 0x18) == 0xF9000020u && t->ctx->x[0]) {
+            st32(t->ctx->x[0] + 0x1b0, t->handle);
+            st32(t->tls + 0x110, (uint32_t)t->id); // id del kernel, como GetThreadId
+            if (getenv("NX_TRACE_TLS"))
+                fprintf(stderr, "[tls] thread handle tid=%llu handle=%#x ThreadType=%#llx\n",
+                        (unsigned long long)t->id, t->handle, (unsigned long long)t->ctx->x[0]);
+        }
+        nx_en_host = 0;   // desde aquí, código del juego
+        nx_dispatch(t->ctx, t->entry);
+        nx_en_host = 1;
+    }
     nx_exit_thread();
     return NULL;
 }
@@ -419,6 +575,16 @@ static int count_waiters(int kind, uint64_t addr, KThread *owner) {
 
 static uint32_t *u32p(uint64_t a) { return (uint32_t *)(uintptr_t)a; }
 
+// Older callers pass a kernel thread handle to ArbitrateLock. Recent Switch 2 SDK mutexes pass
+// the thread ID stored in TLS instead; accept both representations.
+static KThread *thread_by_handle_or_id(uint32_t id) {
+    KThread *t = nx_handle_get(id, KO_THREAD);
+    if (t) return t;
+    for (int k = 0; k < MAX_THREADS; k++)
+        if (threads[k] && (uint32_t)threads[k]->id == id) return threads[k];
+    return NULL;
+}
+
 // ---------- mutex ----------
 // Suelta el mutex en addr que tiene `owner`: se lo pasa al que espera con más prioridad.
 static void release_mutex(KThread *owner, uint64_t addr) {
@@ -444,7 +610,7 @@ static uint32_t arbitrate_lock(uint32_t owner_h, uint64_t addr, uint32_t tag) {
         pthread_mutex_unlock(&G);
         return R_OK_;
     }
-    KThread *owner = nx_handle_get(owner_h, KO_THREAD);
+    KThread *owner = thread_by_handle_or_id(owner_h);
     if (!owner) {
         pthread_mutex_unlock(&G);
         return R_INVALID_HANDLE;
@@ -535,8 +701,12 @@ static uint32_t wait_for_address(uint64_t addr, uint32_t type, int64_t value64, 
     if (type == 3) wait = (int64_t)__atomic_load_n((uint64_t *)(uintptr_t)addr, __ATOMIC_SEQ_CST) == value64; // WaitIfEqual64 (SDK 19)
     else if (type == 0) wait = v < value;                    // WaitIfLessThan
     else if (type == 1) {                               // DecrementAndWaitIfLessThan
-        wait = v < value;
-        if (wait) __atomic_store_n(u32p(addr), (uint32_t)(v - 1), __ATOMIC_SEQ_CST);
+        uint32_t expected = (uint32_t)v;
+        for (;;) {
+            wait = (int32_t)expected < value;
+            if (!wait || __atomic_compare_exchange_n(u32p(addr), &expected, expected - 1u, 0,
+                                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+        }
     } else if (type == 2) wait = v == value;            // WaitIfEqual
     else {
         pthread_mutex_unlock(&G);
@@ -592,14 +762,43 @@ static int signaled(HandleEntry *e) {
     return 0;
 }
 
+// Trazas de SVC que un juego puede repetir millones de veces (un TryWait en bucle): la misma línea seguida en el
+// mismo hilo se escribe las 8 primeras veces y luego en cada potencia de 2, con su número de repetición; al cambiar
+// la línea se dice cuántas veces se repitió la anterior. Una línea distinta siempre sale, así nada nuevo se oculta.
+typedef struct { uint64_t firma, veces; } TrazaRepetida;
+static uint64_t traza_firma(const uint64_t *v, int n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (int k = 0; k < n; k++) h = (h ^ v[k]) * 0x100000001b3ull;
+    return h;
+}
+// Devuelve 0 si la línea se omite; si no, el número de repetición (1 = primera vez).
+static uint64_t nx_traza_repetida(TrazaRepetida *t, uint64_t firma, const char *prefijo) {
+    if (t->veces && t->firma == firma) {
+        uint64_t v = ++t->veces;
+        return v <= 8 || !(v & (v - 1)) ? v : 0;
+    }
+    if (t->veces > 8)
+        fprintf(stderr, "%s la línea anterior se repitió %llu veces seguidas\n", prefijo, (unsigned long long)t->veces);
+    t->firma = firma;
+    t->veces = 1;
+    return 1;
+}
+
 static uint32_t wait_sync(uint64_t hptr, int32_t n, int64_t timeout, uint64_t *index) {
     if (n < 0 || n > 0x40) return R_OUT_OF_RES;
     const uint32_t *hs = (const uint32_t *)(uintptr_t)hptr;
     pthread_mutex_lock(&G);
     if (getenv("NX_TRACE_WAITS")) {
-        fprintf(stderr, "[wait-sync] thread=%llu timeout=%lld handles=", (unsigned long long)cur->id, (long long)timeout);
-        for (int k = 0; k < n; k++) fprintf(stderr, " %x", hs[k]);
-        fprintf(stderr, "\n");
+        static __thread TrazaRepetida rep;
+        uint64_t v[0x43] = {cur->id, (uint64_t)timeout, (uint64_t)n};
+        for (int k = 0; k < n; k++) v[3 + k] = hs[k];
+        uint64_t vez = nx_traza_repetida(&rep, traza_firma(v, 3 + n), "[wait-sync]");
+        if (vez) {
+            fprintf(stderr, "[wait-sync] thread=%llu timeout=%lld handles=", (unsigned long long)cur->id, (long long)timeout);
+            for (int k = 0; k < n; k++) fprintf(stderr, " %x", hs[k]);
+            if (vez > 1) fprintf(stderr, " (repetición %llu)", (unsigned long long)vez);
+            fprintf(stderr, "\n");
+        }
     }
     struct timespec dl = timeout > 0 ? deadline(timeout) : (struct timespec){0};
     for (;;) {
@@ -641,6 +840,14 @@ typedef struct {
 static Region regions[MAX_REGIONS];
 static int nregions;
 static uint64_t heap_size;
+static int is_switch2_runtime(void);
+
+// NXNative's Switch 2 profiles reserve a 9 GiB application pool. OOT asks
+// SetHeapSize for 0x18ce00000, above the old 6 GiB limit.
+#define NX_SWITCH2_HEAP_MAX 0x240000000ull
+static uint64_t heap_limit(void) {
+    return is_switch2_runtime() ? NX_SWITCH2_HEAP_MAX : NX_HEAP_MAX;
+}
 
 static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
     if (nregions < MAX_REGIONS) regions[nregions++] = (Region){addr, size, type, perm};
@@ -692,7 +899,7 @@ static void reserve(uint64_t addr, uint64_t size, const char *what, int watch) {
 // UINT64_MAX si ese rango no se vigila (fuera del heap y de la región alias, o sin userfaultfd).
 uint64_t nx_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
     if (!max || !n) return 0;
-    int dentro = (addr >= NX_HEAP_BASE && addr + n <= NX_HEAP_BASE + NX_HEAP_MAX) ||
+    int dentro = (addr >= NX_HEAP_BASE && addr + n <= NX_HEAP_BASE + heap_limit()) ||
                  (addr >= NX_ALIAS_BASE && addr + n <= NX_ALIAS_BASE + NX_ALIAS_SIZE);
     if (ww_fd < 0 || !dentro) return UINT64_MAX;
     struct page_region r[256];
@@ -729,7 +936,7 @@ static int range_free(uint64_t addr, uint64_t size) {
 }
 
 void nx_memory_init(void) {
-    reserve(NX_HEAP_BASE, NX_HEAP_MAX, "el heap", 1);
+    reserve(NX_HEAP_BASE, heap_limit(), "el heap", 1);
     reserve(NX_ALIAS_BASE, NX_ALIAS_SIZE, "la región alias", 1);
     reserve(NX_STACK_BASE, NX_STACK_SIZE, "la región de pilas", 0);
     for (int k = 0; k < nx_nmodules; k++) {
@@ -752,7 +959,7 @@ void nx_memory_add_stack(uint64_t addr, uint64_t size) { region_add(addr, size, 
 
 static uint32_t set_heap_size(uint64_t size, uint64_t *out) {
     if (size & 0x1FFFFF) return R_INVALID_SIZE; // múltiplo de 2 MiB
-    if (size > NX_HEAP_MAX) return R_OUT_OF_MEMORY; // DKC Tropical Freeze busca el máximo probando
+    if (size > heap_limit()) return R_OUT_OF_MEMORY; // DKC Tropical Freeze busca el máximo probando
     pthread_mutex_lock(&G);
     if (size > heap_size)
         mprotect((void *)(uintptr_t)(NX_HEAP_BASE + heap_size), size - heap_size, PROT_READ | PROT_WRITE);
@@ -844,16 +1051,25 @@ static uint64_t program_id(void) {
     return nx_program_id ? nx_program_id : 0x0100000000001000ull;
 }
 
+static int is_switch2_runtime(void) {
+    const char *platform = getenv("NX_PLATAFORMA"); // lo pone NX2Linux según el NPDM/ExeFS
+    return platform && !strcmp(platform, "switch2");
+}
+
 static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
     static uint8_t contexto_excepcion[0x1000]; // el SDK escribe ahí (+0x1C0) al instalar su manejador
     switch (id) {
     case 0: *out = 0xF; return R_OK_;                        // núcleos permitidos
     case 1: *out = 0x3FFFFFFFFFFFFFFFull; return R_OK_;      // prioridades permitidas
+    // Switch 2's VAMM allocator occupies the upper half of the reserved alias
+    // range; the game's physical-memory alias allocator owns the lower half.
+    // This mirrors nxnative's documented GetInfo 29/30 layout while keeping
+    // the existing full reservation and MapPhysicalMemory backing.
     case 2: *out = NX_ALIAS_BASE; return R_OK_;
-    case 3: *out = NX_ALIAS_SIZE; return R_OK_;
+    case 3: *out = is_switch2_runtime() ? NX_ALIAS_SIZE / 2 : NX_ALIAS_SIZE; return R_OK_;
     case 4: *out = NX_HEAP_BASE; return R_OK_;
-    case 5: *out = NX_HEAP_MAX; return R_OK_;
-    case 6: case 21: *out = 0xCD500000ull; return R_OK_;     // memoria total de una aplicación (3285 MiB)
+    case 5: *out = heap_limit(); return R_OK_;
+    case 6: case 21: *out = is_switch2_runtime() ? NX_SWITCH2_HEAP_MAX : 0xCD500000ull; return R_OK_;
     case 7: case 22: *out = heap_size; return R_OK_;
     case 8: *out = 0; return R_OK_;                          // sin depurador
     case 9: *out = 0; return R_OK_;                          // límite de recursos (handle)
@@ -876,7 +1092,28 @@ static uint32_t get_info(uint32_t id, uint32_t h, uint64_t sub, uint64_t *out) {
     case 26: *out = 1; return R_OK_;                         // IsSvcPermitted: todas
     case 23: *out = 1; return R_OK_;                         // es una aplicación
     case 28: *out = 0; return R_OK_;                         // tamaño extra de la región alias
-    case 24: *out = 256; return R_OK_;                       // hilos libres
+    // Switch 2 consulta el rango VAMM al iniciar nnos. La mitad alta de la
+    // reserva alias se dedica a ese allocator; la mitad baja sigue siendo la
+    // región alias normal (GetInfo 2/3). No hay memoria remota del host.
+    // No exponer estos InfoType de Switch 2 a títulos Switch 1.
+    case 29:
+        if (is_switch2_runtime()) { *out = NX_ALIAS_BASE + NX_ALIAS_SIZE / 2; return R_OK_; }
+        break;
+    case 30:
+        if (is_switch2_runtime()) { *out = NX_ALIAS_SIZE / 2; return R_OK_; }
+        break;
+    case 31: case 32:
+        if (is_switch2_runtime()) { *out = 0; return R_OK_; }
+        break;
+    case 33:
+        if (is_switch2_runtime()) { *out = 0x1000; return R_OK_; } // tamaño de página de 4 KiB
+        break;
+    case 24: {   // FreeThreadCount: límite menos actual (mesosphere kern_svc_info.cpp); subtipo distinto de 0 es inválido
+        if (sub) return R_INVALID_CMB;
+        uint64_t vivos = hilos_vivos();
+        *out = vivos < LIMITE_HILOS ? LIMITE_HILOS - vivos : 0;
+        return R_OK_;
+    }
     case 0xF0000002u: *out = nx_now_ns() * 12 / 625; return R_OK_; // ticks del hilo
     }
     (void)h;
@@ -969,9 +1206,27 @@ static void svc(Ctx *c, uint32_t imm) {
     uint64_t *x = c->x, out = 0;
     static int trace = -1;
     if (trace < 0) trace = getenv("NX_TRAZA_SVC") != NULL;
-    if (trace)
-        fprintf(stderr, "[svc] hilo %llu: 0x%02x x0=%llx x1=%llx x2=%llx\n", (unsigned long long)(cur ? cur->id : 0), imm,
-                (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2]);
+    if (trace) {
+        static __thread TrazaRepetida rep;
+        uint64_t v[7] = {cur ? cur->id : 0, imm, x[0], x[1], x[2], c->x[30], c->sp};
+        uint64_t vez = nx_traza_repetida(&rep, traza_firma(v, 7), "[svc]");
+        if (vez == 1)
+            fprintf(stderr, "[svc] hilo %llu: 0x%02x x0=%llx x1=%llx x2=%llx lr=%llx sp=%llx fp=%llx\n", (unsigned long long)(cur ? cur->id : 0), imm,
+                    (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2],
+                    (unsigned long long)c->x[30], (unsigned long long)c->sp, (unsigned long long)c->x[29]);
+        else if (vez)
+            fprintf(stderr, "[svc] hilo %llu: 0x%02x x0=%llx x1=%llx x2=%llx lr=%llx sp=%llx fp=%llx (repetición %llu)\n",
+                    (unsigned long long)(cur ? cur->id : 0), imm, (unsigned long long)x[0], (unsigned long long)x[1],
+                    (unsigned long long)x[2], (unsigned long long)c->x[30], (unsigned long long)c->sp,
+                    (unsigned long long)c->x[29], (unsigned long long)vez);
+    }
+    if (imm == 0x0c && cur && getenv("NX_TRACE_MAIN_TT"))
+        fprintf(stderr, "[thread] GetThreadPriority cur=%p tpidr=%#llx tlr=%#llx tt=%#llx tt_handle=%#x tlr_tt=%#llx tp_tt=%#llx\n",
+                (void *)cur, (unsigned long long)c->tpidr,
+                (unsigned long long)cur->tls, (unsigned long long)cur->thread_type,
+                cur->thread_type ? ld32(cur->thread_type + 0x1b0) : 0,
+                (unsigned long long)ld64(cur->tls + 0x1f8),
+                (unsigned long long)ld64(c->tpidr + 0x1f8));
     switch (imm) {
     case 0x01: x[0] = set_heap_size(x[1], &out); x[1] = out; return;
     case 0x02: case 0x03: x[0] = R_OK_; return;          // permisos y atributos de memoria
@@ -992,6 +1247,11 @@ static void svc(Ctx *c, uint32_t imm) {
         t->mask = 1ull << t->core;
         t->state = TS_CREATED;
         t->handle = nx_handle_new(KO_THREAD, t, 1);
+        *(uint32_t *)(uintptr_t)(t->tls + 0x110) = (uint32_t)t->id; // id del kernel (GetThreadId), no el handle: nxnative threads.md, SDK 22
+        if (getenv("NX_TRACE_THREAD_CREATE"))
+            fprintf(stderr, "[thread] create tid=%llu handle=%#x entry=%#llx arg=%#llx prio=%d core=%d mask=%#llx\n",
+                    (unsigned long long)t->id, t->handle, (unsigned long long)t->entry,
+                    (unsigned long long)t->ctx->x[0], t->priority, t->core, (unsigned long long)t->mask);
         pthread_mutex_unlock(&G);
         x[0] = t->handle ? R_OK_ : R_OUT_OF_RES;
         x[1] = t->handle;
@@ -1011,7 +1271,12 @@ static void svc(Ctx *c, uint32_t imm) {
         pthread_attr_init(&a);
         pthread_attr_setstacksize(&a, 16 << 20); // pila del host: las llamadas del juego se anidan en ella
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_create(&t->pthread, &a, thread_main, t);
+        int thread_rc = pthread_create(&t->pthread, &a, thread_main, t);
+        pthread_attr_destroy(&a);
+        if (getenv("NX_TRACE_THREAD_CREATE"))
+            fprintf(stderr, "[thread] start tid=%llu handle=%#x rc=%d entry=%#llx stack=%#llx prio=%d core=%d\n",
+                    (unsigned long long)t->id, t->handle, thread_rc, (unsigned long long)t->entry,
+                    (unsigned long long)t->ctx->sp, t->priority, t->core);
         x[0] = R_OK_;
         return;
     }
@@ -1025,11 +1290,34 @@ static void svc(Ctx *c, uint32_t imm) {
         }
         return;
     }
-    case 0x0C: { KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->priority : 0; return; }
-    case 0x0D: { KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD); if (t) t->priority = (int)x[1]; x[0] = t ? R_OK_ : R_INVALID_HANDLE; return; }
-    case 0x0E: { KThread *t = nx_handle_get((uint32_t)x[2], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->core : 0; x[2] = t ? t->mask : 0; return; }
+    case 0x0C: {
+        KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD);
+        // Some Switch 2 SDK startup paths query the running thread before its
+        // ThreadType handle has been published. Horizon's current-thread pseudo
+        // handle is represented by the active kernel thread in this runtime.
+        if (!t && !x[1]) t = cur;
+        x[0] = t ? R_OK_ : R_INVALID_HANDLE;
+        x[1] = t ? (uint64_t)t->priority : 0;
+        return;
+    }
+    case 0x0D: {
+        KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD);
+        if (!t && !x[0]) t = cur;
+        if (t) t->priority = (int)x[1];
+        x[0] = t ? R_OK_ : R_INVALID_HANDLE;
+        return;
+    }
+    case 0x0E: {
+        KThread *t = nx_handle_get((uint32_t)x[2], KO_THREAD);
+        if (!t && !x[2]) t = cur;
+        x[0] = t ? R_OK_ : R_INVALID_HANDLE;
+        x[1] = t ? (uint64_t)t->core : 0;
+        x[2] = t ? t->mask : 0;
+        return;
+    }
     case 0x0F: { // SetThreadCoreMask(handle, núcleo ideal, máscara): -2 = el del proceso, -3 = no cambiar el ideal
         KThread *t = nx_handle_get((uint32_t)x[0], KO_THREAD);
+        if (!t && !x[0]) t = cur;
         int32_t ideal = (int32_t)x[1];
         if (!t) { x[0] = R_INVALID_HANDLE; return; }
         if (ideal == -2) ideal = nx_main_core >= 0 && nx_main_core < 4 ? nx_main_core : 0;
@@ -1154,26 +1442,72 @@ static void svc(Ctx *c, uint32_t imm) {
     case 0x24: x[0] = R_OK_; x[1] = 0x51; return;      // GetProcessId: un solo proceso
     case 0x2A: case 0x2B: x[0] = R_OK_; return;        // FlushEntireDataCache, FlushDataCache: x86 es coherente
     case 0x30: case 0x31: { // GetResourceLimitLimitValue / CurrentValue(límite, recurso)
-        static const uint64_t limite[] = {0xCD500000ull, 256, 700, 200, 900};
+        static const uint64_t limite[] = {0xCD500000ull, LIMITE_HILOS, 700, 200, 900};
         uint32_t k = (uint32_t)x[2];
         x[0] = k < 5 ? R_OK_ : R_INVALID_ENUM;
-        x[1] = k >= 5 ? 0 : imm == 0x30 ? limite[k] : k == 0 ? heap_size : k == 1 ? 32 : limite[k] / 8;
+        x[1] = k >= 5 ? 0 : imm == 0x30 ? limite[k] : k == 0 ? heap_size : k == 1 ? hilos_vivos() : limite[k] / 8;
         return;
     }
     case 0x32: x[0] = set_thread_activity((uint32_t)x[0], (uint32_t)x[1]); return;
     case 0x33: x[0] = get_thread_context((uint32_t)x[1], x[0]); return;
     case 0x36: x[0] = R_OK_; return;                   // SynchronizePreemptionState
-    case 0x25: { KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD); x[0] = t ? R_OK_ : R_INVALID_HANDLE; x[1] = t ? t->id : 0; return; }
-    case 0x26:
+    case 0x25: { // Hookshot treats an absent handle as the calling thread for GetThreadId.
+        KThread *t = nx_handle_get((uint32_t)x[1], KO_THREAD);
+        if (!t && !x[1]) t = cur;
+        x[0] = t ? R_OK_ : R_INVALID_HANDLE;
+        x[1] = t ? t->id : 0;
+        return;
+    }
+    case 0x26: { // svcBreak(reason, address, size)
+        // BreakReason (Atmosphère svc_types_common.hpp): 0 Panic ... 7 CppException; el bit 31 es
+        // NotificationOnlyFlag. Sin depurador, el kernel vuelve de una notificación sin cerrar el proceso y cierra en
+        // los demás casos (mesosphere kern_svc_exception.cpp Break; GPL-2.0, solo el comportamiento). Break no
+        // devuelve Result: los registros quedan como estaban.
+        static const char *const razones[] = {"Panic", "Assert", "User", "PreLoadDll", "PostLoadDll", "PreUnloadDll",
+                                              "PostUnloadDll", "CppException"};
+        uint32_t razon = (uint32_t)x[0], base = razon & 0x7FFFFFFFu;
+        const char *nombre = base < 8 ? razones[base] : "desconocida";
+        int aviso = (razon & 0x80000000u) != 0;
+        char donde[256];
         fflush(stdout);
-        fprintf(stderr, "[nxrt] svcBreak(0x%llx, 0x%llx, 0x%llx)", (unsigned long long)x[0], (unsigned long long)x[1],
-                (unsigned long long)x[2]);
+        fprintf(stderr, "[nxrt] svcBreak(0x%x %s%s, 0x%llx, 0x%llx) hilo %llu lr=0x%llx %s sp=0x%llx fp=0x%llx%s\n",
+                razon, nombre, aviso ? ", solo aviso" : "", (unsigned long long)x[1], (unsigned long long)x[2],
+                (unsigned long long)(cur ? cur->id : 0), (unsigned long long)c->x[30],
+                nx_describir_dir(c->x[30], donde, sizeof donde), (unsigned long long)c->sp, (unsigned long long)c->x[29],
+                aviso ? ": sin depurador, el proceso sigue" : "");
+        if (aviso) return;
         if (x[2] == 4 && x[1]) { // diagAbortWithResult: el resultado va en el buffer
-            uint32_t rc = *(uint32_t *)(uintptr_t)x[1];
-            fprintf(stderr, ": resultado 0x%x (%04u-%04u)", rc, 2000 + (rc & 0x1FF), rc >> 9 & 0x1FFF);
+            uint32_t rc;
+            if (nx_leer_seguro(x[1], &rc, sizeof rc))
+                fprintf(stderr, "[nxrt] resultado 0x%x (%04u-%04u)\n", rc, 2000 + (rc & 0x1FF), rc >> 9 & 0x1FFF);
+            else
+                fprintf(stderr, "[nxrt] resultado ilegible en 0x%llx\n", (unsigned long long)x[1]);
         }
-        fprintf(stderr, "\n");
+        if (!aviso && getenv("NX_TRACE_PANIC_REGS")) {
+            fprintf(stderr, "[nxrt] panic guest pc=%#llx tid=%llu x0..x15:",
+                    (unsigned long long)c->pc, (unsigned long long)(cur ? cur->id : 0));
+            for (unsigned i = 0; i < 16; i++) fprintf(stderr, " x%u=%#llx", i, (unsigned long long)c->x[i]);
+            fputs(" x19..x30:", stderr);
+            for (unsigned i = 19; i < 31; i++) fprintf(stderr, " x%u=%#llx", i, (unsigned long long)c->x[i]);
+            fputc('\n', stderr);
+            uint8_t words[0x100];
+            if (c->sp && nx_leer_seguro(c->sp, words, sizeof words)) {
+                fprintf(stderr, "[nxrt] panic guest stack @%#llx:", (unsigned long long)c->sp);
+                for (unsigned i = 0; i < sizeof words; i += 4) {
+                    uint32_t word;
+                    memcpy(&word, words + i, sizeof word);
+                    if (!(i & 0x1f)) fprintf(stderr, "\n  +%03x:", i);
+                    fprintf(stderr, " %08x", word);
+                }
+                fputc('\n', stderr);
+            } else {
+                fprintf(stderr, "[nxrt] panic guest stack unreadable at %#llx\n", (unsigned long long)c->sp);
+            }
+        }
+        nx_pila_invitado(c);
+        fprintf(stderr, "[nxrt] svcBreak %s: el proceso termina con código 1\n", nombre);
         _exit(1);
+    }
     case 0x27:
         fwrite((const void *)(uintptr_t)x[0], 1, x[1], stdout);
         fflush(stdout);
@@ -1200,6 +1534,85 @@ static void svc(Ctx *c, uint32_t imm) {
     exit(1);
 }
 
+// HLE de nn::os::CreateThread (idea de Hookshot, GPL-3.0; código propio): el kernel crea el hilo con la entrada,
+// argument and stack. This avoids the guest SDK's MapAliasStack path, which OoT uses for
+// its porter thread pool and which is not available in this Linux runtime.
+static void nx_thread_create_common(Ctx *c, int core) {
+    uint64_t tt = c->x[0], entry = c->x[1], arg = c->x[2];
+    uint64_t stack = c->x[3], stack_size = c->x[4];
+    if (getenv("NX_TRACE_THREAD_CREATE"))
+        fprintf(stderr, "[thread] HLE create tt=%#llx entry=%#llx arg=%#llx stack=%#llx size=%#llx prio=%llu core=%d\n",
+                (unsigned long long)tt, (unsigned long long)entry, (unsigned long long)arg,
+                (unsigned long long)stack, (unsigned long long)stack_size,
+                (unsigned long long)c->x[5], core);
+    if (!tt || !entry || !stack || stack_size > UINT64_MAX - stack) {
+        c->x[0] = R_INVALID_ADDR;
+        return;
+    }
+    Ctx call = {0};
+    call.x[1] = entry;
+    call.x[2] = arg;
+    call.x[3] = (stack + stack_size) & ~0xFull;
+    call.x[4] = c->x[5];
+    call.x[5] = (uint64_t)(int64_t)core;
+    nx_svc(&call, 0x08);
+    if (call.x[0] != R_OK_) {
+        c->x[0] = call.x[0];
+        return;
+    }
+    pthread_mutex_lock(&G);
+    KThread *t = nx_handle_get((uint32_t)call.x[1], KO_THREAD);
+    if (t) {
+        t->thread_type = tt;
+        t->thread_arg = arg;
+        t->stack_top = call.x[3];
+        t->ctx->sp = t->stack_top;
+        // Lo que el CreateThread del SDK deja en el ThreadType y lee nn::os::GetCurrentStackInfo (SDK de Switch 2:
+        // pila en +0x50, tamaño en +0x58, fibra actual en +0x70; sin fibra usa la pila del hilo). Sin estos campos,
+        // Nintendo Switch Sports Resort aborta en GetCurrentStackInfo porque sp no cae en [0, 0).
+        st64(tt + 0x50, stack);
+        st64(tt + 0x58, stack_size);
+        st64(tt + 0x70, 0);
+        st32(tt + 0x1b0, t->handle);
+        st64(t->tls + 0x1f8, tt);
+    }
+    pthread_mutex_unlock(&G);
+    c->x[0] = t ? R_OK_ : R_OUT_OF_RES;
+}
+
+void nx_thread_create(Ctx *c) { nx_thread_create_common(c, -2); }
+void nx_thread_create_core(Ctx *c) { nx_thread_create_common(c, (int32_t)c->x[6]); }
+
+void nx_thread_start(Ctx *c) {
+    Ctx call = {0};
+    call.x[0] = c->x[0] ? ld32(c->x[0] + 0x1b0) : 0;
+    nx_svc(&call, 0x09);
+    c->x[0] = call.x[0];
+}
+
+static KThread *thread_type_handle(uint64_t tt) {
+    if (!tt) return NULL;
+    return nx_handle_get(ld32(tt + 0x1b0), KO_THREAD);
+}
+
+void nx_thread_wait(Ctx *c) {
+    pthread_mutex_lock(&G);
+    KThread *t = thread_type_handle(c->x[0]);
+    while (t && t->state != TS_EXITED) pthread_cond_wait(&sync_cv, &G);
+    pthread_mutex_unlock(&G);
+    c->x[0] = t ? R_OK_ : R_INVALID_HANDLE;
+}
+
+void nx_thread_try_wait(Ctx *c) {
+    pthread_mutex_lock(&G);
+    KThread *t = thread_type_handle(c->x[0]);
+    int exited = t && t->state == TS_EXITED;
+    pthread_mutex_unlock(&G);
+    c->x[0] = !t ? R_INVALID_HANDLE : exited ? R_OK_ : R_TIMEOUT;
+}
+
+void nx_thread_destroy(Ctx *c) { nx_thread_wait(c); }
+
 // Lo que toca la tabla de handles desde fuera (servicios) lo hace con G tomado.
 void nx_kernel_lock(void) { pthread_mutex_lock(&G); }
 void nx_kernel_unlock(void) { pthread_mutex_unlock(&G); }
@@ -1218,6 +1631,34 @@ void nx_event_signal(KEvent *ev) {
     ev->signaled = 1;
     pthread_cond_broadcast(&sync_cv);
     pthread_mutex_unlock(&G);
+    if (nx2_syncpt_event_signaled) nx2_syncpt_event_signaled(ev);
+}
+
+int nx_event_signal_handle(uint32_t h) {
+    pthread_mutex_lock(&G);
+    HandleEntry *e = handle_entry(h);
+    if (!e || e->type != KO_EVENT || !e->writable) {
+        pthread_mutex_unlock(&G);
+        return 0;
+    }
+    KEvent *ev = e->obj;
+    ev->signaled = 1;
+    pthread_cond_broadcast(&sync_cv);
+    pthread_mutex_unlock(&G);
+    if (nx2_syncpt_event_signaled) nx2_syncpt_event_signaled(ev);
+    return 1;
+}
+
+int nx_event_clear_handle(uint32_t h) {
+    pthread_mutex_lock(&G);
+    HandleEntry *e = handle_entry(h);
+    if (!e || e->type != KO_EVENT || !e->writable) {
+        pthread_mutex_unlock(&G);
+        return 0;
+    }
+    ((KEvent *)e->obj)->signaled = 0;
+    pthread_mutex_unlock(&G);
+    return 1;
 }
 
 uint32_t nx_shmem_new(uint64_t size, KShmem **out) {

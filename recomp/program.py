@@ -12,6 +12,7 @@ tablas de punteros. Reglas de enlace (las mismas que usa nxnative, que imitan a 
 """
 
 import os
+import hashlib
 import struct
 from collections import Counter
 
@@ -61,6 +62,7 @@ class LoadedModule:
         self.dyn = {}
         self.syms = []
         self.mod0 = None
+        self.dinamico = False      # NRO de nn::ro::LoadModule (Program modulos_ro)
         self.init = 0
         self.init_array = []
         self._parse_dynamic()
@@ -176,11 +178,19 @@ class LoadedModule:
 
 
 class Program:
-    def __init__(self, images, base=BASE, npdm=None):
+    def __init__(self, images, base=BASE, npdm=None, modulos_ro=()):
+        """images: los módulos que rtld carga al arrancar. modulos_ro: NRO que el juego carga después con
+        nn::ro::LoadModule (volcados con NX_VOLCAR_NRO); van detrás, a una dirección fija que el runtime devuelve en
+        ldr:ro MapManualLoadModuleMemory, y su init no corre al arrancar sino dentro de LoadModule."""
         self.modules = []
         addr = base
         for img in images:
             self.modules.append(LoadedModule(img, addr))
+            addr += align(img.size + img.bss)
+        for img in modulos_ro:
+            m = LoadedModule(img, addr)
+            m.dinamico = True
+            self.modules.append(m)
             addr += align(img.size + img.bss)
         self.end = addr
         self.npdm = npdm
@@ -188,10 +198,13 @@ class Program:
         self._import_index = {}
         self.unsupported = Counter()
         self.symbols = {}          # nombre -> dirección (primera definición global en orden de carga)
+        self.globales = {}         # lo mismo, solo de los módulos del arranque (la búsqueda de rtld, LookupGlobalAuto)
         for m in self.modules:
             for s in m.syms:
                 if s.defined and s.bind in (1, 2) and (s.other & 3) == 0 and s.name:
                     self.symbols.setdefault(s.name, m.base + s.value)
+                    if not m.dinamico:
+                        self.globales.setdefault(s.name, m.base + s.value)
         self._link()
         self.text_ranges = [(m.base + m.img.text[0], m.base + m.img.text[0] + m.img.text[1]) for m in self.modules]
         self.data_ranges = [(m.base + o, m.base + o + s) for m in self.modules for (o, s) in (m.img.ro, m.img.rw)]
@@ -292,11 +305,119 @@ class Program:
         """Cómo arranca: con nnMain (juego con SDK) o por la entrada del primer módulo (homebrew)."""
         inits = []
         for m in self.modules:
+            # nxrecomp ya enlazó y reubicó los módulos; ejecutar rtld de nuevo
+            # vuelve a inicializar el cargador dinámico y rompe su estado TLS.
+            if m.name == "rtld" or getattr(m, "dinamico", False):   # el init de un módulo de nn::ro lo llama LoadModule
+                continue
             if m.init:
                 inits.append(m.base + m.init)
-            else:
+            if m.init_array and not self._init_dispatches_array(m):
+                # Algunos módulos de Horizon recorren la tabla dentro de
+                # DT_INIT; otros tienen DT_INIT independiente y necesitan que
+                # el loader ejecute también sus constructores.
                 inits.extend(a for a in m.init_array if a)
         return {"inits": inits, "main": self.symbols.get("nnMain"), "entry": self.modules[0].base + self.modules[0].img.text[0]}
+
+    # La entrada de hilo del SDK guarda su ThreadType en TLR+0x1F8:
+    # mrs x1, tpidrro_el0 / add x1, x1, #0x1f8 / str x0, [x1]
+    # (runtime/nxkern.c reconoce la misma firma en los trampolines creados por SVC).
+    FIRMA_ENTRADA_HILO = struct.pack("<3I", 0xD53BD061, 0x9107E021, 0xF9000020)
+
+    def thread_hook_gots(self, ventana=40):
+        """Entradas de la GOT de los hooks de nnmusl al iniciar y al terminar un hilo (TLS por hilo).
+
+        Tras la firma de la entrada de hilo del SDK, los dos primeros pares ADRP + LDR (64 bits, offset
+        sin signo) que leen de una misma página dan las dos entradas. Devuelve ((inicio, fin), avisos);
+        (0, 0) si no hay firma o si dos entradas de hilo no coinciden (no se adivina cuál vale).
+        Idea tomada de Hookshot (nx2/standalone.py thread_hooks, GPL-3.0); el código es propio."""
+        encontrados, avisos = set(), []
+        for m in self.modules:
+            datos = m.img.data
+            ini, tam = m.img.text
+            k = datos.find(self.FIRMA_ENTRADA_HILO, ini, ini + tam)
+            while k >= 0:
+                if k % 4 == 0:
+                    par = self._hooks_tras_firma(m, k + 12, min(ini + tam, k + 12 + 4 * ventana))
+                    if par:
+                        encontrados.add(par)
+                k = datos.find(self.FIRMA_ENTRADA_HILO, k + 4, ini + tam)
+        if len(encontrados) == 1:
+            return encontrados.pop(), avisos
+        if len(encontrados) > 1:
+            avisos.append("entradas de hilo con hooks distintos: " +
+                          ", ".join(f"0x{a:x}/0x{b:x}" for a, b in sorted(encontrados)) + "; no se usa ninguno")
+        return (0, 0), avisos
+
+    @staticmethod
+    def _hooks_tras_firma(m, desde, hasta):
+        paginas, gots = {}, []
+        for off in range(desde, hasta - 3, 4):
+            w = struct.unpack_from("<I", m.img.data, off)[0]
+            pc = m.base + off
+            if w & 0x9F000000 == 0x90000000:  # ADRP Xd, página
+                imm = ((w >> 5) & 0x7FFFF) << 2 | (w >> 29) & 3
+                if imm & 1 << 20:
+                    imm -= 1 << 21
+                paginas[w & 31] = (pc & ~0xFFF) + (imm << 12)
+            elif w & 0xFFC00000 == 0xF9400000 and (w >> 5) & 31 in paginas:  # LDR Xt, [Xn, #imm12*8]
+                gots.append(paginas.pop((w >> 5) & 31) + ((w >> 10) & 0xFFF) * 8)
+                if len(gots) == 2:
+                    return tuple(gots)
+        return None
+
+    # Lo que rtld publica en los módulos al terminar de enlazarlos: recorre su lista de módulos, busca en cada uno
+    # estos símbolos (binding global o débil) y escribe en ellos la dirección de su propio estado de nn::ro.
+    # Visto en el rtld de Switch 2 (bucle tras enlazar con los cinco nombres en su .rodata); el recompilador no
+    # ejecuta rtld (boot), así que el runtime repite esas escrituras (runtime/nxsvc_ldr.c nx_rtld_publicar_ro).
+    # El orden fija el índice que usa el runtime.
+    RTLD_RO = ("_ZN2nn2ro6detail15g_pAutoLoadListE",
+               "_ZN2nn2ro6detail17g_pManualLoadListE",
+               "_ZN2nn2ro6detail14g_pRoDebugFlagE",
+               "_ZN2nn2ro6detail34g_pLookupGlobalAutoFunctionPointerE",
+               "_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE")
+
+    def rtld_ro_vars(self):
+        """[(índice en RTLD_RO, dirección de la variable)] de cada módulo que define una de ellas."""
+        out = []
+        for m in self.modules:
+            if m.name == "rtld":
+                continue
+            for s in m.syms:
+                if s.defined and s.bind in (1, 2) and s.name in self.RTLD_RO:
+                    out.append((self.RTLD_RO.index(s.name), m.base + s.value))
+        return sorted(out)
+
+    def _init_dispatches_array(self, m):
+        """Detecta si DT_INIT materializa el rango de su DT_INIT_ARRAY."""
+        if not m.init or not m.init_array or DT["INIT_ARRAY"] not in m.dyn:
+            return False
+        from a64 import bits, decode
+
+        array_lo = m.base + m.dyn[DT["INIT_ARRAY"]]
+        array_hi = array_lo + m.dyn.get(DT["INIT_ARRAYSZ"], 0)
+        ends = [m.base + start for start in m.eh_frame_starts() if start > m.init]
+        end = min(ends, default=m.base + m.img.size)
+        found_lo = found_hi = False
+        pc = m.base + m.init
+        while pc + 4 <= end:
+            insn = decode(pc, self.word(pc))
+            if insn.ref is not None:
+                refs = [insn.ref]
+                if insn.adrp_reg is not None:
+                    for k in range(1, 9):
+                        q = pc + 4 * k
+                        if q >= end:
+                            break
+                        word = self.word(q)
+                        if bits(word, 31, 22) == 0b1001000100 and bits(word, 9, 5) == insn.adrp_reg:
+                            refs.append(insn.ref + bits(word, 21, 10))
+                            break
+                found_lo |= array_lo in refs
+                found_hi |= array_hi in refs
+                if found_lo and found_hi:
+                    return True
+            pc += 4
+        return False
 
     def summary(self):
         lines = []
@@ -310,7 +431,34 @@ class Program:
         return "\n".join(lines)
 
 
-def load_program(paths, base=BASE):
+def modulos_ro_de(carpeta):
+    """Los NRO volcados por el runtime (NX_VOLCAR_NRO=<carpeta>, <sha256>.nro), en orden de nombre: así cada uno
+    recibe siempre la misma dirección. Un archivo que no es NRO o cuyo SHA-256 no es su nombre se ignora con aviso."""
+    out = []
+    if not carpeta or not os.path.isdir(carpeta):
+        return out
+    for nombre in sorted(os.listdir(carpeta)):
+        if not nombre.endswith(".nro"):
+            continue
+        raw = open(os.path.join(carpeta, nombre), "rb").read()
+        sha = hashlib.sha256(raw).hexdigest()
+        if sha != nombre[:-4]:
+            print(f"[RED] módulo de nn::ro {nombre}: su SHA-256 es {sha}; se ignora")
+            continue
+        try:
+            img = load_module(raw, "ro_" + sha[:16])
+        except FormatError as e:
+            print(f"[RED] módulo de nn::ro {nombre}: {e}; se ignora")
+            continue
+        if img.kind != "nro":
+            print(f"[RED] módulo de nn::ro {nombre}: no es un NRO; se ignora")
+            continue
+        img.sha256 = bytes.fromhex(sha)
+        out.append(img)
+    return out
+
+
+def load_program(paths, base=BASE, modulos_ro=()):
     """Carga un ExeFS (carpeta con main, sdk, subsdk*... y main.npdm) o una lista de módulos."""
     npdm = None
     if len(paths) == 1 and os.path.isdir(paths[0]):
@@ -323,4 +471,4 @@ def load_program(paths, base=BASE):
     else:
         files = paths
     images = [load_module(open(f, "rb").read(), os.path.splitext(os.path.basename(f))[0]) for f in files]
-    return Program(images, base, npdm)
+    return Program(images, base, npdm, modulos_ro)

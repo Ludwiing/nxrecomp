@@ -161,7 +161,7 @@ Ampere (NVN2). Se avanza por capas, de lo más acotado a lo más grande. Pruebas
 
 ## Switch 2 completo en NX2Linux, en MIT (plan pedido el 2026-11-08)
 
-Todo escrito para nxrecomp, sin copiar código de Hookshot (GPL-3.0): solo ideas y formatos. Las pruebas con juegos
+Todo escrito e implementado dentro de nxrecomp. Las pruebas con juegos
 reales las hace el usuario con sus dumps y trae el registro; aquí se prueba con programas y datos sintéticos.
 
 - [x] Fase 1: HLE por símbolo. `nxrecomp.py --sustituir` se puede repetir y acepta `símbolo funcion_c`,
@@ -183,6 +183,33 @@ reales las hace el usuario con sus dumps y trae el registro; aquí se prueba con
   validar N` compara con nvdisasm instrucciones al azar: 1863/2000 (93 %) iguales. Fallan sobre todo las de medio
   float (HADD2, HMUL2, HFMA2, HSET2: inmediatos de dos halfs y valor absoluto de constantes), IMMA/HMMA, algunas formas
   de TLD y LDG. Falta: llevar el decodificador a C en el runtime y la bajada a lo que traduce runtime/nxshader.c.
+  - [~] Medio float (`tools/sm86_baja_medios.py`): HADD2, HMUL2, HFMA2, HSETP2 y HSET2 en sus formas R, I y C, con
+    sufijos (.F32, .H0_H0, .H1_H1), - y ||, SAT, salida .F32, FTZ/FMZ (Ryujinx no los aplica), H_AND y .BF. Bits
+    comprobados con nvdisasm; la posición de las mitades del inmediato, con ptxas. Todo operando que no es registro
+    va primero a un temporal: el Maxwell de Ryujinx recorta el inmediato a 10 bits por mitad y lee la constante como
+    F32. Pruebas: ejecución contra SM86 (`probar`, 0 distintas, con mutaciones), lectura de operandos contra nvdisasm
+    (`oraculo`, 525 instrucciones, 0 diferencias; encontró que la primera versión aceptaba HMUL2/HFMA2 con FMZ y FTZ
+    a la vez, que es inválida) y en la GPU (`tests/sm86_programa_test.py`: HADD2 y HFMA2 con - y .H1_H1).
+    Falta: HFMA2.MMA, RELU, BF16_V2, .H0_NH1 (nxnative dice: carril bajo = -B.H1, alto = B.H0; sin verificar),
+    HADD2.F32 con el bit 73 y HADD2 inmediato con .F32.
+  - [x] PRMT (`tools/sm86_baja_prmt.py`): **corregido**. La regla anterior bajaba a PrmtR de Maxwell, que el Ryujinx de
+    totk_xlate no implementa (solo deja un log): en la GPU, `PRMT R5, R1, 0x1032, RZ` daba 0, sin error. Ahora,
+    con el selector inmediato y el modo normal: BFE/BFI byte por byte, incluido el bit de signo. Selector en registro
+    o constante y los modos F4E/B4E/ECL...: sin regla (error claro). Revisión de las demás instrucciones que genera
+    la bajada contra las que Ryujinx no implementa: solo PrmtR y Pixld (ya anotada).
+  - [~] Predicados, votos y FSET (`tools/sm86_baja_predicados.py`): VOTE (ALL/ANY/EQ), FSET.BF (registro,
+    constante, inmediato; comparación en los bits 76-79, operación en 74-75, FTZ en 80, comprobado con nvdisasm) y
+    PLOP3.LUT sobre predicados (0x81c). Se prueba ejecutando la SM86 y lo bajado en un warp de 32 hilos, cambiando
+    también los bits de modificadores (`python3 tools/sm86_baja_predicados.py probar 1500`, en make test): 0
+    distintas. Siete mutaciones de las reglas (BVal, Bop, FComp, VoteMode, PredicateOp, orden de salidas, PT) se
+    detectan todas.
+    Falta: PLOP3 con el signo de un registro o constante (0x21d-0x21f, 0xa1d-0xa1f) o con UPn como tercera entrada
+    (bit 67); PLOP3 con las dos salidas en el mismo predicado (no se sabe cuál gana); FTZ de FSET/FSETP (Ryujinx no
+    lo aplica: un denormal compara como su valor).
+    Censo (`python3 tools/sm86_censo.py <carpeta>` sobre test_dmsh_*.py de seedds/nxnative @1ee0252, MIT, con
+    encodings de MKW, OoT y Pokopia): 158 instrucciones distintas; 101 se bajan (97 antes), 46 sin regla (sobre todo
+    medio float HADD2/HMUL2/HFMA2/HSETP2, SUATOM/SURED/SULD, ISBERD/ISBEWR, F2FP, HMMA/LDSM, CAS), 11 no decodifican
+    (texturas con UR, ULOP3, UP2UR, ATOMS.POPC.INC).
   - [~] Bajada de lo uniforme y de las constantes con registro (`tools/sm86_baja_uniformes.py`): UMOV, ULDC (todos
     los tamaños), S2UR, R2UR, VOTEU (ALL/ANY/EQ), UPLOP3 y LDC (c[b][Ra+off], .IL/.IS/.ISL, todos los tamaños).
     Diseño: URn en R(188+n), URZ = RZ; como URZ no ocupa registro, R251 es UPR, el registro de predicados

@@ -3,6 +3,8 @@ heap de 32 MiB: resultado 0x0, suma de prueba 522240
 QueryMemory(código): tipo 0x3, permisos 5
 QueryMemory(heap): tipo 0x5, permisos 3, empieza en el heap: sí, tamaño 32 MiB: sí
 GetInfo(región del heap) coincide con SetHeapSize: sí
+SVC sin tocar la pila debajo de sp: sí
+GetInfo(hilos libres): hay: sí, un hilo vivo resta 1: sí, al terminar vuelve: sí, subtipo 1: 0xe801
 4 hilos × 100000 con mutex: 400000
 4 hilos × 100000 atómicos (LDXR/STXR): 400000
 productor y 3 consumidores: 5000 valores, suma 12502500

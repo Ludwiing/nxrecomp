@@ -19,7 +19,8 @@ enum {
     VK_EXEC_DIRTY_DEPTH_BIAS = 1 << 2,   // polygon offset
     VK_EXEC_DIRTY_BLEND_CONST = 1 << 3,
     VK_EXEC_DIRTY_STENCIL = 1 << 4,      // compare and write masks, references
-    VK_EXEC_DIRTY_ALL = (1 << 5) - 1,
+    VK_EXEC_DIRTY_VIEWPORT_SWIZZLE = 1 << 5,
+    VK_EXEC_DIRTY_ALL = (1 << 6) - 1,
 };
 
 // One render target of OP_SET_RT, resolved to its vk_texture.c image for the current command buffer.
@@ -67,6 +68,7 @@ typedef struct VkExec {
 
     // ---- fixed-function state (vk_exec.c keeps it; vk_exec_draw.c records it before draws)
     float vp[16][6];                     // OP_VIEWPORTS: x, y, w, h, near, far
+    VkViewportSwizzleNV vp_swizzle[16];  // OP_VIEWPORT_SWIZZLES
     int has_vp;                          // a viewport was set; else the render area
     p_scissor scissor;                   // OP_SCISSOR (scissor 0)
     int has_scissor;                     // a scissor was set; else unbounded
@@ -87,8 +89,9 @@ typedef struct VkExec {
     const prog_t *prog;                  // OP_BIND_PROGRAM
     int32_t prog_stages;
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
-    p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
-    uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
+    p_bind_buf ubo[NVN_MAX_PROGRAM_STAGES][18], ssbo[NVN_MAX_PROGRAM_STAGES][16];  // per NVN stage and index
+    uint64_t tex[NVN_MAX_PROGRAM_STAGES][128], samp[NVN_MAX_PROGRAM_STAGES][128],
+             img[NVN_MAX_PROGRAM_STAGES][32];   // OP_BIND_* handles per stage
 
     // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip

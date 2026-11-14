@@ -4,6 +4,7 @@
 static KEvent *test_handles[256];
 static unsigned next_test_handle = 1;
 static pthread_mutex_t kernel_mutex = PTHREAD_MUTEX_INITIALIZER;
+void nx2_syncpt_publish(uint32_t id, uint32_t value) { (void)id; (void)value; }
 void nx_kernel_lock(void) { pthread_mutex_lock(&kernel_mutex); }
 void nx_kernel_unlock(void) { pthread_mutex_unlock(&kernel_mutex); }
 uint32_t nx_handle_new(int type, void *obj, int writable) {

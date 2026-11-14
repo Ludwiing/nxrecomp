@@ -32,14 +32,30 @@
 #define CTL_PER_RECORDING 64                // control memory one recording is reported to use
 #define COPY_PAGE_SHIFT 16                  // recording copy index granularity (release_copies)
 
-static cmd_t *cmd_of(const Cpu *c) { return arg_p(c, 0); }
+// The guest thread of the command-buffer call in progress on this host thread: every command-buffer entry point takes
+// its object through cmd_of, so a record that runs out of command memory can call the game's callback (cmd_charge).
+static __thread Cpu *cmd_cpu;
+static cmd_t *cmd_of(const Cpu *c) {
+    cmd_cpu = (Cpu *)c;
+    return arg_p(c, 0);
+}
 
 // ---------- memory callbacks
-// NVN calls the game's memory callback when a recording needs command or control memory and none is left. Records
-// live in host memory here, so the callback is called only where the hardware certainly would: a recording starts
-// without any command memory, or ends without any control memory. It runs on the calling guest thread through
-// rt_call; whatever memory it adds is accounted. Set{Command,Control}MemoryCallbackEnabled(false) suppress it.
+// NVN calls the game's memory callback when a recording needs command or control memory and none is left, every time
+// that happens, before it writes; the callback adds at least minSize with AddCommandMemory / AddControlMemory. Records
+// live in host memory here and the game's memory is accounted only (hw_used: the real encoding's bytes; CTL_PER_RECORDING
+// per recording), so the callback is called where that accounting runs out:
+// - a recording starts without any command memory (BeginRecording), or a record does not fit in the command memory
+//   left (cmd_charge; asked with at least that record's size);
+// - a recording ends without any control memory, or without room for one more recording's control (EndRecording).
+// Without these calls the counts stopped at the size the game gave (Get*MemoryUsed never report more), so a game that
+// measures a recording by the change of command plus control used read 0 for a full recording: Mario Tennis Fever
+// drops recordings under 9 bytes as empty and then called a null handle. It runs on the calling guest thread through
+// rt_call (which keeps the API's arguments), never inside itself for the same command buffer, and what the callback adds
+// starts a new count. Set{Command,Control}MemoryCallbackEnabled(false), or no callback, suppress it; the counts then go
+// past the memory as before (Used reports the size).
 enum { CB_NO_COMMAND = 1, CB_NO_CONTROL = 2 };
+static __thread const cmd_t *cb_running;   // the command buffer whose callback runs on this thread
 static PlatMutex cb_lock = PLAT_MUTEX_INIT;
 static nvn_hmap cb_off = {.klen = 8};       // command buffer -> disabled callback kinds | 0x100
 
@@ -59,15 +75,41 @@ static void cb_set_disabled(const cmd_t *o, unsigned kind, int disabled) {
     plat_mutex_unlock(&cb_lock);
 }
 
-static void memory_event(Cpu *c, cmd_t *o, int event, uint64_t min) {
-    if (!o->cb || (cb_disabled(o) & (event == NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY ? CB_NO_COMMAND
-                                                                                                     : CB_NO_CONTROL)))
-        return;
+// 1 when the callback was called.
+static int memory_event(Cpu *c, cmd_t *o, int event, uint64_t min) {
+    if (!c || !o->cb || cb_running == o ||
+        (cb_disabled(o) & (event == NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY ? CB_NO_COMMAND
+                                                                                          : CB_NO_CONTROL)))
+        return 0;
     NVN_LOG("command buffer %p: memory callback %p (%s memory, %llu bytes)", (void *)o, (void *)o->cb,
             event == NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY ? "command" : "control",
             (unsigned long long)min);
+    const cmd_t *outer = cb_running;
+    cb_running = o;
     rt_call(c, (uint64_t)(uintptr_t)o->cb, 4, (uint64_t)(uintptr_t)o, (uint64_t)event, min,
             (uint64_t)(uintptr_t)o->cb_data);
+    cb_running = outer;
+    return 1;
+}
+
+// A callback that left the memory short: reported (a few times), the count goes on past the memory.
+static void memory_short(const cmd_t *o, const char *what, size_t used, size_t need, size_t size) {
+    static uint32_t reports;
+    if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 8)
+        rt_log("nvn: command buffer %p: the memory callback left %s memory short (%zu used + %zu needed > %zu)",
+               (const void *)o, what, used, need, size);
+}
+
+// Charges one record's command memory (the real encoding's bytes). A record that does not fit in what the game added
+// asks the callback first; AddCommandMemory in it starts a new count, which the record then goes into.
+static void cmd_charge(cmd_t *o, size_t bytes) {
+    if (o->recording && o->game_size && o->hw_used + bytes > o->game_size) {
+        uint64_t min = bytes > MIN_COMMAND_SIZE ? (bytes + 7) & ~(size_t)7 : MIN_COMMAND_SIZE;
+        if (memory_event(cmd_cpu, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, min) &&
+            o->hw_used + bytes > o->game_size)
+            memory_short(o, "command", o->hw_used, bytes, o->game_size);
+    }
+    o->hw_used += bytes;
 }
 
 // ---------- recording buffer
@@ -193,17 +235,24 @@ static void cmd_reserve(cmd_t *o, size_t need) {
     o->end = b + cap;
 }
 
-// Space for one record (header included); the header's op is filled by the caller.
-static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
+// Space for one record (header included) in the host recording buffer only; the header's op is filled by the caller.
+static uint8_t *cmd_alloc_host(cmd_t *o, uint32_t size) {
     size = (size + 7) & ~7u;
     cmd_reserve(o, size);
     uint8_t *p = o->cur;
     o->cur += size;
     o->cmd_used += size;
-    o->hw_used += size;
-    o->last_rec = size;
     put_hdr(p, 0, size);
     return p;
+}
+
+// Space for one record, charged as command memory (hw_fix corrects the charge to the real encoding). The charge comes
+// first: the memory callback it may call runs before the record is written.
+static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
+    size = (size + 7) & ~7u;
+    cmd_charge(o, size);
+    o->last_rec = size;
+    return cmd_alloc_host(o, size);
 }
 
 // The game sums nvnCommandBufferGetCommandMemoryUsed over recordings to size resource heaps, so usage must be what the
@@ -211,9 +260,9 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
 // DrawElements 12 words, DrawElementsBaseVertex 11, BindVertexAttribState 1+16, BindVertexStreamState 16+n,
 // BindVertexBuffer 6 words each.
 static void hw_fix(cmd_t *o, size_t bytes) {
-    o->hw_used += bytes;
     o->hw_used -= o->last_rec;
     o->last_rec = bytes;
+    cmd_charge(o, bytes);
 }
 
 // A zeroed payload of one record.
@@ -610,6 +659,7 @@ NVN_API(nvnCommandBufferAddCommandMemory) {
     o->game_size = arg_x(c, 3);
     o->cmd_used = 0;
     o->hw_used = 0;
+    o->last_rec = 0;   // the last record was charged to the memory before; hw_fix corrects only what it charged here
 }
 // void nvnCommandBufferAddControlMemory(NVNcommandBuffer *cmd, void *memory, size_t size): the SDK encodes handles in
 // control memory (sdk+0x444530), so reusing that storage retires the copies recorded there
@@ -640,8 +690,8 @@ NVN_API(nvnCommandBufferBeginRecording) {
     o->recording = 1;
     o->cur = o->seg;   // the previous recording was copied at EndRecording
     o->rec_start = o->cmd_used;
-    put_hdr(cmd_alloc(o, 8), OP_BEGIN, 8);
-    o->hw_used -= 8;   // BEGIN and END have no hardware equivalent
+    put_hdr(cmd_alloc_host(o, 8), OP_BEGIN, 8);   // BEGIN and END have no hardware equivalent: not charged
+    o->last_rec = 0;
     o->hw_start = o->hw_used;
     if (!o->game_size) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, MIN_COMMAND_SIZE);
 }
@@ -649,9 +699,15 @@ NVN_API(nvnCommandBufferBeginRecording) {
 NVN_API(nvnCommandBufferEndRecording) {
     cmd_t *o = cmd_of(c);
     if (!o->recording || !o->seg) rt_fatal("nvn: EndRecording on command buffer %p, which does not record", (void *)o);
-    if (!o->ctl_size) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, MIN_CONTROL_SIZE);
-    put_hdr(cmd_alloc(o, 8), OP_END, 8);
-    o->hw_used -= 8;
+    // No control memory, or no room for this recording's: the callback first (AddControlMemory in it retires the copies
+    // made in that memory and starts a new count, which this recording then goes into).
+    if (!o->ctl_size || o->ctl_used + CTL_PER_RECORDING > o->ctl_size) {
+        int had = o->ctl_size != 0;
+        if (memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, MIN_CONTROL_SIZE) && had &&
+            o->ctl_used + CTL_PER_RECORDING > o->ctl_size)
+            memory_short(o, "control", o->ctl_used, CTL_PER_RECORDING, o->ctl_size);
+    }
+    put_hdr(cmd_alloc_host(o, 8), OP_END, 8);
     o->recording = 0;
     uint8_t *copy = flatten_recording(o->seg, (size_t)(o->cur - o->seg));
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
@@ -677,8 +733,8 @@ static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
     memcpy(o->cur, (const uint8_t *)(uintptr_t)handle + 8, body);
     o->cur += body;
     o->cmd_used += body;
-    o->hw_used += body;
     o->last_rec = 0;
+    cmd_charge(o, body);   // after the copy: a callback that retires the called recording cannot free it under us
 }
 // void nvnCommandBuffer{Call,Copy}Commands(NVNcommandBuffer *cmd, int n, const NVNcommandHandle *handles)
 NVN_API(nvnCommandBufferCallCommands) {
@@ -771,6 +827,26 @@ static void set_viewports(cmd_t *o, int first, int n, const float *v) {
 }
 // void nvnCommandBufferSetViewports(NVNcommandBuffer *cmd, int first, int n, const float *xywh)
 NVN_API(nvnCommandBufferSetViewports) { set_viewports(cmd_of(c), (int)arg_x(c, 1), (int)arg_x(c, 2), arg_p(c, 3)); }
+// void nvnCommandBufferSetViewportSwizzles(NVNcommandBuffer *cmd, int first, int n, const NVNviewportSwizzle *swizzles)
+NVN_API(nvnCommandBufferSetViewportSwizzles) {
+    cmd_t *o = cmd_of(c);
+    int first = (int)arg_x(c, 1), n = (int)arg_x(c, 2);
+    const NVNviewportSwizzle (*sw)[4] = arg_p(c, 3);
+    if (first < 0 || first > 16 || n < 0 || n > 16 - first)
+        rt_fatal("nvn: SetViewportSwizzles first %d n %d", first, n);
+    if (n && !sw) rt_fatal("nvn: SetViewportSwizzles has a null array");
+    if (!n) return;
+    p_viewport_swizzles *r = REC(o, OP_VIEWPORT_SWIZZLES, p_viewport_swizzles);
+    r->first = first;
+    r->n = n;
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < 4; c++) {
+            if ((unsigned)sw[i][c] > NVN_VIEWPORT_SWIZZLE_NEGATIVE_W)
+                rt_fatal("nvn: SetViewportSwizzles[%d][%d] has invalid value %d", first + i, c, (int)sw[i][c]);
+            r->v[i][c] = (uint8_t)sw[i][c];
+        }
+    }
+}
 // void nvnCommandBufferSetViewport(NVNcommandBuffer *cmd, int x, int y, int w, int h)
 NVN_API(nvnCommandBufferSetViewport) {
     float v[4] = {(float)(int)arg_x(c, 1), (float)(int)arg_x(c, 2), (float)(int)arg_x(c, 3), (float)(int)arg_x(c, 4)};
@@ -1023,6 +1099,17 @@ NVN_API(nvnCommandBufferDispatchCompute) {
 NVN_API(nvnCommandBufferDispatchComputeIndirect) {
     *REC(cmd_of(c), OP_DISPATCH_IND, p_dispatch_ind) = (p_dispatch_ind){arg_x(c, 1), c->x[30]};
 }
+// NVN2: direct mesh task launch. The caller PC is retained for shader/control diagnostics.
+NVN_API(nvnCommandBufferDrawMeshTasks) {
+    int32_t count = (int32_t)arg_x(c, 2);
+    if (count <= 0) return;
+    *REC(cmd_of(c), OP_DRAW_MESH, p_draw_mesh) = (p_draw_mesh){(int32_t)arg_x(c, 1), count, c->x[30]};
+}
+// NVN2: indirect mesh task launch. Preserve the opaque NVN2 arguments verbatim for backend translation.
+NVN_API(nvnCommandBufferDrawMeshTasksIndirect) {
+    *REC(cmd_of(c), OP_DRAW_MESH_IND, p_draw_mesh_ind) =
+        (p_draw_mesh_ind){arg_x(c, 1), arg_x(c, 3), (uint32_t)arg_x(c, 2), (uint32_t)arg_x(c, 4), c->x[30]};
+}
 // void nvnCommandBufferClearBuffer(NVNcommandBuffer *cmd, NVNbufferAddress addr, size_t size, uint32_t value)
 NVN_API(nvnCommandBufferClearBuffer) {
     *REC(cmd_of(c), OP_CLEAR_BUF, p_clear_buf) = (p_clear_buf){arg_x(c, 1), arg_x(c, 2), (uint32_t)arg_x(c, 3), 0};
@@ -1103,6 +1190,12 @@ NVN_API(nvnCommandBufferDownsample) {
 }
 // void nvnCommandBufferSetCopyRowStride(NVNcommandBuffer *cmd, ptrdiff_t stride)
 NVN_API(nvnCommandBufferSetCopyRowStride) { REC(cmd_of(c), OP_COPY_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1); }
+// NVN's layer stride is a hint for 3D/array image copies. OOT passes zero, the tightly packed default used by replay.
+NVN_API(nvnCommandBufferSetCopyImageStride) {
+    static int warned;
+    if (arg_x(c, 1) && !__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+        NVN_LOG("SetCopyImageStride(%lld): replay uses tightly packed layers", (long long)arg_x(c, 1));
+}
 // void nvnCommandBufferSetBlendColor(NVNcommandBuffer *cmd, const float *rgba)
 NVN_API(nvnCommandBufferSetBlendColor) { memcpy(REC(cmd_of(c), OP_BLEND_COLOR, p_blend_color)->rgba, arg_p(c, 1), 16); }
 
@@ -1216,6 +1309,7 @@ const char *nvn_op_name(uint32_t op) {
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
         "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF",
+        "DRAW_MESH", "DRAW_MESH_IND", "VIEWPORT_SWIZZLES",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

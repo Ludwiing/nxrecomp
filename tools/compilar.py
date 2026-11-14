@@ -16,6 +16,7 @@ import glob
 import fcntl
 import hashlib
 import json
+import shlex
 import tempfile
 import shutil
 from dispatch_table import prepare as prepare_dispatch
@@ -35,6 +36,53 @@ def terminate_process(process):
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
+
+
+def parse_dependencies(rule):
+    rule = rule.replace("\\\n", " ").strip()
+    if ":" not in rule:
+        return None
+    try:
+        paths = shlex.split(rule.split(":", 1)[1])
+    except ValueError:
+        return None
+    return paths
+
+
+def compiler_dependencies(src, command, obj):
+    """Return the headers a source actually includes, using clang's Make dependency output."""
+    dep_command = [arg for arg in command if arg != "-c"] + ["-MM", "-MT", obj]
+    result = subprocess.run(dep_command, capture_output=True, text=True)
+    if result.returncode:
+        return None
+    paths = parse_dependencies(result.stdout)
+    if paths is None:
+        return None
+    paths.append(src)
+    return sorted({os.path.abspath(p) for p in paths})
+
+
+def dependencies_fresh(depfile, src, command, obj, obj_mtime):
+    try:
+        with open(depfile) as f:
+            paths = json.load(f)
+    except (OSError, ValueError):
+        paths = compiler_dependencies(src, command, obj)
+        if paths is None:
+            return False
+        # Adopt existing object files into dependency-aware caching without recompiling them.
+        temp = depfile + f".{os.getpid()}.tmp"
+        try:
+            with open(temp, "w") as f:
+                json.dump(paths, f)
+            os.replace(temp, depfile)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+    try:
+        return all(os.path.getmtime(path) <= obj_mtime for path in paths)
+    except OSError:
+        return False
 
 
 def cancel_compilation(signum, frame):
@@ -68,6 +116,7 @@ def compile_source(src, carpeta, opt, newest_h, reuse_optimized=False):
             optimized = [command[0], f"-O{level}", *command[2:]]
             allowed_signatures.add(hashlib.sha256(json.dumps(optimized).encode()).hexdigest())
     stamp = obj + ".command"
+    depfile = obj + ".deps"
     with open(obj + ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if os.path.basename(src).startswith(("funciones_", "pistas_extra")):
@@ -77,16 +126,18 @@ def compile_source(src, carpeta, opt, newest_h, reuse_optimized=False):
         try:
             with open(stamp) as saved_command:
                 saved_signature = saved_command.read()
-            valid = (os.path.getmtime(obj) >= max(original.st_mtime, newest_h)
-                     and saved_signature in allowed_signatures)
+            obj_mtime = os.path.getmtime(obj)
+            valid = (obj_mtime >= original.st_mtime and saved_signature in allowed_signatures
+                     and dependencies_fresh(depfile, src, command, obj, obj_mtime))
         except OSError:
             valid = False
         if valid:
             return obj, None
         fd, temporary = tempfile.mkstemp(prefix=".compilar-", suffix=".o", dir=objdir)
         os.close(fd)
+        dep_temporary = temporary + ".d"
         try:
-            process = subprocess.Popen([*command, "-o", temporary], stdout=subprocess.PIPE,
+            process = subprocess.Popen([*command, "-MMD", "-MF", dep_temporary, "-MT", obj, "-o", temporary], stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True, start_new_session=True)
             active_compilers.add(process)
             try:
@@ -102,13 +153,26 @@ def compile_source(src, carpeta, opt, newest_h, reuse_optimized=False):
             after = os.stat(src)
             if (original.st_size, original.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 return obj, f"El archivo cambió durante la compilación: {src}"
+            try:
+                with open(dep_temporary) as dep_output:
+                    dep_paths = parse_dependencies(dep_output.read())
+            except OSError:
+                dep_paths = None
+            if dep_paths is not None:
+                dep_paths.append(src)
+                dep_paths = sorted({os.path.abspath(p) for p in dep_paths})
+            if dep_paths is None:
+                return obj, f"No se pudieron obtener las dependencias del compilador: {src}"
             os.replace(temporary, obj)
+            os.replace(dep_temporary, depfile)
             with open(stamp, "w") as output:
                 output.write(signature)
             return obj, None
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+            if os.path.exists(dep_temporary):
+                os.unlink(dep_temporary)
 
 
 def main():
@@ -145,7 +209,7 @@ def main():
     signal.signal(signal.SIGTERM, cancel_compilation)
     signal.signal(signal.SIGINT, cancel_compilation)
     prepare_dispatch(os.path.join(args.carpeta, "programa.c"))
-    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c", "nxhle.c",
+    runtime = ["nxrt.c", "nxmain.c", "nxkern.c", "nxipc.c", "nxservices.c", "nxsvc_am.c", "nxsvc_ldr.c", "nxsvc_hid.c", "nxsvc_time.c", "nxsvc_fs.c", "nxsvc_vi.c", "nxdisplay.c", "nxinput.c", "nxaudio.c", "nxsvc_audio.c", "nxsvc_audren.c", "nxaudren.c", "nxsvc_acc.c", "nxsvc_otros.c", "nxsvc_opus.c", "nxgpu.c", "nxgl.c", "nxshader.c", "nxastc.c", "nxnvn.c", "nxhle.c", "nxcodec.c", "nxguest.c", "nxhle_event.c", "nxcodec_hle.c", "nxfont.c",
                ]
     # La capa NVN y el backend Vulkan de totk-pc-recomp (runtime/nvn/, con sus archivos de adaptación)
     nvn = os.path.join(ROOT, "runtime", "nvn")
@@ -155,7 +219,10 @@ def main():
     srcs = sorted(glob.glob(os.path.join(args.carpeta, "*.c"))) + [os.path.join(ROOT, "runtime", f) for f in runtime]
     objdir = os.path.join(args.carpeta, "obj")
     os.makedirs(objdir, exist_ok=True)
-    headers = glob.glob(os.path.join(ROOT, "runtime", "*.h")) + [os.path.join(args.carpeta, "nxgame.h")]
+    game_header = os.path.join(args.carpeta, "nxgame.h")
+    if not os.path.isfile(game_header) or not os.path.isfile(os.path.join(args.carpeta, "programa.c")):
+        sys.exit(f"Falta nxgame.h o programa.c en {args.carpeta}; vuelve a recompilar el código ARM64 a C.")
+    headers = glob.glob(os.path.join(ROOT, "runtime", "*.h")) + [game_header]
     newest_h = max(os.path.getmtime(h) for h in headers)
 
     # Los encabezados de runtime/nvn/ solo los incluye esa capa: si cambian, se recompila ella y no todo el juego.
@@ -180,7 +247,7 @@ def main():
     os.close(fd)
     try:
         linker = ["-fuse-ld=lld", f"-Wl,--threads={args.j}"] if shutil.which("ld.lld") else []
-        process = subprocess.Popen(["clang", *linker, *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-lEGL", "-lOpenGL", "-lopus", "-lvulkan", "-lstdc++", "-o", temporary], start_new_session=True)
+        process = subprocess.Popen(["clang", *linker, *[o for o, _ in results], "-lm", "-lpthread", *[f for f in SDL if not f.startswith("-I")], "-lEGL", "-lOpenGL", "-lopus", "-lvpx", "-lvulkan", "-lstdc++", "-o", temporary], start_new_session=True)
         active_compilers.add(process)
         try:
             if cancelled.is_set():

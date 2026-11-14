@@ -52,6 +52,32 @@ class CompileCacheTest(unittest.TestCase):
                                 hashlib.sha256(original).digest())
             self.assertFalse(list(obj.parent.glob('.compilar-*')))
 
+    def test_only_invalidates_for_headers_the_source_includes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'answer.c'
+            included = root / 'included.h'
+            unrelated = root / 'unrelated.h'
+            included.write_text('#define ANSWER 42\n')
+            unrelated.write_text('#define NOISE 1\n')
+            source.write_text('#include "included.h"\nint answer(void) { return ANSWER; }\n')
+
+            obj, error = compile_source(str(source), folder, '0', 0)
+            self.assertIsNone(error)
+            obj = Path(obj)
+            first_mtime = obj.stat().st_mtime_ns
+
+            unrelated.write_text('#define NOISE 2\n')
+            _, error = compile_source(str(source), folder, '0', unrelated.stat().st_mtime)
+            self.assertIsNone(error)
+            self.assertEqual(obj.stat().st_mtime_ns, first_mtime)
+
+            included.write_text('#define ANSWER 7\n')
+            _, error = compile_source(str(source), folder, '0', unrelated.stat().st_mtime)
+            self.assertIsNone(error)
+            self.assertNotEqual(obj.stat().st_mtime_ns, first_mtime)
+            self.assertTrue(Path(str(obj) + '.deps').is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

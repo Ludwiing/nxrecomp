@@ -3,7 +3,7 @@
 #include "../mini.h"
 
 int sdk_counter = 5;
-static int sdk_inits;
+static volatile int sdk_inits; // volatile: ver main.c
 
 __attribute__((constructor)) static void sdk_init(void) { sdk_inits = 42; }
 

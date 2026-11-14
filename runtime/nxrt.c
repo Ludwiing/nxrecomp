@@ -2,6 +2,7 @@
 // lo que el código traducido no puede hacer solo: registros de sistema, trampas, el reloj.
 #define _GNU_SOURCE
 #include "nxrt.h"
+#include "nxkern.h"
 
 #include <signal.h>
 #include <dlfcn.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -54,7 +56,15 @@ uint64_t nx_mrs(Ctx *c, int reg) {
 
 void nx_msr(Ctx *c, int reg, uint64_t v) {
     switch (reg) {
-    case NX_TPIDR_EL0: c->tpidr = v; break;
+    case NX_TPIDR_EL0:
+        c->tpidr = v;
+        if (getenv("NX_TRACE_TLS")) {
+            uint64_t hook_tp = 0;
+            if (c->tpidrro) memcpy(&hook_tp, (const void *)(uintptr_t)(c->tpidrro + 0x1f0), sizeof hook_tp);
+            fprintf(stderr, "[tls] TP write ctx=%p tpidrro=%#llx TLR+1f0=%#llx TP=%#llx\n", (void *)c,
+                    (unsigned long long)c->tpidrro, (unsigned long long)hook_tp, (unsigned long long)v);
+        }
+        break;
     case NX_NZCV: c->n = v >> 31 & 1; c->z = v >> 30 & 1; c->c = v >> 29 & 1; c->v = v >> 28 & 1; break;
     case NX_FPCR: c->fpcr = v; break;
     case NX_FPSR: c->fpsr = v; break;
@@ -89,20 +99,86 @@ static void trace_host_stack(void) {
     }
 }
 
+// Lee memoria del invitado sin poder fallar: process_vm_readv sobre el propio proceso devuelve
+// EFAULT (en vez de SIGSEGV) si la dirección no está mapeada o está protegida. Se usa dentro del
+// manejador de fallos, donde un segundo fallo taparía el original.
+static int leer_seguro(uint64_t a, void *out, size_t n) {
+    struct iovec local = {.iov_base = out, .iov_len = n};
+    struct iovec remota = {.iov_base = (void *)(uintptr_t)a, .iov_len = n};
+    return a && process_vm_readv(getpid(), &local, 1, &remota, 1, 0) == (ssize_t)n;
+}
+
+// Texto de una lectura segura: el valor, o "ilegible" si la dirección no se pudo leer.
+static const char *fmt_seguro(char *buf, size_t tam, uint64_t a, size_t n) {
+    uint64_t v = 0;
+    if (!leer_seguro(a, &v, n)) return "ilegible";
+    snprintf(buf, tam, "%#llx", (unsigned long long)v);
+    return buf;
+}
+
+#include "nx_describir.h"
+static void trace_guest_stack(const Ctx *c);
+int nx_leer_seguro(uint64_t a, void *out, size_t n) { return leer_seguro(a, out, n); }
+
+const char *nx_describir_dir(uint64_t a, char *buf, size_t n) { return nx_describir(a, buf, n); }
+void nx_pila_invitado(const Ctx *c) { trace_guest_stack(c); }
+
+static void trace_guest_stack(const Ctx *c) {
+    uint64_t fp = c->x[29];
+    uint64_t lo = NX_STACK_BASE, hi = NX_STACK_BASE + NX_STACK_SIZE;
+    // Los hilos del juego pueden tener la pila en el heap (nn::os::CreateThread con memoria propia): entonces se
+    // sigue la cadena dentro de 16 MiB por encima del fp inicial; leer_seguro descarta lo que no sea legible.
+    if (fp < lo || fp > hi - 16) lo = fp, hi = fp + (16u << 20);
+    for (int depth = 0; depth < 16; depth++) {
+        if ((fp & 7) || fp < lo || fp > hi - 16) break;
+        // La región de pilas está reservada entera, pero solo las pilas de los hilos están abiertas.
+        uint64_t frame[2];
+        if (!leer_seguro(fp, frame, sizeof frame)) {
+            fprintf(stderr, "  [guest stack %02d] fp=0x%llx ilegible\n", depth, (unsigned long long)fp);
+            break;
+        }
+        uint64_t prev = frame[0], lr = frame[1];
+        char donde[256];
+        fprintf(stderr, "  [guest stack %02d] fp=0x%llx lr=0x%llx %s\n", depth, (unsigned long long)fp,
+                (unsigned long long)lr, nx_describir_dir(lr, donde, sizeof donde));
+        if (prev <= fp || prev > hi - 16) break;
+        fp = prev;
+    }
+}
+
 void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to) {
     fflush(stdout);
+    // nx_buscar() has no guest PC when the build was not made with --traza.
+    // For a null BLR target, LR is the instruction after that call, so retain
+    // the call site instead of reporting the unhelpful address 0x0.
+    if (!from && c && c->x[30] >= 4) from = c->x[30] - 4;
     fprintf(stderr, "[RED] salto indirecto a 0x%llx (desde 0x%llx): no es una función recompilada\n",
             (unsigned long long)to, (unsigned long long)from);
-    if (getenv("NX_TRACE_BOOT")) {
-        fprintf(stderr, "[nxrt] LR invitado: 0x%llx\n", (unsigned long long)c->x[30]);
+    // A null callback is a runtime/game-state failure, not an undiscovered code
+    // address. Keep its LR and host stack so it can be diagnosed without feeding
+    // 0x0 back into the static recompiler as a bogus hint.
+    if (c && (!to || getenv("NX_TRACE_BOOT"))) {
+        fprintf(stderr, "[nxrt] PC invitado: 0x%llx; LR: 0x%llx\n",
+                (unsigned long long)c->pc, (unsigned long long)c->x[30]);
+        if (!to) {
+            for (int k = 0; k < 31; k += 4) {
+                fprintf(stderr, "  x%-2d %016llx", k, (unsigned long long)c->x[k]);
+                for (int j = k + 1; j < k + 4 && j < 31; j++)
+                    fprintf(stderr, "  x%-2d %016llx", j, (unsigned long long)c->x[j]);
+                fputc('\n', stderr);
+            }
+            trace_guest_stack(c);
+        }
         trace_host_stack();
     }
     const char *pistas = getenv("NX_PISTAS");
-    FILE *f = pistas && *pistas ? fopen(pistas, "a") : NULL;
+    FILE *f = to && pistas && *pistas ? fopen(pistas, "a") : NULL;
     if (f) {
         fprintf(f, "0x%llx\n", (unsigned long long)to);
         fclose(f);
         fprintf(stderr, "[nxrt] anotado en %s: recompila con --pistas para seguir\n", pistas);
+    } else if (!to) {
+        fprintf(stderr, "[nxrt] destino nulo: no se agrega a pistas porque no es una dirección de código\n");
     }
     exit(3);
 }
@@ -275,7 +351,51 @@ static void on_crash(int sig, siginfo_t *si, void *uc) {
 #endif
     Ctx *c = crash_ctx;
     if (c) {
+        KThread *thread = nx_current_thread();
+        // TPIDR_EL0, el TLS (TPIDRRO_EL0 puede ser el buffer de SendSyncRequestWithUserBuffer) y lo
+        // que hay en ellos los escribe el juego: se leen sin poder fallar.
+        char b0[24], b1[24], b2[24], b3[24], b4[24];
+        uint64_t tt = 0, tp_word1 = 0;
+        int tt_ok = c->tpidrro && leer_seguro(c->tpidrro + 0x1f8, &tt, sizeof tt);
+        int tp1_ok = c->tpidr && leer_seguro(c->tpidr + 8, &tp_word1, sizeof tp_word1);
+        fprintf(stderr, "[nxrt] TLS state TPIDR_EL0=%#llx TPIDRRO_EL0=%#llx TLR+1f0=%s TLR+1f8=%s\n",
+                (unsigned long long)c->tpidr, (unsigned long long)c->tpidrro,
+                c->tpidrro ? fmt_seguro(b0, sizeof b0, c->tpidrro + 0x1f0, 8) : "-",
+                c->tpidrro ? fmt_seguro(b1, sizeof b1, c->tpidrro + 0x1f8, 8) : "-");
+        fprintf(stderr, "[nxrt] TLS words TP[0]=%s TP[8]=%s DTV[0..2]=%s,%s,%s\n",
+                c->tpidr ? fmt_seguro(b0, sizeof b0, c->tpidr, 8) : "-",
+                c->tpidr ? fmt_seguro(b1, sizeof b1, c->tpidr + 8, 8) : "-",
+                tp1_ok && tp_word1 ? fmt_seguro(b2, sizeof b2, tp_word1, 8) : "-",
+                tp1_ok && tp_word1 ? fmt_seguro(b3, sizeof b3, tp_word1 + 8, 8) : "-",
+                tp1_ok && tp_word1 ? fmt_seguro(b4, sizeof b4, tp_word1 + 16, 8) : "-");
+        fprintf(stderr, "[nxrt] thread id=%llu handle=%#x TLR+110=%s ThreadType=%s ThreadType+1b0=%s\n",
+                (unsigned long long)(thread ? thread->id : 0), thread ? thread->handle : 0,
+                c->tpidrro ? fmt_seguro(b0, sizeof b0, c->tpidrro + 0x110, 4) : "-",
+                c->tpidrro ? fmt_seguro(b1, sizeof b1, c->tpidrro + 0x1f8, 8) : "-",
+                tt_ok && tt ? fmt_seguro(b2, sizeof b2, tt + 0x1b0, 4) : "-");
+        fprintf(stderr, "[nxrt] thread entry=%#llx\n", (unsigned long long)(thread ? thread->entry : 0));
+        // x4 es un registro del juego, no necesariamente un puntero (p. ej. 0x4000): solo su valor.
+        fprintf(stderr, "[nxrt] x4=%#llx (valor del registro; no se lee la memoria a la que apunte)\n",
+                (unsigned long long)c->x[4]);
+        // Diagnóstico opcional (NX_CRASH_CADENAS=1): las cadenas imprimibles a las que apuntan x0..x28, leídas con la
+        // lectura segura (una dirección sin mapear no provoca otro fallo). Sirve, p. ej., para ver el nombre de un
+        // recurso que el juego buscaba en la pila cuando cayó.
+        if (getenv("NX_CRASH_CADENAS"))
+            for (int k = 0; k < 29; k++) {
+                char s[97];
+                if (c->x[k] < 0x10000 || !leer_seguro(c->x[k], s, sizeof s - 1)) continue;
+                s[sizeof s - 1] = 0;
+                int n = 0;
+                while (s[n] >= 0x20 && s[n] < 0x7f) n++;
+                if (n >= 4 && !s[n]) fprintf(stderr, "[nxrt] x%d → \"%s\"\n", k, s);
+            }
+        // Solo las entradas que dio el recompilador (sin direcciones de un juego: leer una sin mapear aquí,
+        // dentro del manejador de fallos, taparía el fallo original).
+        if (&nx_thread_hook_got[0])
+            fprintf(stderr, "[nxrt] GOT de hooks de hilo nnmusl: %#llx/%#llx\n",
+                    (unsigned long long)nx_thread_hook_got[0], (unsigned long long)nx_thread_hook_got[1]);
         fprintf(stderr, "[nxrt] última instrucción ARM: 0x%llx (0 si no se compiló con --traza)\n", (unsigned long long)c->pc);
+        trace_guest_stack(c);
         for (int k = 0; k < 31; k += 4) {
             for (int j = k; j < k + 4 && j < 31; j++) fprintf(stderr, "  x%-2d %016llx", j, (unsigned long long)c->x[j]);
             fprintf(stderr, "\n");

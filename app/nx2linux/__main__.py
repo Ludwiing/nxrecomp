@@ -41,7 +41,7 @@ def _esperar(j, desde=None, solo_dlc=None):
         if paso in ("fin", "error"):
             estado["ok"] = paso == "fin"
             fin.set()
-    c = motor.Construccion(j, avisar, desde, solo_dlc)
+    c = motor.Construccion(j, avisar, desde, solo_dlc, motivo="línea de comandos (nx2linux --construir)")
     c.empezar()
     try:
         fin.wait()

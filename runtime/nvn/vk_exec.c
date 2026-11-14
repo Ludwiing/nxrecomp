@@ -29,6 +29,16 @@
 #include "vk_exec.h"
 #include "vk_dlaa.h"
 
+_Static_assert((int)NVN_VIEWPORT_SWIZZLE_POSITIVE_X == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_X_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_NEGATIVE_X == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_NEGATIVE_X_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_POSITIVE_Y == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_Y_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_NEGATIVE_Y == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_NEGATIVE_Y_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_POSITIVE_Z == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_Z_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_NEGATIVE_Z == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_NEGATIVE_Z_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_POSITIVE_W == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_W_NV &&
+               (int)NVN_VIEWPORT_SWIZZLE_NEGATIVE_W == (int)VK_VIEWPORT_COORDINATE_SWIZZLE_NEGATIVE_W_NV,
+               "NVN and Vulkan viewport swizzle enums must have identical ABI values");
+
 #define WEAK __attribute__((weak))
 #define CALL_DEPTH 8
 
@@ -114,6 +124,11 @@ static void state_reset(VkExec *ex) {
     memset(ex, 0, sizeof *ex);
     ex->st_vmask[0] = ex->st_vmask[1] = ex->st_wmask[0] = ex->st_wmask[1] = 0xff;
     ex->depth_range[1] = 1.0f;
+    for (int i = 0; i < 16; i++)
+        ex->vp_swizzle[i] = (VkViewportSwizzleNV){VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_X_NV,
+                                                  VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_Y_NV,
+                                                  VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_Z_NV,
+                                                  VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_W_NV};
     vk_pipe_state_defaults(&ex->pipe);
     ex->barrier_at = -1;
 }
@@ -865,6 +880,30 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
                 if (v->first + i >= 0) memcpy(ex->vp[v->first + i], v->v[i], sizeof ex->vp[0]);
             ex->has_vp = 1;
             ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+            break;
+        }
+        case OP_VIEWPORT_SWIZZLES: {
+            const p_viewport_swizzles *v = a;
+            VkCtx *c = vk_ctx();
+            for (int i = 0; i < v->n && v->first + i < 16; i++) {
+                int at = v->first + i;
+                if (at < 0) continue;
+                VkViewportSwizzleNV *d = &ex->vp_swizzle[at];
+                d->x = (VkViewportCoordinateSwizzleNV)v->v[i][0];
+                d->y = (VkViewportCoordinateSwizzleNV)v->v[i][1];
+                d->z = (VkViewportCoordinateSwizzleNV)v->v[i][2];
+                d->w = (VkViewportCoordinateSwizzleNV)v->v[i][3];
+            }
+            if (!c || !c->has_viewport_swizzle) {
+                static const VkViewportSwizzleNV identity = {VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_X_NV,
+                    VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_Y_NV, VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_Z_NV,
+                    VK_VIEWPORT_COORDINATE_SWIZZLE_POSITIVE_W_NV};
+                for (int i = 0; i < v->n; i++)
+                    if (memcmp(&ex->vp_swizzle[v->first + i], &identity, sizeof identity))
+                        rt_fatal("nvn: non-identity viewport swizzle requires VK_NV_viewport_swizzle and EDS3 support");
+            } else {
+                ex->dirty |= VK_EXEC_DIRTY_VIEWPORT_SWIZZLE;
+            }
             break;
         }
         case OP_SCISSOR:

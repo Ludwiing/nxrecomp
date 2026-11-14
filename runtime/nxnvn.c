@@ -12,6 +12,20 @@
 #include "nvn_procs.inc"
 #undef NVN_PROC
 
+static void hle_unknown_proc(Ctx *c) {
+    nx_enter(c);
+    nx_host_enter();
+    ret_x(c, 0);
+    nx_host_leave();
+}
+
+static void hle_unknown_init(Ctx *c) {
+    nx_enter(c);
+    nx_host_enter();
+    ret_x(c, 1);
+    nx_host_leave();
+}
+
 // El nvnp_nvnDeviceGetProcAddress de abajo reemplaza al de relleno que se genera para la misma fila.
 #define nvnp_nvnDeviceGetProcAddress nvnp_relleno_nvnDeviceGetProcAddress
 #define NVN_PROC(n)                                                                                             \
@@ -57,6 +71,7 @@ enum { PROC_COUNT = 0
 
 static Proc procs[PROC_COUNT];
 static int nprocs;
+static uint64_t unknown_proc_addr, unknown_init_addr;
 
 static int by_name(const void *a, const void *b) { return strcmp(((const Proc *)a)->name, ((const Proc *)b)->name); }
 
@@ -78,15 +93,26 @@ static void procs_register(void) {
 #include "nvn_procs.inc"
 #undef NVN_PROC
     qsort(procs, (size_t)nprocs, sizeof *procs, by_name);
+    // Hookshot and NXnative return callable stubs for versioned NVN names the
+    // host does not implement. Returning NULL makes Switch 2 games branch to
+    // address zero before they can decide whether the optional proc is used.
+    unknown_proc_addr = nx_hle_register(hle_unknown_proc);
+    unknown_init_addr = nx_hle_register(hle_unknown_init);
 }
 
 uint64_t nvn_proc_address(const char *name) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static unsigned long long requests;
     pthread_once(&once, procs_register);
     if (!name) return 0;
     const Proc *p = bsearch(&(Proc){name, 0}, procs, (size_t)nprocs, sizeof *procs, by_name);
-    if (!p && getenv("NX_TRAZA_NVN")) fprintf(stderr, "[nvn] función desconocida \"%s\": se devuelve NULL\n", name);
-    return p ? p->addr : 0;
+    if (getenv("NX_TRAZA_NVN")) {
+        unsigned long long n = __atomic_add_fetch(&requests, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[nvn] proc #%llu \"%s\" -> %#llx%s\n", n, name,
+                (unsigned long long)(p ? p->addr : (strstr(name, "Initialize") ? unknown_init_addr : unknown_proc_addr)),
+                p ? "" : " (stub desconocido)");
+    }
+    return p ? p->addr : (strstr(name, "Initialize") ? unknown_init_addr : unknown_proc_addr);
 }
 
 // PFNNVNGENERICFUNC nvnDeviceGetProcAddress(const NVNdevice *device, const char *name)

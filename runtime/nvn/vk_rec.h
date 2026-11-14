@@ -44,6 +44,14 @@ void rec_blend_equation(PFN_vkCmdSetColorBlendEquationEXT fn, VkCommandBuffer cb
                         const VkColorBlendEquationEXT *v);
 void rec_write_mask(PFN_vkCmdSetColorWriteMaskEXT fn, VkCommandBuffer cb, uint32_t first, uint32_t n,
                     const VkColorComponentFlags *v);
+void rec_viewport_swizzle(PFN_vkCmdSetViewportSwizzleNV fn, VkCommandBuffer cb, uint32_t first, uint32_t n,
+                          const VkViewportSwizzleNV *v);
+void rec_draw_mesh_tasks(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z);
+void rec_draw_mesh_tasks_indirect(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer buffer,
+                                  VkDeviceSize offset, uint32_t count, uint32_t stride);
+void rec_draw_mesh_tasks_nv(PFN_vkCmdDrawMeshTasksNV fn, VkCommandBuffer cb, uint32_t count, uint32_t first);
+void rec_draw_mesh_tasks_indirect_nv(PFN_vkCmdDrawMeshTasksIndirectNV fn, VkCommandBuffer cb, VkBuffer buffer,
+                                     VkDeviceSize offset, uint32_t count, uint32_t stride);
 // A pass mark (vk_crumbs.c vk_pass_mark_cmd: a buffer marker and a checkpoint), in order with the commands around it.
 void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end);
 

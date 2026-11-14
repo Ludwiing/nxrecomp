@@ -237,14 +237,174 @@ static uint32_t binder_handle(ServiceObject *self, NxRequest *r) {
 // ---------- vsync ----------
 static KEvent *vsync_event;
 static uint32_t vsync_event_h;
+typedef struct Vi2Session {
+    KEvent *events[8];
+    uint32_t handles[8];
+    uint8_t vsync[8];
+    int display_bound;
+    struct { uint64_t token; uint32_t options[2]; int display_bound; } layers[16];
+    struct Vi2Session *next;
+} Vi2Session;
+static Vi2Session *vi2_sessions;
+static pthread_mutex_t vi2_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t vsync_once = PTHREAD_ONCE_INIT;
+static int vsync_start_error;
+
+// Service objects live until process exit, including their registered events/layers.
+static Vi2Session *vi2_state_locked(ServiceObject *self) {
+    Vi2Session *s = self->state;
+    if (!s) {
+        s = calloc(1, sizeof *s);
+        if (s) { s->next = vi2_sessions; vi2_sessions = s; self->state = s; }
+    }
+    return s;
+}
+
+static uint32_t vi2_layer_request(ServiceObject *self, NxRequest *r) {
+    uint32_t required = r->cmd == 101 ? 12 : (r->cmd == 201 || r->cmd == 251) ? 16 : 8;
+    if (r->in_size < required) return 0xE401u;
+    uint64_t token = nx_in64(r, 0);
+    if (!token) return 0xE401u;
+    if (r->cmd == 101 && (token != 0x00746c7561666564ull || nx_in32(r, 8) != 1))
+        return 0xE401u;
+    pthread_mutex_lock(&vi2_lock);
+    Vi2Session *s = vi2_state_locked(self);
+    if (!s) { pthread_mutex_unlock(&vi2_lock); return 0xE601u; }
+    uint32_t rc = OK;
+    if (r->cmd == 101) s->display_bound = 1;
+    else {
+        unsigned found = 16, free_slot = 16;
+        for (unsigned i = 0; i < 16; i++) {
+            if (s->layers[i].token == token) found = i;
+            if (!s->layers[i].token && free_slot == 16) free_slot = i;
+        }
+        if (r->cmd == 201) {
+            if (!s->display_bound || found != 16) rc = 0xE401u;
+            else if (free_slot == 16) rc = 0xE601u;
+            else {
+                s->layers[free_slot].token = token;
+                s->layers[free_slot].options[0] = nx_in32(r, 8);
+                s->layers[free_slot].options[1] = nx_in32(r, 12);
+            }
+        } else if (found == 16) rc = 0xE401u;
+        else if (r->cmd == 251) {
+            // SDK passes the client layer token followed by the eight-byte display name.
+            if (!s->display_bound || nx_in64(r, 8) != 0x00746c7561666564ull) rc = 0xE401u;
+            else s->layers[found].display_bound = 1;
+        }
+        else if (r->cmd == 202) memset(&s->layers[found], 0, sizeof s->layers[found]);
+        else nx_out64(r, 0x7fffull); // GetLayerBufferBits: available client buffer slots.
+    }
+    pthread_mutex_unlock(&vi2_lock);
+    return rc;
+}
+
+static void vi2_tick(void) {
+    pthread_mutex_lock(&vi2_lock);
+    for (Vi2Session *s = vi2_sessions; s; s = s->next)
+        for (unsigned i = 0; i < 8; i++)
+            if (s->vsync[i] && s->events[i]) nx_event_signal(s->events[i]);
+    pthread_mutex_unlock(&vi2_lock);
+}
 static void *vsync_thread(void *arg) {
     (void)arg;
     for (;;) {
         struct timespec ts = {0, 16666667};
         nanosleep(&ts, NULL);
         nx_event_signal(vsync_event);
+        vi2_tick();
     }
     return NULL;
+}
+
+static void start_vsync(void) {
+    vsync_event_h = nx_event_new(&vsync_event);
+    if (!vsync_event_h || !vsync_event) { vsync_start_error = 1; return; }
+    pthread_t thread;
+    vsync_start_error = pthread_create(&thread, NULL, vsync_thread, NULL);
+    if (!vsync_start_error) pthread_detach(thread);
+}
+
+uint32_t nx2_vi2(ServiceObject *self, NxRequest *r) {
+    switch (r->cmd) {
+    case 101: case 201: case 202: case 212: case 251:
+        return vi2_layer_request(self, r);
+    case 0:
+        if (r->in_size < 8) return 0xE401u;
+        nx_out64(r, nx_in64(r, 0)); return OK;
+    case 1: case 3: nx_out32(r, 1); return OK; // One native display.
+    case 5: nx_out32(r, 7); return OK; // SDK timestamp recorder slots per layer.
+    case 104: { // QueryDisplayHdrStatus: SDR output and 400-nit peak luminance.
+        const struct { uint64_t format; uint16_t peak_nits; } status = {1, 400};
+        nx_out_bytes(r, &status, sizeof status);
+        return OK;
+    }
+    case 105: { // QueryDisplayHdrPaperWhite: BT.2408 reference white in nits.
+        const uint16_t paper_white_nits = 203;
+        nx_out_bytes(r, &paper_white_nits, sizeof paper_white_nits);
+        return OK;
+    }
+    case 106: { // QueryBufferMaxResolution(u64 pantalla) → BufferMaxResolution {u32 ancho, u32 alto}: lo que el SDK
+                // copia tal cual (nn::vi::detail::DefaultDisplay::QueryBufferMaxResolution, sdk+0x562270 en MTF). La
+                // misma resolución que dan GetDisplayResolution y GetDisplayLogicalResolution.
+        if (r->in_size != 8) return 0xE401u;
+        const uint32_t max[2] = {1920, 1080};
+        nx_out_bytes(r, max, sizeof max);
+        return OK;
+    }
+    case 107: case 354:
+        // Firmware commands without a known effect; Eglantine uses zeroed
+        // replies for these VI2 commands as well.
+        return OK;
+    // Firmware commands without a known effect; the SDK calls these while creating a layer.
+    // The reference implementation returns an empty TIPC success for both.
+    case 51:
+        return r->in_size == 4 ? OK : 0xE401u;
+    case 111:
+        return r->in_size == 24 ? OK : 0xE401u;
+    case 301: // Firmware command not yet identified; current public implementation replies empty-success.
+        return OK;
+    case 11: { KEvent *event; uint32_t h = nx_event_new(&event);
+        if (!h || !event) return 0xE601u;
+        nx_out_copy_handle(r, h); return OK;
+    }
+    case 31: case 32: case 261: case 262:
+    case 263: case 264: case 265: case 266: case 267: case 268:
+    case 269: case 270: case 271: case 272: break;
+    default: return NX_R_UNKNOWN_CMD;
+    }
+    uint32_t offset = r->cmd >= 261 ? 8 : 0;
+    if (r->in_size < offset + 4 || (r->cmd == 32 && r->nin_handles != 1)) return 0xE401u;
+    uint32_t slot = nx_in32(r, offset);
+    if (slot >= 8) return 0xF001u;
+    pthread_mutex_lock(&vi2_lock);
+    Vi2Session *s = vi2_state_locked(self);
+    if (!s) { pthread_mutex_unlock(&vi2_lock); return 0xE601u; }
+    uint32_t rc = OK;
+    if (r->cmd == 31) {
+        if (!s->events[slot]) s->handles[slot] = nx_event_new(&s->events[slot]);
+        if (!s->events[slot] || !s->handles[slot]) rc = 0xE601u;
+        else nx_out_copy_handle(r, s->handles[slot]);
+    } else if (!s->events[slot]) rc = 0xE401u;
+    else if (r->cmd == 32) {
+        if (nx_handle_get(r->in_handles[0], KO_EVENT) != s->events[slot]) rc = 0xE401u;
+        else nx_out_copy_handle(r, s->handles[slot]);
+    } else if (r->cmd == 261) {
+        s->vsync[slot] = 1;
+    } else {
+        // BindDisplay{RefreshRate,HdrStatus,HdrPaperWhite,BufferMaxResolution,
+        // ModeCapability}Event: those display properties stay fixed on this
+        // host, so deliver one change notification and leave the slot quiet.
+        // The even commands in this range unbind the native event.
+        s->vsync[slot] = 0;
+        if (r->cmd & 1) nx_event_signal(s->events[slot]);
+    }
+    pthread_mutex_unlock(&vi2_lock);
+    if (!rc && r->cmd == 261) {
+        pthread_once(&vsync_once, start_vsync);
+        if (vsync_start_error) return 0xE601u;
+    }
+    return rc;
 }
 
 // ---------- vi ----------
@@ -320,11 +480,8 @@ static uint32_t app_display(ServiceObject *self, NxRequest *r) {
     case 2030: native_window(r, &size); nx_out64(r, 1); nx_out64(r, size); return OK; // CreateStrayLayer
     case 2102: nx_out64(r, nx_in32(r, 0)); return OK; // ConvertScalingMode
     case 5202: case 5203: // GetDisplayVsyncEvent
-        if (!vsync_event_h) {
-            vsync_event_h = nx_event_new(&vsync_event);
-            pthread_t t;
-            pthread_create(&t, NULL, vsync_thread, NULL);
-        }
+        pthread_once(&vsync_once, start_vsync);
+        if (vsync_start_error) return 0xE601u;
         nx_out_copy_handle(r, vsync_event_h);
         return OK;
     }
@@ -435,6 +592,9 @@ static KEvent *sync_event_object(NvSyncEvent *e) {
 }
 
 void nx_nvdrv_syncpt_changed(uint32_t id) {
+    // Publish before taking nv_lock: GSV signals its event through the kernel
+    // handle lock, and must not invert the NV event lock order.
+    nx2_syncpt_publish(id, nx_syncpt_read(id));
     pthread_mutex_lock(&nv_lock);
     for (unsigned slot = 0; slot < 64; slot++) {
         NvSyncEvent *e = &sync_events[slot];

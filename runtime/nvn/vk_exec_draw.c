@@ -25,6 +25,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn2_program.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
@@ -41,7 +42,8 @@
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT,
+       W_MESH_DIRECT, W_MESH_INDIRECT, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile int32_t seen[W_COUNT];
@@ -248,6 +250,7 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
                                  .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         // HOST_COHERENT: the CPU fills these chunks and never flushes them. Intel's integrated GPUs (ANV, Meteor Lake)
         // offer host-cached memory only without coherence, which VMA picks for random host access: the GPU then read
@@ -491,7 +494,8 @@ static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
-static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
+static VkImageView get_view_format(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage,
+                                   VkFormat format) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
     if ((img->samples > 1) != ms || (storage && ms)) return VK_NULL_HANDLE;
@@ -539,12 +543,12 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
+    ViewKey k = {img->image, format, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
-                                .format = img->format,
+                                .format = format,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
@@ -558,6 +562,19 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     nvn_hm_put(&views_by_image, &img->image, n);
     nvn_hm_put(&view_of, &k, (void *)view);
     return view;
+}
+
+static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
+    return get_view_format(ex, img, v, hv, rtype, storage, img->format);
+}
+
+// An unformatted storage image's SPIR-V scalar type must still agree with the VkImageView's numeric type. NVN images
+// are mutable-format, so preserve the same 32-bit texel bits through the compatible floating-point view when the
+// translator declares a float image over an R32 integer image.
+static VkFormat storage_view_format(const VkTexImage *img, const GfxShaderRes *res) {
+    if (!img || res->format || res->sampled_type != 1) return img ? img->format : VK_FORMAT_UNDEFINED;
+    if (img->format == VK_FORMAT_R32_UINT || img->format == VK_FORMAT_R32_SINT) return VK_FORMAT_R32_SFLOAT;
+    return img->format;
 }
 
 // An attachment view of a registered texture, kept with its sampled views for the image's lifetime: made per command
@@ -610,14 +627,57 @@ void vk_exec_image_gone(VkImage image) {
 typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; } ShaderEnt;
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
+// NVN1 puts its stage and full code-area length in the control block. NVN2
+// graphics put the stage in the Ampere SPH; NVN2 compute has no SPH, so its
+// stage is supplied by dispatch context.
+static int shader_stage_and_length(const NVNshaderData *sd, int requested_stage, int *stage, uint32_t *len) {
+    const uint8_t *c = sd->control;
+    const uint8_t *code = (const uint8_t *)(uintptr_t)sd->data;
+    if (!c || !code) return 0;
+    if (nvn2_control_tiene_magia(c)) {
+        if (!nvn2_control_es(c)) return 0;
+        uint8_t control_stage;
+        // The control section is authoritative for NVN2, including task=6 and mesh=7. Do this
+        // before the compute/graphics split so a graphics shader cannot be mistaken for compute
+        // during dispatch scanning, or task/mesh code mistaken for an ordinary vertex shader.
+        if (!nvn2_control_stage_leer(c, &control_stage) || control_stage != requested_stage) return 0;
+        Nvn2Control n2;
+        if (requested_stage == NVN_STAGE_CS) {
+            // NVN2 compute is supported by the shader service. Read only the common prefix here: full compute metadata
+            // is validated by gfx_shader_get, and probing +0xA9..+0xBA on a graphics control can overread it.
+            if (!nvn2_control_leer(c, NVN2_CONTROL_MIN_TAM, 0, 1, &n2)) return 0;
+            *stage = NVN_STAGE_CS;
+            *len = n2.area_codigo_tam;
+            return 1;
+        }
+        if (!nvn2_control_leer(c, NVN2_CONTROL_MIN_TAM, 0, 1, &n2) ||
+            n2.largo_instrucciones < NVN2_SPH_TAM || n2.area_codigo_tam < n2.largo_instrucciones ||
+            nvn2_sph_version(code, n2.largo_instrucciones) != 4)
+            return 0;
+        int sph = nvn2_sph_stage(code, n2.largo_instrucciones);
+        if (requested_stage == NVN2_CONTROL_STAGE_TASK || requested_stage == NVN2_CONTROL_STAGE_MESH) {
+            *stage = requested_stage;
+            *len = n2.area_codigo_tam;
+            return 1;
+        }
+        *stage = (sph == NVN2_SPH_STAGE_VERTEX_A || sph == NVN2_SPH_STAGE_VERTEX) ? NVN_STAGE_VS :
+                 sph == NVN2_SPH_STAGE_FRAGMENT ? NVN_STAGE_FS : -1;
+        *len = n2.area_codigo_tam;
+        return *stage >= 0;
+    }
+    memcpy(stage, c + 0x714, 4);
+    memcpy(len, c + 0x704, 4);
+    return 1;
+}
+
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
-    for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
+    for (uint32_t i = 0; i < p->nstage && i < NVN_MAX_PROGRAM_STAGES; i++) {
         const uint8_t *c = p->sd[i].control;
         if (!c || !p->sd[i].data) continue;
-        uint32_t st;
-        memcpy(&st, c + 0x714, 4);
-        if ((int)st != nvn_stage) continue;
-        memcpy(len, c + 0x704, 4);
+        int st;
+        uint32_t size;
+        if (!shader_stage_and_length(&p->sd[i], nvn_stage, &st, &size) || st != nvn_stage) continue;
+        *len = size;
         *ctl = c, *code = (const uint8_t *)(uintptr_t)p->sd[i].data;
         return 1;
     }
@@ -628,7 +688,7 @@ static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, 
 // nvnProgramSetShaders): the scan reads two words of every stage's control block, cold guest cache lines, and runs
 // several times a draw. Direct-mapped; a collision only scans again.
 #define STAGEM_N 512
-static struct { uint64_t serial; int8_t idx[6]; uint32_t len[6]; } stagem[STAGEM_N];
+static struct { uint64_t serial; int8_t idx[NVN_MAX_PROGRAM_STAGES]; uint32_t len[NVN_MAX_PROGRAM_STAGES]; } stagem[STAGEM_N];
 
 static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     if (!p->serial || (unsigned)nvn_stage >= 6) return find_stage_scan(p, nvn_stage, ctl, code, len);
@@ -636,12 +696,26 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
     if (m->serial != p->serial) {
         m->serial = p->serial;
         memset(m->idx, -1, sizeof m->idx);
-        for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
+        for (uint32_t i = 0; i < p->nstage && i < NVN_MAX_PROGRAM_STAGES; i++) {
             const uint8_t *c = p->sd[i].control;
             if (!c || !p->sd[i].data) continue;
-            uint32_t st;
-            memcpy(&st, c + 0x714, 4);
-            if (st < 6 && m->idx[st] < 0) m->idx[st] = (int8_t)i, memcpy(&m->len[st], c + 0x704, 4);
+            int st;
+            uint32_t size;
+            if (nvn2_control_tiene_magia(c)) {
+                // NVN2 graphics controls may be only 0x48 bytes. Never probe their compute ABI fields (+0xA9..+0xBA)
+                // while building a graphics stage map. A compute dispatch supplies CS context and takes that path.
+                if (nvn_stage == NVN_STAGE_CS) {
+                    if (shader_stage_and_length(&p->sd[i], NVN_STAGE_CS, &st, &size) && m->idx[st] < 0)
+                        m->idx[st] = (int8_t)i, m->len[st] = size;
+                } else if (shader_stage_and_length(&p->sd[i], NVN_STAGE_VS, &st, &size) && st == NVN_STAGE_VS) {
+                    if (m->idx[st] < 0) m->idx[st] = (int8_t)i, m->len[st] = size;
+                } else if (shader_stage_and_length(&p->sd[i], NVN_STAGE_FS, &st, &size) && st == NVN_STAGE_FS) {
+                    if (m->idx[st] < 0) m->idx[st] = (int8_t)i, m->len[st] = size;
+                }
+            } else if (shader_stage_and_length(&p->sd[i], NVN_STAGE_VS, &st, &size) && st < 6 && m->idx[st] < 0) {
+                // NVN1 embeds its stage in the control section, so one read still discovers every stage.
+                m->idx[st] = (int8_t)i, m->len[st] = size;
+            }
         }
     }
     int i = m->idx[nvn_stage];
@@ -653,7 +727,8 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
 // Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
 // was looked up under: a slot is looked up again, a hash probe, only when the handle changed or its slot may resolve
 // otherwise (slot_still).
-static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; } AC[6];
+static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; }
+    AC[NVN_MAX_PROGRAM_STAGES];
 
 // vk_texture_slot_token of the slot a texture or image handle names; an empty handle always resolves to nothing.
 static uint64_t token_of(uint64_t h) { return h ? vk_texture_slot_token((int)(h & 0xfffff)) : 1; }
@@ -700,7 +775,18 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
     memset(a, 0, sizeof *a);
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
     else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
-    else
+    else if (st == NVN2_CONTROL_STAGE_MESH) {
+        const uint8_t *task_ctl, *task_code;
+        uint32_t task_len;
+        // Task presence belongs to the program's bound stage set. The per-stage
+        // mesh control byte with the same meaning is not consistent in captures.
+        a->mesh_has_task = (uint8_t)find_stage(ex->prog, NVN2_CONTROL_STAGE_TASK, &task_ctl, &task_code, &task_len);
+        VkCtx *vkc = vk_ctx();
+        // NV's mesh-only SPIR-V preserves Vulkan's base-workgroup argument (firstTask). Keep task+mesh on EXT,
+        // because task payload support is not emitted in the NV dialect by this translator path.
+        a->mesh_nv = (uint8_t)(vkc && vkc->has_mesh_shader_nv && !a->mesh_has_task);
+    }
+    else if (!nvn2_control_tiene_magia(ctl))
         for (int k = 0; k < 3; k++) {
             uint32_t l;
             memcpy(&l, ctl + 0x748 + 4 * k, 4);
@@ -759,7 +845,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
             return set[0].s;
         }
     }
-    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : GFX_STAGE_CS;
+    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS :
+             st == NVN2_CONTROL_STAGE_TASK ? GFX_STAGE_TASK : st == NVN2_CONTROL_STAGE_MESH ? GFX_STAGE_MESH : GFX_STAGE_CS;
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
                        : pending && (vk_pipeline_async_on() || a.mvprev) ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
@@ -777,7 +864,9 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
 // ---- descriptors
 
 static int nvn_stage_of(int gfx_stage) {
-    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS : NVN_STAGE_CS;
+    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS :
+           gfx_stage == GFX_STAGE_TASK ? NVN2_CONTROL_STAGE_TASK :
+           gfx_stage == GFX_STAGE_MESH ? NVN2_CONTROL_STAGE_MESH : NVN_STAGE_CS;
 }
 
 static VkDescriptorBufferInfo zero_info(uint64_t max) {
@@ -912,10 +1001,17 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
     if (slot == 0 && c0_on()) return c0_info(ex, st);
     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
         const uint8_t *ctl, *code;
-        uint32_t len, c1;
+        uint32_t len, c1, c1_end;
         if (find_stage(ex->prog, st, &ctl, &code, &len)) {
-            memcpy(&c1, ctl + 0x700, 4);
-            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, &bi))
+            if (nvn2_control_tiene_magia(ctl)) {
+                Nvn2Control n2;
+                if (!nvn2_control_leer(ctl, NVN2_CONTROL_MIN_TAM, len, 1, &n2)) return zero_info(max);
+                c1 = n2.c1_inicio, c1_end = n2.area_codigo_tam;
+            } else {
+                memcpy(&c1, ctl + 0x700, 4), memcpy(&c1_end, ctl + 0x704, 4);
+            }
+            if (c1 < c1_end && c1_end <= len &&
+                bind_range(ex, (uint64_t)(uintptr_t)code + c1, c1_end - c1, align, max, VK_MUSE_UBO, 0, &bi))
                 return bi;
         }
     } else if (slot >= 3 && slot - 3 < 18) {
@@ -1229,7 +1325,12 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         view_t v;
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
-        if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
+        if (img) {
+            VkFormat format = storage ? storage_view_format(img, r) : img->format;
+            view = format != img->format ? get_view_format(ex, img, &v, hv, r->type, storage, format)
+                                         : get_view(ex, img, &v, hv, r->type, storage);
+            *image = img->image;
+        }
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
@@ -1946,6 +2047,13 @@ static void record_fixed(VkExec *ex) {
         vkCmdSetViewportWithCount(cb, 1, &v);
         ex->recorded++;
     }
+    if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT_SWIZZLE) {
+        VkCtx *c = vk_ctx();
+        if (!c || !c->cmd_set_viewport_swizzle)
+            rt_fatal("vk: viewport swizzle state is dirty but vkCmdSetViewportSwizzleNV is unavailable");
+        rec_viewport_swizzle(c->cmd_set_viewport_swizzle, cb, 0, 1, &ex->vp_swizzle[0]);
+        ex->recorded++;
+    }
     if (ex->dirty & VK_EXEC_DIRTY_SCISSOR) {
         VkRect2D r = vk_exec_scissor(ex);
         vkCmdSetScissorWithCount(cb, 1, &r);
@@ -2217,6 +2325,151 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (vk_hdr_track) vk_hdr_draw(ex, info);
     vk_exec_oq_draw(ex);
     return 1;
+}
+
+// NVN2's mesh path has no vertex input or input assembly state. It uses the same
+// render pass, descriptor binding and graphics-state cache as ordinary draws.
+static int prepare_mesh_draw(VkExec *ex, const p_draw_mesh *d, const GfxShader **mesh_out) {
+    if (ex->render_disabled || d->count <= 0) return 0;
+    cb_res(ex);
+    dummies_init();
+    if (ex->pass_noatt) {
+        uint32_t w, h;
+        vk_exec_noatt_dims(ex, &w, &h);
+        if (ex->in_pass && (w > ex->pass_w || h > ex->pass_h)) vk_exec_pass_end(ex);
+        if (!ex->in_pass) ex->rt_resolved = 0;
+    }
+    if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    vk_exec_pass_begin(ex);
+    VkRect2D sc = vk_exec_scissor(ex);
+    if (!sc.extent.width || !sc.extent.height || !ex->prog) return 0;
+    int ht = 0, hm = 0, hf = 0, pt = 0, pm = 0, pf = 0;
+    const GfxShader *task = shader_for(ex, NVN2_CONTROL_STAGE_TASK, &ht, &pt, 0);
+    const GfxShader *mesh = shader_for(ex, NVN2_CONTROL_STAGE_MESH, &hm, &pm, 0);
+    const GfxShader *fs = shader_for(ex, NVN_STAGE_FS, &hf, &pf, 0);
+    if (!hm) return 0;
+    if (pt || pm || pf) {
+        if (pt) task = shader_for(ex, NVN2_CONTROL_STAGE_TASK, &ht, NULL, 1);
+        if (pm) mesh = shader_for(ex, NVN2_CONTROL_STAGE_MESH, &hm, NULL, 1);
+        if (pf) fs = shader_for(ex, NVN_STAGE_FS, &hf, NULL, 1);
+    }
+    if (!mesh || (ht && !task) || (hf && !fs)) return 0;
+    VkCtx *vkc = vk_ctx();
+    int mesh_nv = gfx_shader_mesh_nv(mesh);
+    if (!vkc || (mesh_nv ? !vkc->has_mesh_shader_nv : !vkc->has_mesh_shader)) {
+        __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+        warn_once(W_MESH_DIRECT, "NVN2 mesh draw at guest PC 0x%llx skipped: translated SPIR-V dialect is unsupported by the Vulkan device",
+                  (unsigned long long)d->caller);
+        return 0;
+    }
+    if (d->first != 0 && !mesh_nv) {
+        __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+        warn_once(W_MESH_DIRECT, "NVN2 DrawMeshTasks firstTask=%d at guest PC 0x%llx cannot be represented by the EXT shader dialect; skipped",
+                  d->first, (unsigned long long)d->caller);
+        return 0;
+    }
+    if (mesh_nv && d->first < 0) {
+        __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+        warn_once(W_MESH_DIRECT, "NVN2 DrawMeshTasks firstTask=%d at guest PC 0x%llx is negative; skipped",
+                  d->first, (unsigned long long)d->caller);
+        return 0;
+    }
+    uint32_t fbl = feedback_prepare(ex, fs);
+    VkPipeState s = ex->pipe;
+    s.vs = NULL, s.task = task, s.mesh = mesh, s.fs = fs;
+    s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
+    s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
+    s.y_flip = 1;
+    s.prim_restart = 0;
+    const VkPipeInfo *info = NULL;
+    int pending = 0;
+    VkPipeline p = vk_pipeline_graphics_async(&s, &info, &pending, 0);
+    if (pending || !p || !info) return 0;
+    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
+        vk_pipeline_set_dynamic_mesh(ex->cb, &s);
+        ex->recorded++;
+        B.st = s, B.st_valid = 1;
+    }
+    bind_resources(ex, info);
+    *mesh_out = mesh;
+    return 1;
+}
+
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
+    const GfxShader *mesh = NULL;
+    if (!prepare_mesh_draw(ex, d, &mesh)) return;
+    VkCtx *vkc = vk_ctx();
+    if (gfx_shader_mesh_nv(mesh)) {
+        if (!vkc->cmd_draw_mesh_tasks_nv) {
+            __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+            return warn_once(W_MESH_DIRECT, "NVN2 mesh draw at guest PC 0x%llx skipped: VK_NV_mesh_shader draw command is unavailable",
+                             (unsigned long long)d->caller);
+        }
+        rec_draw_mesh_tasks_nv(vkc->cmd_draw_mesh_tasks_nv, ex->cb, (uint32_t)d->count, (uint32_t)d->first);
+    } else {
+        if (d->first != 0 || !vkc->cmd_draw_mesh_tasks) {
+            __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+            return warn_once(W_MESH_DIRECT, "NVN2 DrawMeshTasks at guest PC 0x%llx skipped: VK_EXT_mesh_shader draw command cannot preserve firstTask or is unavailable",
+                             (unsigned long long)d->caller);
+        }
+        rec_draw_mesh_tasks(vkc->cmd_draw_mesh_tasks, ex->cb, (uint32_t)d->count, 1, 1);
+    }
+    vk_exec_frame.draws++;
+    ex->recorded++;
+}
+
+// NVN2 indirect records store {taskCount, firstTask}. NV keeps that native 8-byte record intact; EXT expects three
+// dimensions, so its fallback copies count and synthesizes Y=Z=1. All conversion stays on the GPU timeline.
+static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
+    VkCtx *vkc = vk_ctx();
+    if (!vkc || (!vkc->cmd_draw_mesh_tasks_indirect && !vkc->cmd_draw_mesh_tasks_indirect_nv)) {
+        __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+        return warn_once(W_MESH_INDIRECT, "NVN2 DrawMeshTasksIndirect at guest PC 0x%llx skipped: no mesh shader indirect command is available",
+                         (unsigned long long)d->caller);
+    }
+    VkMemSpan src;
+    if (!vk_mem_resolve(d->indirect, 8, &src) || src.offset % 4 || src.avail < 8) {
+        __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+        return warn_once(W_MESH_INDIRECT, "NVN2 DrawMeshTasksIndirect args at 0x%llx are not backed/aligned for {taskCount, firstTask}",
+                         (unsigned long long)d->indirect);
+    }
+    VK_MEM_USE(src);
+    VkBuffer args_ext, args_nv;
+    VkDeviceSize args_ext_off, args_nv_off;
+    scratch(ex, 12, &args_ext, &args_ext_off);
+    scratch(ex, 8, &args_nv, &args_nv_off);
+    vk_exec_barrier(ex); // GPU-produced NVN2 count -> transfer read; also ends any active render pass.
+    vkCmdFillBuffer(ex->cb, args_ext, args_ext_off, 12, 1u);
+    VkBufferCopy copy_ext = {.srcOffset = src.offset, .dstOffset = args_ext_off, .size = 4};
+    VkBufferCopy copy_nv = {.srcOffset = src.offset, .dstOffset = args_nv_off, .size = 8};
+    vkCmdCopyBuffer(ex->cb, src.buffer, args_ext, 1, &copy_ext);
+    vkCmdCopyBuffer(ex->cb, src.buffer, args_nv, 1, &copy_nv);
+    ex->recorded += 3;
+    vk_exec_barrier(ex); // transfer write -> indirect command read.
+    vk_mem_count(src.cls, VK_MUSE_IND, 8);
+    VK_MEM_BOUND(src);
+
+    p_draw_mesh draw = {.first = 0, .count = 1, .caller = d->caller};
+    const GfxShader *mesh = NULL;
+    if (!prepare_mesh_draw(ex, &draw, &mesh)) return;
+    if (gfx_shader_mesh_nv(mesh)) {
+        if (!vkc->cmd_draw_mesh_tasks_indirect_nv) {
+            __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+            return warn_once(W_MESH_INDIRECT, "NVN2 indirect mesh draw at guest PC 0x%llx skipped: VK_NV_mesh_shader indirect command is unavailable",
+                             (unsigned long long)d->caller);
+        }
+        rec_draw_mesh_tasks_indirect_nv(vkc->cmd_draw_mesh_tasks_indirect_nv, ex->cb, args_nv, args_nv_off, 1, 8);
+    } else {
+        if (!vkc->cmd_draw_mesh_tasks_indirect) {
+            __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
+            return warn_once(W_MESH_INDIRECT, "NVN2 indirect mesh draw at guest PC 0x%llx skipped: VK_EXT_mesh_shader indirect command is unavailable",
+                             (unsigned long long)d->caller);
+        }
+        rec_draw_mesh_tasks_indirect(vkc->cmd_draw_mesh_tasks_indirect, ex->cb, args_ext, args_ext_off, 1, 12);
+    }
+    vk_exec_frame.draws++;
+    ex->recorded++;
 }
 
 // ---- per-object motion
@@ -3182,7 +3435,8 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
 // ---- bind ops
 
 static void bind_handles(uint64_t *dst, int cap, const p_bind_handles *b) {
-    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) {
+    if (!dst || b->stage < 0 || b->stage >= NVN_MAX_PROGRAM_STAGES || b->first < 0 || b->n < 0 || b->n > 32 ||
+        b->first + b->n > cap) {
         warn_once(W_BIND, "a bind of %d handles at %d of stage %d is out of range: ignored", b->n, b->first, b->stage);
         return;
     }
@@ -3236,31 +3490,33 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     }
     case OP_BIND_UBO: {
         const p_bind_buf *b = payload;
-        if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 18) ex->ubo[b->stage][b->index] = *b;
+        if (b->stage >= 0 && b->stage < NVN_MAX_PROGRAM_STAGES && b->index >= 0 && b->index < 18)
+            ex->ubo[b->stage][b->index] = *b;
         bind_gen++;
         break;
     }
     case OP_BIND_SSBO: {
         const p_bind_buf *b = payload;
-        if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) ex->ssbo[b->stage][b->index] = *b;
+        if (b->stage >= 0 && b->stage < NVN_MAX_PROGRAM_STAGES && b->index >= 0 && b->index < 16)
+            ex->ssbo[b->stage][b->index] = *b;
         bind_gen++;
         break;
     }
     case OP_BIND_TEX: {
         const p_bind_handles *b = payload;
-        bind_handles(b->stage >= 0 && b->stage < 6 ? ex->tex[b->stage] : NULL, 128, b);
+        bind_handles(b->stage >= 0 && b->stage < NVN_MAX_PROGRAM_STAGES ? ex->tex[b->stage] : NULL, 128, b);
         ex->tex_serial++;
         bind_gen++;
         break;
     }
     case OP_BIND_SAMP: {
         const p_bind_handles *b = payload;
-        bind_handles(b->stage >= 0 && b->stage < 6 ? ex->samp[b->stage] : NULL, 128, b);
+        bind_handles(b->stage >= 0 && b->stage < NVN_MAX_PROGRAM_STAGES ? ex->samp[b->stage] : NULL, 128, b);
         break;
     }
     case OP_BIND_IMG: {
         const p_bind_handles *b = payload;
-        bind_handles(b->stage >= 0 && b->stage < 6 ? ex->img[b->stage] : NULL, 32, b);
+        bind_handles(b->stage >= 0 && b->stage < NVN_MAX_PROGRAM_STAGES ? ex->img[b->stage] : NULL, 32, b);
         ex->tex_serial++;   // the shader memo's handle check (feedback_scan reads only textures: a rescan at most)
         bind_gen++;
         break;
@@ -3271,6 +3527,8 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_DISPATCH: op_dispatch(ex, payload); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); break;
+    case OP_DRAW_MESH: op_draw_mesh(ex, payload); break;
+    case OP_DRAW_MESH_IND: op_draw_mesh_ind(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }

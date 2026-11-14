@@ -15,11 +15,13 @@ Cada juego vive en su propia carpeta, fuera del repositorio:
         registro.txt    lo que dijo cada paso
 """
 
+import glob
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -54,6 +56,7 @@ AJUSTES_POR_DEFECTO = {
     "pantalla_completa": False,
     "audio": True,
     "generacion_cuadros": False,   # TOTK_FRAMEGEN del runtime NVN (vk_framegen.c)
+    "telemetria": "off",         # TOTK_PERF_OVERLAY del runtime NVN: off, fps o full
     "variables": "",          # líneas CLAVE=VALOR extra para el entorno del juego
 }
 
@@ -186,11 +189,26 @@ class Juego:
 
     @property
     def nombre(self):
-        return self.datos.get("nombre") or self.id
+        """El nombre para el menú. Una ficha vieja guardó a veces el nombre de la carpeta del dump ("base", "65536") o
+        del archivo con etiquetas; esa se muestra con el nombre del dump, sin reescribir juego.json."""
+        n = self.datos.get("nombre")
+        base = (self.datos.get("origen") or {}).get("base")
+        if base and (self.datos.get("identidad") or {}).get("nombre_fuente") not in NOMBRES_VERIFICADOS and (
+                not n or n.isdecimal() or n.lower() in _NOMBRES_GENERICOS or re.search(r"\[[0-9A-Fa-f]{16}\]", n)):
+            try:
+                return nombre_externo(base, int(self.id, 16))
+            except ValueError:
+                pass
+        return n or self.id
 
     @property
     def version(self):
         return self.datos.get("version", "")
+
+    @property
+    def ejecutable_nativo(self):
+        """Ruta estable del ejecutable recompilado por NX2Linux, independiente de motores alternativos."""
+        return os.path.join(self.carpeta, "juego")
 
     @property
     def icono(self):
@@ -203,14 +221,65 @@ class Juego:
     @property
     def ejecutable(self):
         e = motor_especial(self)
-        return e.exe(self) if e else os.path.join(self.carpeta, "juego")
+        if e:
+            return e.exe(self)
+        return self.ejecutable_nativo
 
     @property
     def listo(self):
-        return all(self.datos["pasos"].get(k) for k, _, _ in PASOS) and os.path.exists(self.ejecutable)
+        return all(self.paso_hecho(k) for k, _, _ in PASOS) and os.path.exists(self.ejecutable)
+
+    @property
+    def runtime_desactualizado(self):
+        if (not self.datos["pasos"].get("compilar") or motor_especial(self)
+                or not os.path.isfile(self.ejecutable_nativo)):
+            return False
+        try:
+            binario_mtime = os.stat(self.ejecutable_nativo).st_mtime_ns
+            fuentes = [os.path.join(ROOT, "tools", "compilar.py"), os.path.join(ROOT, "Makefile")]
+            carpeta_runtime = os.path.join(ROOT, "runtime")
+            # compilar.py enlaza también C++ y el runtime incluye tablas .inc.
+            for extension in ("*.c", "*.h", "*.cpp", "*.inc"):
+                fuentes.extend(glob.glob(os.path.join(carpeta_runtime, "**", extension), recursive=True))
+            return any(os.stat(ruta).st_mtime_ns > binario_mtime for ruta in fuentes)
+        except OSError:
+            return True
 
     def paso_hecho(self, clave):
-        return bool(self.datos["pasos"].get(clave))
+        if not self.datos["pasos"].get(clave):
+            return False
+        if motor_especial(self):
+            return True
+        if clave == "recompilar":
+            # El marcador de juego.json puede sobrevivir a una carpeta C incompleta
+            # (por ejemplo, si se cerró NX2Linux a mitad de la escritura). Sin estos
+            # archivos compilar.py termina con FileNotFoundError en nxgame.h.
+            carpeta_c = os.path.join(self.carpeta, "c")
+            if not all(os.path.isfile(os.path.join(carpeta_c, nombre))
+                       for nombre in ("nxgame.h", "programa.c")):
+                return False
+            # Una mejora del decodificador o de las sustituciones deja obsoleto el C
+            # generado, aunque el ejecutable se haya enlazado después con ese C viejo.
+            try:
+                sello = time.mktime(time.strptime(self.datos["pasos"][clave], "%Y-%m-%d %H:%M:%S"))
+                fuentes = [os.path.join(ROOT, "app", "nx2linux", "motor.py")]
+                carpeta_recomp = os.path.join(ROOT, "recomp")
+                for extension in ("*.py", "*.txt"):
+                    fuentes.extend(glob.glob(os.path.join(carpeta_recomp, "**", extension), recursive=True))
+                return not any(os.path.getmtime(ruta) > sello for ruta in fuentes)
+            except (OSError, ValueError):
+                return False
+        if clave != "compilar":
+            return True
+        if not os.path.isfile(self.ejecutable_nativo):
+            return False
+        if not self.paso_hecho("recompilar"):
+            return False
+        # El ejecutable incluye el runtime, además del C generado para este juego.
+        try:
+            return not self.runtime_desactualizado
+        except OSError:
+            return False
 
     def registro(self):
         return os.path.join(self.carpeta, "registro.txt")
@@ -326,12 +395,7 @@ def title_id(archivo, llaves):
             raise RuntimeError(f"{os.path.basename(archivo)} no es un NRO (no tiene la cabecera NRO0)")
         return _id_local(datos)
     if t == "nup":
-        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "nup_extraer.py"), archivo, "--info"],
-                           capture_output=True, text=True)
-        m = re.search(r"^base ([0-9a-f]{16})$", r.stdout, re.M)
-        if not m:
-            raise RuntimeError(f"no se pudo leer {os.path.basename(archivo)}: " + _ultima_linea(r.stderr or r.stdout))
-        return int(m.group(1), 16)
+        return _title_nup(archivo)
     if t == "extraido":
         exefs = _carpeta_exefs(archivo)
         npdm = os.path.join(exefs, "main.npdm")
@@ -349,14 +413,85 @@ def title_id(archivo, llaves):
                            "(Preferencias); sin llaves solo se pueden agregar homebrew NRO y juegos ya extraídos")
     if t == "paquete" and not archivo.lower().endswith(".nca"):
         revisar_archivo(archivo)
-    t = _title_del_nombre(os.path.basename(archivo))
-    if t is not None:
-        return t
+    # El [title id] del nombre del archivo no cuenta: un archivo renombrado pasaría por otro juego. Lo dice el extractor.
     r = subprocess.run([extractor(), llaves, "--title", archivo], capture_output=True, text=True)
     m = re.search(r"title ([0-9a-f]{16})", r.stdout)
     if not m:
         raise RuntimeError(f"no se reconoce {os.path.basename(archivo)}: " + _primera_linea_error(r.stderr or r.stdout))
     return int(m.group(1), 16)
+
+
+def _title_nup(archivo):
+    """Title ID de un .nup según su TOC (tools/nup_extraer.py --info): el del juego base si lo trae; si no, el de la
+    actualización (o el DLC), para que clasificar no lo tome por un juego. El main.npdm del título con código tiene que
+    estar y nombrar al mismo juego; si falta algo, el paquete está incompleto."""
+    nombre = os.path.basename(archivo)
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "nup_extraer.py"), archivo, "--info"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"no se pudo leer {nombre}: " + _ultima_linea(r.stderr or r.stdout))
+    ids = {clase: [int(x, 16) for x in re.findall(rf"^{clase} ([0-9a-f]{{16}})$", r.stdout, re.M)]
+           for clase in ("base", "update", "dlc")}
+    falta = re.findall(r"^falta (.+)$", r.stdout, re.M)
+    if falta:
+        raise RuntimeError(f"{nombre} está incompleto: le falta {' y '.join(falta)} (el código del juego)")
+    tid = (ids["base"] or ids["update"] or ids["dlc"] or [None])[0]
+    if tid is None:
+        raise RuntimeError(f"no se pudo leer {nombre}: no trae títulos")
+    m = re.search(r"^npdm ([0-9a-f]{16})$", r.stdout, re.M)
+    if (ids["base"] or ids["update"]) and not (m and int(m.group(1), 16) == tid & ~0xFFF):
+        raise RuntimeError(f"{nombre}: el programa de su main.npdm ({m.group(1) if m else 'ninguno'}) no coincide "
+                           f"con el title ID del paquete ({tid:016x})")
+    return tid
+
+
+# De dónde sale un nombre que no se reemplaza al volver a agregar el juego: el NACP del juego o el motor especial elegido
+# por su title ID. "archivo" es provisional (nombre_externo).
+NOMBRES_VERIFICADOS = ("nacp", "motor especial")
+
+# Carpetas que no dicen qué juego es (las de un dump: base/, updates/<versión>/, exefs/...): el nombre se busca más arriba.
+_NOMBRES_GENERICOS = {"base", "update", "updates", "upd", "dlc", "aoc", "exefs", "romfs", "game", "juego", "dump",
+                      "nup", "switch", "switch2", "switch 2"}
+
+
+def _limpiar_nombre(texto):
+    """El nombre de un juego a partir del nombre de un archivo o carpeta: sin extensión ni etiquetas ([id], [v..],
+    _v1.1.1, (Switch 2), BASE Game...), con guiones separadores como espacios y con espacios entre palabras pegadas
+    (JuegoEjemplo)."""
+    s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", texto)
+    s = re.sub(r"(?i)[ _.-]v\d+(\.\d+)*\b", " ", s).replace("_", " ").strip()
+    # Nombre de archivo con guiones por espacios (Juego-Ejemplo-Switch-2); con uno solo puede ser parte del
+    # título (Spider-Man) y, si ya hay espacios, el guion es del título.
+    if " " not in s and s.count("-") >= 2:
+        s = s.replace("-", " ")
+    # Solo al final: "... Switch 2 BASE Game" es etiqueta, "Game Builder Garage" no.
+    s = re.sub(r"(?i)([ -]+(switch[ -]?2|nsw2|base|basw|update|game|dump))+\s*$", "", " " + s.strip())
+    s = re.sub(r"\s+", " ", s).strip(" -.")
+    if " " not in s and not s.isupper():
+        s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
+    return s
+
+
+def nombre_externo(ruta, title=None):
+    """Nombre provisional (solo para mostrar) de lo que no trae NACP, como los dumps de Switch 2: sale del archivo o de
+    la carpeta del juego, saltando las genéricas (base/, 65536/...). Si el nombre trae un [title id] que no es el del
+    juego, no se usa: es de otro juego. Sin nada útil, "Juego <title id>"."""
+    ruta = os.path.normpath(ruta)
+    candidato = os.path.basename(ruta) if os.path.isdir(ruta) else os.path.splitext(os.path.basename(ruta))[0]
+    padre = os.path.dirname(ruta)
+    for _ in range(4):
+        dice = _title_del_nombre(candidato)
+        if title is not None and dice is not None and dice & ~0xFFF != title & ~0xFFF:
+            break
+        limpio = _limpiar_nombre(candidato)
+        if limpio and not limpio.isdecimal() and limpio.lower() not in _NOMBRES_GENERICOS:
+            return limpio
+        candidato, padre = os.path.basename(padre), os.path.dirname(padre)
+        # No subir hasta carpetas que no son del juego: la raíz, el home ni las suyas (Downloads, Juegos...).
+        if not candidato or padre in ("/", "") or os.path.dirname(padre) == "/" or \
+                os.path.join(padre, candidato) == os.path.expanduser("~") or padre == os.path.expanduser("~"):
+            break
+    return f"Juego {title:016x}" if title is not None else ""
 
 
 def _archivos(rutas):
@@ -398,11 +533,14 @@ def clasificar(rutas, llaves):
     upd = sorted((a for u, a in updates if u == t | 0x800), key=_version_del_nombre)
     # Un DLC es base + 0x1000 + índice; el juego lo abre por ese id.
     dlc = [{"ruta": a, "indice": d - t - 0x1000} for d, a in sorted(dlcs) if t + 0x1000 < d < t + 0x2000]
-    return {"title": f"{t:016x}", "base": base, "update": upd[-1] if upd else None, "dlc": dlc}
+    return {"title": f"{t:016x}", "base": base, "update": upd[-1] if upd else None, "dlc": dlc,
+            "nombre": nombre_externo(base, t)}
 
 
 def _version_del_nombre(a):
     m = re.search(r"\[v(\d+)\]", os.path.basename(a))
+    if not m and os.path.basename(os.path.normpath(a)).isdecimal():
+        return int(os.path.basename(os.path.normpath(a)))
     return int(m.group(1)) if m else 0
 
 
@@ -432,8 +570,14 @@ def nuevo_juego(origen, llaves=None):
     j = Juego(os.path.join(carpeta_juegos(), origen["title"]))
     j.datos["origen"] = {k: origen[k] for k in ("base", "update", "dlc")}
     j.datos["pasos"] = {}
-    base = os.path.normpath(origen["base"])
-    j.datos.setdefault("nombre", os.path.basename(base) if os.path.isdir(base) else os.path.splitext(os.path.basename(base))[0])
+    # El nombre del NACP (o uno que ya se mostraba bien) se conserva al volver a agregar el juego; uno provisional
+    # sacado del archivo se recalcula. El Title ID es la carpeta del juego y no cambia.
+    identidad = j.datos.get("identidad") or {}
+    if identidad.get("nombre_fuente") not in NOMBRES_VERIFICADOS or not j.datos.get("nombre"):
+        j.datos["nombre"] = origen.get("nombre") or nombre_externo(origen["base"], int(origen["title"], 16))
+        identidad["nombre_fuente"] = "archivo"
+    identidad["title_id"] = origen["title"]
+    j.datos["identidad"] = identidad
     if llaves:
         j.datos["llaves"] = llaves
         recordar_llaves(llaves)
@@ -450,7 +594,7 @@ def clasificar_contenido(juego, rutas):
     updates, dlc = [], []
     for a in _archivos(rutas):
         d = title_id(a, llaves)
-        if d == t | 0x800:
+        if d == t | 0x800 or (d == t and _actualizacion_extraida(a)):
             updates.append(a)
         elif t + 0x1000 < d < t + 0x2000:
             dlc.append({"ruta": a, "indice": d - t - 0x1000})
@@ -459,6 +603,18 @@ def clasificar_contenido(juego, rutas):
         else:
             raise RuntimeError(f"{os.path.basename(a)} es de otro juego (title ID {d:016x}), no de {juego.nombre}")
     return {"update": max(updates, key=_version_del_nombre) if updates else None, "dlc": dlc}
+
+
+def _actualizacion_extraida(ruta):
+    """Snapshot extraído de un update NUP: <versión>/<exefs, romfs>.
+
+    El NPDM de un título actualizado conserva el Program ID del juego base, así que su
+    title_id no termina en 800 como el contenedor NUP. La carpeta numérica de versión
+    permite reconocer ese snapshot sin confundirlo con una carpeta base normal.
+    """
+    nombre = os.path.basename(os.path.normpath(ruta))
+    return (nombre.isdecimal() and int(nombre) > 0 and tipo(ruta) == "extraido"
+            and os.path.isdir(os.path.join(ruta, "romfs")))
 
 
 def aplicar_contenido(juego, nuevo):
@@ -479,7 +635,10 @@ def aplicar_contenido(juego, nuevo):
 
 
 def quitar(juego):
-    shutil.rmtree(juego.carpeta, ignore_errors=True)
+    try:
+        shutil.rmtree(juego.carpeta)
+    except FileNotFoundError:
+        pass
     try:
         os.remove(os.path.join(APPS_DIR, f"nx2linux-{juego.id}.desktop"))
     except OSError:
@@ -543,22 +702,35 @@ class Construccion:
     ese hilo con cada novedad: paso es la clave del paso en curso (o "fin"/"error"), fraccion el
     progreso total de 0 a 1 y linea el texto nuevo del registro (o None)."""
 
-    def __init__(self, juego, avisar, desde=None, solo_dlc=None):
+    def __init__(self, juego, avisar, desde=None, solo_dlc=None, motivo=None):
         # solo_dlc: índices de DLC nuevos de un juego ya construido; se extraen y no se recompila nada.
+        # motivo: qué botón o aviso pidió la construcción; queda en registro.txt junto a la fecha.
         self.juego, self.avisar, self.desde, self.solo_dlc = juego, avisar, desde, solo_dlc
+        self.motivo = motivo
         self.proc = None
         self.cancelado = False
-        self.hilo = threading.Thread(target=self._correr, daemon=True)
+        # No es daemon: si el proceso de la app termina con la construcción en marcha, Python espera a que
+        # el hilo acabe en vez de matarlo a mitad de un paso (y de dejar el compilador sin quien lea su salida).
+        self.hilo = threading.Thread(target=self._correr, daemon=False, name=f"construccion-{juego.id}")
         self.inicio = None
 
     def empezar(self):
         self.inicio = time.time()
         self.hilo.start()
 
+    def activa(self):
+        """True mientras el hilo de la construcción sigue corriendo (aunque ya haya avisado "fin"/"error")."""
+        return self.hilo.is_alive()
+
     def cancelar(self):
         self.cancelado = True
         if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+            # Todo el grupo (_ejecutar lo abre con start_new_session): los trabajadores del Pool de nxrecomp.py o
+            # los clang de compilar.py seguirían solos y morirían con BrokenPipeError en el registro.
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                self.proc.terminate()
 
     def _peso_antes(self, clave):
         total = sum(p for _, _, p in PASOS)
@@ -581,6 +753,8 @@ class Construccion:
         try:
             with open(j.registro(), "a") as self.log:
                 self.log.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
+                self.log.write(f"[nx2linux] pedida por: {self.motivo or 'sin indicar'}"
+                               f" (desde: {self.desde or 'lo que falte'})\n")
                 if self.solo_dlc:
                     self._linea("extraer", 0, "— Agregar contenido descargable")
                     self._extraer_dlc([d for d in j.datos["origen"]["dlc"] if d["indice"] in self.solo_dlc])
@@ -617,7 +791,7 @@ class Construccion:
         self.log.write("$ " + " ".join(cmd) + "\n")
         env = dict(os.environ, PYTHONUNBUFFERED="1", **(entorno or {}))
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-                                     errors="replace", bufsize=1, cwd=cwd)
+                                     errors="replace", bufsize=1, cwd=cwd, start_new_session=True)
         frac = 0.0
         ultimas = []
         for linea in self.proc.stdout:
@@ -645,6 +819,18 @@ class Construccion:
             return e.extraer(self, j)
         t = tipo(o["base"])
         if t == "extraido":
+            update = o.get("update")
+            if update:
+                tipo_update = tipo(update)
+                if tipo_update == "extraido":
+                    # Un snapshot extraído del update contiene los módulos y el RomFS
+                    # completos de esa versión; usarlo como título actualizado.
+                    return self._extraer_extraido(update)
+                if tipo_update == "nup":
+                    return self._extraer_nup(update)
+                raise RuntimeError("para actualizar un juego ya extraído, elige el snapshot extraído de la versión "
+                                   "(carpeta numérica con exefs/ y romfs/) o el archivo .nup; un update cifrado "
+                                   "necesita el paquete base original")
             return self._extraer_extraido(o["base"])
         if t == "nro":
             return self._extraer_nro(o["base"])
@@ -660,6 +846,7 @@ class Construccion:
             m = re.match(r"name (.+)", linea)
             if m:
                 j.datos["nombre"] = m.group(1).strip()
+                j.datos.setdefault("identidad", {})["nombre_fuente"] = "nacp"
             m = re.match(r"display version (.+)", linea)
             if m:
                 j.datos["version"] = m.group(1).strip()
@@ -679,6 +866,7 @@ class Construccion:
         nombre, version = leer_nacp(nacp)
         if nombre:
             self.juego.datos["nombre"] = nombre
+            self.juego.datos.setdefault("identidad", {})["nombre_fuente"] = "nacp"
         if version:
             self.juego.datos["version"] = version
         self._linea("extraer", 0.9, f"{nombre or 'sin nombre'} {version}".strip())
@@ -795,13 +983,15 @@ class Construccion:
             return int(m.group(1)) / int(m.group(2)) if m else None
 
         pistas = os.path.join(j.carpeta, "pistas.txt")
+        modulos_ro = carpeta_modulos_ro(j)
         self._ejecutar("recompilar", [sys.executable, os.path.join(ROOT, "recomp", "nxrecomp.py"),
                                       os.path.join(j.carpeta, "ExeFS"), "-o", os.path.join(j.carpeta, "c"), "--progreso",
-                                      "--pistas", pistas,
+                                      "--pistas", pistas, "--modulos-ro", modulos_ro,
                                       "--sustituir", os.path.join(ROOT, "recomp", "sustituciones.txt")]
                       + (["--sustituir", os.path.join(ROOT, "recomp", "sustituciones-switch2.txt")]
-                         if j.datos.get("plataforma") == "switch2" else []), prog)
+                        if j.datos.get("plataforma") == "switch2" else []), prog)
         j.datos["pistas_usadas"] = _contar_pistas(pistas)
+        j.datos["modulos_ro_usados"] = _modulos_ro(modulos_ro)
         j.guardar()
 
     def _anotar_plataforma(self):
@@ -816,8 +1006,8 @@ class Construccion:
         j.datos["plataforma"] = cual
         j.guardar()
         if cual == "switch2":
-            self._linea("recompilar", 0, "Juego de Switch 2 (" + ", ".join(razones) + "). El código se recompila, pero "
-                        "la GPU de Switch 2 (NVN2) todavía no está en el runtime: sin un motor especial no se va a ver.")
+            self._linea("recompilar", 0, "Juego de Switch 2 detectado (" + ", ".join(razones) + "). La compatibilidad "
+                        "del runtime Linux con Switch 2 sigue en desarrollo; consulta el registro de ejecución si falla.")
 
     # Paso 3: clang en todos los núcleos.
     def _compilar(self):
@@ -834,7 +1024,7 @@ class Construccion:
             return int(m.group(1)) / int(m.group(2)) if m else None
 
         self._ejecutar("compilar", [sys.executable, os.path.join(ROOT, "tools", "compilar.py"),
-                                    os.path.join(j.carpeta, "c"), "-o", j.ejecutable, "--progreso"], prog)
+                                    os.path.join(j.carpeta, "c"), "-o", j.ejecutable_nativo, "--progreso"], prog)
 
     # Paso 4: ícono PNG y entrada .desktop, para abrirlo desde el lanzador de Omarchy.
     def _terminar(self):
@@ -862,10 +1052,61 @@ def crear_acceso(j):
 
 def _contar_pistas(ruta):
     try:
+        direcciones = set()
         with open(ruta) as f:
-            return len({l.strip() for l in f if l.strip()})
+            for linea in f:
+                try:
+                    direccion = int(linea.split()[0], 0)
+                except (ValueError, IndexError):
+                    continue
+                if direccion > 0 and not direccion & 3:
+                    direcciones.add(direccion)
+        return len(direcciones)
     except OSError:
         return 0
+
+
+# Qué quiere decir el código con que terminó un juego. Los números fijos son los exit() del runtime (runtime/*.c, sin
+# runtime/nvn): tests/salidas_test.py falla si el runtime agrega uno que esta tabla no explica. subprocess da las
+# señales en negativo (-11) y una terminal como 128 + señal (139).
+SALIDAS = {
+    0: "terminó normalmente",
+    1: "el runtime cerró el juego: svcBreak que no es solo aviso, fatal:u, una SVC, función, instrucción o función "
+       "NVN sin implementar, o memoria que no se pudo reservar (la línea [nxrt] o [RED] anterior dice cuál)",
+    3: "salto indirecto a código que la recompilación no vio ([RED] salto indirecto); se anota en pistas y se "
+       "arregla recompilando",
+    4: "no se pudo crear la ventana o el contexto gráfico (SDL o EGL/Zink)",
+}
+_SENALES = {6: "SIGABRT (abort)", 9: "SIGKILL (lo mató el sistema u otro proceso)", 11: "SIGSEGV (violación de "
+            "segmento; el primer fallo es la línea [nxrt] violación de segmento)", 15: "SIGTERM (cerrado desde afuera)"}
+
+
+def significado_salida(rc):
+    """Texto para el código de salida rc de un juego (Popen.returncode o el de una terminal)."""
+    if rc is None:
+        return "sigue corriendo"
+    senal = -rc if rc < 0 else rc - 128 if 128 < rc < 160 else None
+    if senal is not None:
+        return f"señal {senal}: " + _SENALES.get(senal, "terminado por una señal")
+    return SALIDAS.get(rc, "código que el runtime no usa: lo puso el juego (svcExitProcess) o una biblioteca")
+
+
+def carpeta_modulos_ro(j):
+    """Donde el runtime vuelca los NRO que el juego arma en memoria y carga con nn::ro (NX_VOLCAR_NRO); la
+    recompilación los traduce desde ahí (nxrecomp.py --modulos-ro)."""
+    return os.path.join(j.carpeta, "nro")
+
+
+def _modulos_ro(carpeta):
+    try:
+        return sorted(n for n in os.listdir(carpeta) if re.fullmatch(r"[0-9a-f]{64}\.nro", n))
+    except OSError:
+        return []
+
+
+def modulos_ro_nuevos(j):
+    """Cuántos NRO volcó el juego que la última recompilación todavía no tradujo."""
+    return len(set(_modulos_ro(carpeta_modulos_ro(j))) - set(j.datos.get("modulos_ro_usados", [])))
 
 
 def pistas_nuevas(j):
@@ -885,7 +1126,15 @@ def entorno_juego(j):
     env["NX_TITLE_ID"] = j.id
     env["NX_PLATAFORMA"] = j.datos.get("plataforma", "switch1")   # runtime/nvn/tex_deswizzle.c: GOB de Switch 2
     env["NX_PISTAS"] = os.path.join(j.carpeta, "pistas.txt")
+    env["NX_VOLCAR_NRO"] = carpeta_modulos_ro(j)
     env["NX_TITULO"] = j.nombre
+    # La bajada SM86 propia necesita el traductor Python. Los juegos viven
+    # fuera del repositorio, así que el runtime no puede descubrirlo junto al
+    # ejecutable; la configuración específica del juego aún puede sustituirlo.
+    sm86_programa = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                 "tools", "sm86_programa.py")
+    if os.path.isfile(sm86_programa):
+        env["NX_SM86_PROGRAMA"] = sm86_programa
     if leer_config().get("usuario"):
         env["NX_USUARIO"] = leer_config()["usuario"]
     env["NX_IDIOMA"] = aj["idioma"]
@@ -896,12 +1145,15 @@ def entorno_juego(j):
         env["NX_PANTALLA_COMPLETA"] = "1"
     if not aj["audio"]:
         env["NX_SIN_AUDIO"] = "1"
-    if aj.get("generacion_cuadros"):
-        env["TOTK_FRAMEGEN"] = "on"
     for linea in (aj.get("variables") or "").splitlines():
         if "=" in linea and not linea.strip().startswith("#"):
             k, v = linea.split("=", 1)
             env[k.strip()] = v.strip()
+    # El ajuste del juego manda sobre el entorno heredado: el runtime NVN de NX2Linux lee TOTK_FRAMEGEN y, si
+    # solo se exportara "on", un valor heredado dejaría la generación activa aunque el usuario la apague.
+    env["TOTK_FRAMEGEN"] = "on" if aj.get("generacion_cuadros") else "off"
+    telemetria = aj.get("telemetria", "off")
+    env["TOTK_PERF_OVERLAY"] = telemetria if telemetria in ("off", "fps", "full") else "off"
     # NVN en el host (runtime/nvn): el backend Vulkan traduce los shaders del juego a SPIR-V con totk_xlate (el
     # traductor de Ryujinx, compilado por totk-pc-recomp) y los guarda en la caché del juego.
     xlate = os.path.join(motor_especial_repo("totk-pc-recomp"), "build", "xlate", "totk_xlate")
@@ -918,13 +1170,156 @@ def motor_especial_repo(nombre):
     return next((e.repo() for e in especiales.ESPECIALES.values() if e.nombre == nombre), "")
 
 
+class EjecutableObsoleto(RuntimeError):
+    """El ejecutable nativo es anterior a algún archivo del runtime: hay que volver a enlazarlo."""
+
+
 def jugar(j, salida=None):
     """Arranca el juego; su salida va a <carpeta>/ultima_partida.txt."""
-    if not os.path.exists(j.ejecutable):
-        raise RuntimeError("el juego todavía no está construido")
-    log = salida or open(os.path.join(j.carpeta, "ultima_partida.txt"), "w")
     e = motor_especial(j)
+    exe = j.ejecutable
+    if not os.path.exists(exe):
+        raise RuntimeError("el juego todavía no está construido")
+    # La ventana decide si "Jugar" está activo al refrescarse; si el runtime cambia después (o se abre desde
+    # el menú con --jugar), sin esta comprobación se lanzaría un ejecutable enlazado con el runtime anterior.
+    if not e and j.runtime_desactualizado:
+        raise EjecutableObsoleto("el runtime cambió después de compilar este juego; actualiza el ejecutable "
+                                 "(Actualizar runtime) antes de jugar")
+    log = salida or open(os.path.join(j.carpeta, "ultima_partida.txt"), "w")
     if e:
         return e.lanzar(j, log)
-    return subprocess.Popen([j.ejecutable], env=entorno_juego(j), stdout=log, stderr=subprocess.STDOUT,
+    return subprocess.Popen([exe], env=entorno_juego(j), stdout=log, stderr=subprocess.STDOUT,
                             cwd=j.carpeta, start_new_session=True)
+
+
+# ---------- partidas en marcha ----------
+
+def _exe_de(pid):
+    """Ruta del ejecutable de pid, sin el " (deleted)" que pone el núcleo cuando se recompiló encima."""
+    try:
+        r = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    return r[:-len(" (deleted)")] if r.endswith(" (deleted)") else r
+
+
+def _hijos():
+    """{ppid: [pids]} de todos los procesos visibles."""
+    hijos = {}
+    for n in os.listdir("/proc"):
+        if not n.isdigit():
+            continue
+        try:
+            with open(f"/proc/{n}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        hijos.setdefault(ppid, []).append(int(n))
+    return hijos
+
+
+def descendientes(pid, hijos=None):
+    """pid y todos sus descendientes."""
+    hijos = _hijos() if hijos is None else hijos
+    vistos, pila = [], [pid]
+    while pila:
+        p = pila.pop()
+        if p not in vistos:
+            vistos.append(p)
+            pila.extend(hijos.get(p, []))
+    return vistos
+
+
+def procesos_del_juego(j):
+    """PIDs que ejecutan el binario del juego, los haya abierto esta ventana de NX2Linux o una anterior que se
+    cerró (al cerrarse, su partida queda huérfana y la ventana nueva no la conoce)."""
+    rutas = {os.path.realpath(p) for p in (j.ejecutable, j.ejecutable_nativo)}
+    propio = os.getpid()
+
+    def es_del_juego(pid):
+        exe = _exe_de(pid)
+        if exe is None:   # ya terminó (o es un zombi esperando su wait)
+            return False
+        if exe in rutas:
+            return True
+        # Si el binario se reemplazó por renombre, el enlace exe apunta al nombre viejo: mirar argv[0].
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                arg0 = f.read().split(b"\0", 1)[0].decode(errors="replace")
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return False
+        return bool(arg0) and os.path.normpath(os.path.join(cwd, arg0)) in rutas
+
+    return sorted(int(n) for n in os.listdir("/proc") if n.isdigit() and int(n) != propio and es_del_juego(n))
+
+
+def pids_con_ventana():
+    """PIDs que tienen una ventana en el compositor, o None si no se puede saber (no es Hyprland)."""
+    try:
+        r = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=3)
+        return {c.get("pid") for c in json.loads(r.stdout)} if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def tiene_ventana(pids):
+    """True/False si alguno de pids (o sus descendientes) tiene ventana; None si no se puede saber."""
+    con = pids_con_ventana()
+    if con is None:
+        return None
+    hijos = _hijos()
+    return any(d in con for p in pids for d in descendientes(p, hijos))
+
+
+def enfocar(pids):
+    """Lleva el foco a la ventana de alguno de pids. True si encontró una."""
+    con = pids_con_ventana() or set()
+    hijos = _hijos()
+    for p in pids:
+        for d in descendientes(p, hijos):
+            if d in con:
+                subprocess.run(["hyprctl", "dispatch", "focuswindow", f"pid:{d}"], capture_output=True, timeout=3)
+                return True
+    return False
+
+
+def cola_salida(j, lineas=12):
+    """Las últimas líneas de ultima_partida.txt (lo último que dijo el juego), o "" si no hay."""
+    try:
+        with open(os.path.join(j.carpeta, "ultima_partida.txt"), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384))
+            texto = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(texto.rstrip().splitlines()[-lineas:])
+
+
+def cerrar_partidas(pids, espera=3.0):
+    """SIGTERM a cada partida y su grupo (se lanzan con start_new_session); SIGKILL a lo que siga vivo tras
+    `espera` segundos. Devuelve los PIDs que no se pudieron cerrar."""
+    todos = set()
+    hijos = _hijos()
+    for p in pids:
+        todos.update(descendientes(p, hijos))
+    for p in pids:
+        try:
+            os.killpg(p, signal.SIGTERM) if os.getpgid(p) == p else os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    for p in todos:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    fin = time.monotonic() + espera
+    while time.monotonic() < fin and any(_exe_de(p) is not None for p in todos):   # los zombis no cuentan
+        time.sleep(0.1)
+    for p in todos:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.2)
+    return sorted(p for p in todos if _exe_de(p) is not None)

@@ -14,8 +14,10 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "nvn_device_info.h"
 #include "nvn_pool_index.h"
 #include "platform/platform.h"
+#include "tex.h"
 
 #define DEV_MAGIC MAGIC('D', 'E', 'V', 0)
 #define QUEUE_MAGIC MAGIC('Q', 'U', 'E', 'U')
@@ -202,8 +204,13 @@ NVN_API(nvnDeviceFinalize) { ((dev_t_ *)arg_p(c, 0))->magic = 0; }
 NVN_API(nvnDeviceGetInteger) {
     unsigned w = (unsigned)arg_x(c, 1);
     int *out = arg_p(c, 2);
-    if (w >= sizeof devinfo / sizeof *devinfo) rt_fatal("nvn: unsupported NVN device property %#x", w);
-    *out = devinfo[w];
+    int switch2 = nvn_gob_switch2();
+    if (!nvn_device_info_get(switch2, w, devinfo, sizeof devinfo / sizeof *devinfo, out))
+        rt_fatal("nvn: unsupported %s device property %#x", switch2 ? "NVN2" : "NVN", w);
+    if (switch2 && nvn_device_info_switch2_is_runtime(w))
+        NVN_LOG("DeviceGetInteger %#x is runtime-derived on Switch 2; host fallback -> %d", w, *out);
+    if (switch2 && nvn_device_info_switch2_is_unknown(w))
+        NVN_LOG("DeviceGetInteger %#x is unknown to this NVN2 table; fallback -> 0", w);
     NVN_LOG("DeviceGetInteger %#x -> %d", w, *out);
 }
 // NVNboolean nvnDeviceRegisterFastClearColor{,i,ui}(NVNdevice *d, const T *color, NVNformat format), ...Depth(d, float):
@@ -487,6 +494,16 @@ NVN_API(nvnSyncWait) {
     if (ok) b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
+// NVNboolean nvnQueueWaitSync(NVNqueue *q, const NVNsync *s): the commands q receives after this call wait for s.
+// Every queue feeds the same back end in submission order (one fence counter, nvn_fence_last; the async replay thread
+// keeps that order), so a sync fenced before this call is already ahead of anything q submits later: nothing to add.
+// A sync never fenced would stall the hardware queue for good; here it is logged and does not block.
+NVN_API(nvnQueueWaitSync) {
+    const sync_t *s = arg_p(c, 1);
+    if (!s || s->magic != SYNC_MAGIC || !s->fenced)
+        rt_log("nvn: QueueWaitSync on a sync that was never fenced (%p); not waited", (const void *)s);
+    ret_x(c, 1);
+}
 // void nvnEventBuilderSetDefaults(NVNeventBuilder *b)
 NVN_API(nvnEventBuilderSetDefaults) { memset(arg_p(c, 0), 0, sizeof(ev_builder_t)); }
 // void nvnEventBuilderSetStorage(NVNeventBuilder *b, const NVNmemoryPool *p, int64_t offset)
@@ -530,6 +547,10 @@ NVN_API(nvnQueueBuilderSetDefaults) {
 NVN_API(nvnQueueBuilderSetDevice) { ((queue_builder_t *)arg_p(c, 0))->dev = arg_p(c, 1); }
 // void nvnQueueBuilderSetFlags(NVNqueueBuilder *b, int flags)
 NVN_API(nvnQueueBuilderSetFlags) { ((queue_builder_t *)arg_p(c, 0))->flags = (uint32_t)arg_x(c, 1); }
+// NVN2 primary-queue routing is a scheduling hint; the Linux replay uses one host queue.
+// Keep the Switch 2 proc resolvable, matching Hookshot's no-op SetPrimaryQueue behavior.
+NVN_API(nvnQueueBuilderSetPrimaryQueue) { (void)c; }
+NVN_API(nvnQueueBuilderGetPrimaryQueue) { ret_x(c, 0); }
 // void nvnQueueBuilderSet{Command,Compute,Control}MemorySize / SetCommandFlushThreshold(NVNqueueBuilder *b, size_t n)
 NVN_API(nvnQueueBuilderSetCommandMemorySize) { ((queue_builder_t *)arg_p(c, 0))->cmd_sz = arg_x(c, 1); }
 NVN_API(nvnQueueBuilderSetComputeMemorySize) { ((queue_builder_t *)arg_p(c, 0))->comp_sz = arg_x(c, 1); }

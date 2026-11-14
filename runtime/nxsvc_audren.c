@@ -36,11 +36,12 @@ static ArParam param_read(const uint8_t *p) {
     return a;
 }
 
-// "REVn" en little endian: el número va en el byte alto. Se aceptan REV1 a REV15.
+// "REVn"/"REvn" en little endian: REV@/REv@ representan REV16.
 static int rev_number(int32_t rev) {
     uint32_t r = (uint32_t)rev;
     int n = (int)(r >> 24) - '0';
-    return (r & 0xFFFFFF) == 0x564552 && n >= 1 && n <= 15 ? n : 0;
+    uint32_t tag = r & 0xFFFFFF;
+    return (tag == 0x564552 || tag == 0x764552) && n >= 1 && n <= 16 ? n : 0;
 }
 
 // AudioRenderSystem.GetWorkBufferSize de Ryujinx, con los tamaños de sus estructuras: VoiceInfo 0x218,
@@ -858,6 +859,11 @@ static uint32_t audio_device(ServiceObject *self, NxRequest *r) {
         nx_out_copy_handle(r, d->h[r->cmd == 4 ? 0 : r->cmd == 11 ? 1 : 2]);
         return OK;
     case 5: nx_out32(r, 2); return OK; // GetActiveChannelCount: la salida es estéreo
+    case 17: nx_out_copy_handle(r, d->h[2]); return OK; // AcquireAudioOutputDeviceNotification
+    case 18: return OK; // ReleaseAudioOutputDeviceNotification
+    case 19: return OK; // SetAudioDeviceOutputVolumeAutoTuneEnabled
+    case 20: nx_out8(r, 0); return OK; // IsAudioDeviceOutputVolumeAutoTuneEnabled
+    case 21: nx_out8(r, 0); return OK; // IsActiveOutputDeviceEstimatedLowLatency
     }
     return NX_R_UNKNOWN_CMD;
 }
@@ -881,7 +887,10 @@ uint32_t nx_audren(ServiceObject *self, NxRequest *r) {
     }
     case 1: { // GetWorkBufferSize
         ArParam a = param_read(r->in);
-        if (!rev_number(a.revision)) return AR_R_OPERATION_FAILED;
+        if (!rev_number(a.revision)) {
+            if (getenv("NX_TRAZA_AUDREN")) fprintf(stderr, "[nxrt] audren GetWorkBufferSize: cmd=%u in_size=%u rev=0x%08x rate=%u samples=%u\n", r->cmd, r->in_size, (uint32_t)a.revision, a.rate, a.samples);
+            return AR_R_OPERATION_FAILED;
+        }
         nx_out64(r, work_size(&a));
         return OK;
     }

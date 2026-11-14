@@ -44,7 +44,8 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_PassMark,
+    R_PassMark, R_DrawMeshTasks, R_DrawMeshTasksIndirect, R_DrawMeshTasksNV, R_DrawMeshTasksIndirectNV,
+    R_ViewportSwizzle,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -625,6 +626,42 @@ void rec_pass_mark(VkCommandBuffer cb, uint32_t id, int end) {
     pub();
 }
 
+typedef struct { PFN_vkCmdDrawMeshTasksEXT fn; uint32_t x, y, z; } A_DrawMeshTasks;
+void rec_draw_mesh_tasks(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    if (!OWNED(cb)) { fn(cb, x, y, z); return; }
+    A_DrawMeshTasks *a = put(R_DrawMeshTasks, sizeof *a);
+    *a = (A_DrawMeshTasks){fn, x, y, z};
+    pub();
+}
+
+typedef struct { PFN_vkCmdDrawMeshTasksIndirectEXT fn; VkBuffer buffer; VkDeviceSize offset; uint32_t count, stride; }
+    A_DrawMeshTasksIndirect;
+void rec_draw_mesh_tasks_indirect(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer buffer,
+                                  VkDeviceSize offset, uint32_t count, uint32_t stride) {
+    if (!OWNED(cb)) { fn(cb, buffer, offset, count, stride); return; }
+    A_DrawMeshTasksIndirect *a = put(R_DrawMeshTasksIndirect, sizeof *a);
+    *a = (A_DrawMeshTasksIndirect){fn, buffer, offset, count, stride};
+    pub();
+}
+
+typedef struct { PFN_vkCmdDrawMeshTasksNV fn; uint32_t count, first; } A_DrawMeshTasksNV;
+void rec_draw_mesh_tasks_nv(PFN_vkCmdDrawMeshTasksNV fn, VkCommandBuffer cb, uint32_t count, uint32_t first) {
+    if (!OWNED(cb)) { fn(cb, count, first); return; }
+    A_DrawMeshTasksNV *a = put(R_DrawMeshTasksNV, sizeof *a);
+    *a = (A_DrawMeshTasksNV){fn, count, first};
+    pub();
+}
+
+typedef struct { PFN_vkCmdDrawMeshTasksIndirectNV fn; VkBuffer buffer; VkDeviceSize offset; uint32_t count, stride; }
+    A_DrawMeshTasksIndirectNV;
+void rec_draw_mesh_tasks_indirect_nv(PFN_vkCmdDrawMeshTasksIndirectNV fn, VkCommandBuffer cb, VkBuffer buffer,
+                                     VkDeviceSize offset, uint32_t count, uint32_t stride) {
+    if (!OWNED(cb)) { fn(cb, buffer, offset, count, stride); return; }
+    A_DrawMeshTasksIndirectNV *a = put(R_DrawMeshTasksIndirectNV, sizeof *a);
+    *a = (A_DrawMeshTasksIndirectNV){fn, buffer, offset, count, stride};
+    pub();
+}
+
 typedef struct { void *fn; uint32_t first, n; const void *v; } A_Targets;
 #define TARGET_CMD(fname, R, PFN, T)                                                                                    \
     void fname(PFN fn, VkCommandBuffer cb, uint32_t first, uint32_t n, const T *v) {                                    \
@@ -638,6 +675,17 @@ typedef struct { void *fn; uint32_t first, n; const void *v; } A_Targets;
 TARGET_CMD(rec_blend_enable, R_BlendEnable, PFN_vkCmdSetColorBlendEnableEXT, VkBool32)
 TARGET_CMD(rec_blend_equation, R_BlendEquation, PFN_vkCmdSetColorBlendEquationEXT, VkColorBlendEquationEXT)
 TARGET_CMD(rec_write_mask, R_WriteMask, PFN_vkCmdSetColorWriteMaskEXT, VkColorComponentFlags)
+
+typedef struct { PFN_vkCmdSetViewportSwizzleNV fn; uint32_t first, n; const VkViewportSwizzleNV *v; } A_ViewportSwizzle;
+void rec_viewport_swizzle(PFN_vkCmdSetViewportSwizzleNV fn, VkCommandBuffer cb, uint32_t first, uint32_t n,
+                          const VkViewportSwizzleNV *v) {
+    if (!OWNED(cb)) { fn(cb, first, n, v); return; }
+    A_ViewportSwizzle *a = put(R_ViewportSwizzle, sizeof *a + sizeof *v * n);
+    uint8_t *at = (uint8_t *)(a + 1);
+    *a = (A_ViewportSwizzle){fn, first, n, NULL};
+    a->v = tail_copy(&at, v, sizeof *v * n);
+    pub();
+}
 
 // ---- the recorder's side
 
@@ -714,6 +762,11 @@ static void exec_packet(uint32_t op, void *p) {
     case R_BlendEquation: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEquationEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_WriteMask: { A_Targets *a = p; ((PFN_vkCmdSetColorWriteMaskEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_PassMark: { A_PassMark *a = p; vk_pass_mark_cmd(cb, a->id, a->end); break; }
+    case R_DrawMeshTasks: { A_DrawMeshTasks *a = p; a->fn(cb, a->x, a->y, a->z); break; }
+    case R_DrawMeshTasksIndirect: { A_DrawMeshTasksIndirect *a = p; a->fn(cb, a->buffer, a->offset, a->count, a->stride); break; }
+    case R_DrawMeshTasksNV: { A_DrawMeshTasksNV *a = p; a->fn(cb, a->count, a->first); break; }
+    case R_DrawMeshTasksIndirectNV: { A_DrawMeshTasksIndirectNV *a = p; a->fn(cb, a->buffer, a->offset, a->count, a->stride); break; }
+    case R_ViewportSwizzle: { A_ViewportSwizzle *a = p; a->fn(cb, a->first, a->n, a->v); break; }
     case R_EndCb: {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);

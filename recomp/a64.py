@@ -6,7 +6,7 @@ flujo y las líneas de C que implementan la instrucción sobre el contexto `c`
 (registros x0-x30, sp y banderas NZCV) que define runtime/nxrt.h.
 
 La autenticación de punteros de ARMv8.3 (Switch 2) se traduce como desactivada: firmar y
-autenticar no cambian el puntero. Lo que todavía no está cubierto (PACGA, FCMLA/FCADD) se traduce a una llamada a nx_trap(), que detiene el programa con la
+autenticar no cambian el puntero. PACGA conserva el puntero de entrada; FCMLA/FCADD se traduce a una llamada a nx_trap(), que detiene el programa con la
 dirección y la palabra de la instrucción.
 """
 
@@ -424,19 +424,26 @@ def loadstore(i, x):
         elif o2 == 0 and o1 == 0:  # LDXR / LDAXR / STXR / STLXR
             # Monitor exclusivo con varios hilos: LDXR recuerda la dirección y el valor leído,
             # y STXR guarda solo si la memoria sigue con ese valor (compare-and-swap atómico).
+            # La lectura también debe ser atómica: combinar memcpy con CAS incurre en una carrera
+            # del modelo C cuando otro hilo modifica la misma palabra.
             w = 8 << size
             if l:
-                i.lines = [f"{{ uint64_t a = {base}; uint64_t v = ld{w}(a); c->excl_addr = a; c->excl_val = v; "
+                i.lines = [f"{{ uint64_t a = {base}; uint64_t v = nx_excl_ld{w}(a); c->excl_addr = a; c->excl_val = v; "
                            f"{setr(rt, 'v')} }}"]
             else:
                 i.lines = [f"{{ uint64_t a = {base}; int ok = c->excl_addr == a && nx_cas{w}(a, c->excl_val, {R(rt)}); "
                            f"c->excl_addr = ~0ull; {setr(rs, '!ok', 32)} }}"]
         elif o2 == 0 and o1 == 1 and size >= 2:  # LDXP / STXP
             s = size
-            n = 1 << s
             if l:
-                i.lines = [f"{{ uint64_t a = {base}; uint64_t v1 = {LD[s]}(a), v2 = {LD[s]}(a + {n}); c->excl_addr = a; "
-                           f"c->excl_val = v1; c->excl_val2 = v2; {setr(rt, 'v1')} {setr(rt2, 'v2')} }}"]
+                if s == 3:
+                    i.lines = [f"{{ uint64_t a = {base}; unsigned __int128 v = nx_excl_ld128(a); "
+                               f"uint64_t v1 = (uint64_t)v, v2 = (uint64_t)(v >> 64); c->excl_addr = a; "
+                               f"c->excl_val = v1; c->excl_val2 = v2; {setr(rt, 'v1')} {setr(rt2, 'v2')} }}"]
+                else:
+                    i.lines = [f"{{ uint64_t a = {base}; uint64_t v = nx_excl_ld64(a); "
+                               f"uint64_t v1 = (uint32_t)v, v2 = (uint32_t)(v >> 32); c->excl_addr = a; "
+                               f"c->excl_val = v1; c->excl_val2 = v2; {setr(rt, 'v1')} {setr(rt2, 'v2')} }}"]
             elif s == 3:
                 i.lines = [f"{{ uint64_t a = {base}; int ok = c->excl_addr == a && "
                            f"nx_cas128(a, c->excl_val, c->excl_val2, {R(rt)}, {R(rt2)}); c->excl_addr = ~0ull; "
@@ -658,6 +665,11 @@ def dp_reg(i, x):
                 0b001010: f"({T(w)})(({ST(w)}){a} >> ({b} & {w - 1}))",
                 0b001011: f"ror{w}({a}, {b} & {w - 1})",
             }
+            if opcode == 0b001100 and sf and not bits(x, 29, 29):  # PACGA
+                # Pointer authentication is disabled on the host. Keep the source
+                # pointer unchanged, matching the PAC/AUT identity handling below.
+                i.lines = [setr(rd, a, 64)]
+                return
             if opcode >> 3 == 0b010 and not bits(x, 29, 29):  # CRC32 / CRC32C
                 sz, crc_c = bits(x, 11, 10), bits(x, 12, 12)
                 if (sz == 3) != bool(sf):

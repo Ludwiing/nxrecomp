@@ -15,6 +15,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 RAIZ = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 B = os.path.join(RAIZ, "build")
@@ -31,6 +34,148 @@ def mal(msg):
     global fallos
     fallos += 1
     print("MAL: " + msg)
+
+
+def probar_framegen_env():
+    """Framegen y telemetría por juego deben dominar variables heredadas."""
+    keys = ("TOTK_FRAMEGEN", "TOTK_PERF_OVERLAY")
+    anterior = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ.update(TOTK_FRAMEGEN="on", TOTK_PERF_OVERLAY="full")
+        j = SimpleNamespace(
+            id="framegen-env-test", nombre="Framegen env test", carpeta=os.path.join(tmp, "framegen-env"),
+            datos={"ajustes": {"renderer": "vulkan", "modo": "base", "idioma": "es-419",
+                               "pantalla_completa": False, "audio": True, "generacion_cuadros": False,
+                               "telemetria": "off", "variables": ""}},
+        )
+        env = motor.entorno_juego(j)
+        sm86 = os.path.join(RAIZ, "tools", "sm86_programa.py")
+        if os.path.isfile(sm86) and env.get("NX_SM86_PROGRAMA") != sm86:
+            mal("el lanzador no pasa la ruta local de tools/sm86_programa.py al runtime")
+        if env["TOTK_FRAMEGEN"] != "off":
+            mal("generación apagada: el entorno heredado prevaleció sobre el ajuste del juego")
+        if env["TOTK_PERF_OVERLAY"] != "off":
+            mal("telemetría apagada: el entorno heredado prevaleció sobre el ajuste del juego")
+        j.datos["ajustes"]["generacion_cuadros"] = True
+        j.datos["ajustes"]["telemetria"] = "fps"
+        env = motor.entorno_juego(j)
+        if env["TOTK_FRAMEGEN"] != "on":
+            mal("generación activada: TOTK_FRAMEGEN no llegó al runtime")
+        if env["TOTK_PERF_OVERLAY"] != "fps":
+            mal("telemetría FPS: el modo seleccionado no llegó al runtime")
+        j.datos["ajustes"]["telemetria"] = "full"
+        if motor.entorno_juego(j)["TOTK_PERF_OVERLAY"] != "full":
+            mal("telemetría detallada: no se habilitó la medición CPU/GPU")
+        j.datos["ajustes"]["variables"] = "NX_SM86_PROGRAMA=/tmp/sm86-personal.py"
+        if motor.entorno_juego(j).get("NX_SM86_PROGRAMA") != "/tmp/sm86-personal.py":
+            mal("NX_SM86_PROGRAMA específico del juego no prevalece sobre el valor predeterminado")
+    finally:
+        for k, v in anterior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    if not fallos:
+        print("OK: framegen y telemetría controlan el runtime NVN nativo")
+
+
+probar_framegen_env()
+
+
+def probar_modulos_ro():
+    """Los NRO que el juego arma en memoria: el runtime los vuelca en <juego>/nro y, si hay uno que la última
+    recompilación no tradujo, la app pide recompilar (como con las pistas)."""
+    carpeta = os.path.join(tmp, "modulos-ro")
+    j = SimpleNamespace(id="modulos-ro-test", nombre="Módulos ro", carpeta=carpeta,
+                        datos={"ajustes": {"renderer": "opengl", "modo": "base", "idioma": "es-419",
+                                           "pantalla_completa": False, "audio": True, "generacion_cuadros": False,
+                                           "telemetria": "off", "variables": ""}})
+    if motor.entorno_juego(j).get("NX_VOLCAR_NRO") != os.path.join(carpeta, "nro"):
+        mal("NX_VOLCAR_NRO no apunta a <juego>/nro")
+    if motor.modulos_ro_nuevos(j) != 0:
+        mal("sin carpeta nro no hay módulos nuevos")
+    os.makedirs(os.path.join(carpeta, "nro"), exist_ok=True)
+    a, b = "a" * 64 + ".nro", "b" * 64 + ".nro"
+    for n in (a, "nro-1234.tmp", "notas.txt"):
+        open(os.path.join(carpeta, "nro", n), "wb").close()
+    if motor.modulos_ro_nuevos(j) != 1:
+        mal("un <sha256>.nro sin traducir debe contar (y los temporales no)")
+    j.datos["modulos_ro_usados"] = [a]
+    if motor.modulos_ro_nuevos(j) != 0:
+        mal("el NRO ya traducido no debe pedir otra recompilación")
+    open(os.path.join(carpeta, "nro", b), "wb").close()
+    if motor.modulos_ro_nuevos(j) != 1:
+        mal("un segundo NRO volcado debe pedir recompilar")
+    if not fallos:
+        print("OK: NRO volcados en <juego>/nro y aviso de recompilación")
+
+
+probar_modulos_ro()
+
+
+def probar_ejecutable_nativo():
+    """NX2Linux compila a <carpeta>/juego y lo abre desde la carpeta del juego con el entorno nativo."""
+    carpeta = os.path.join(tmp, "0100000000c0ffee")
+    os.makedirs(carpeta, exist_ok=True)
+    j = motor.Juego(carpeta)
+    j.datos.update({
+        "nombre": "Nativo", "version": None,
+        "pasos": {clave: time.strftime("%Y-%m-%d %H:%M:%S") for clave, _, _ in motor.PASOS},  # motor.py compara la fecha con las fuentes
+        "ajustes": {"renderer": "vulkan", "modo": "base", "idioma": "es-419",
+                    "pantalla_completa": False, "audio": True, "generacion_cuadros": False,
+                    "telemetria": "off", "variables": "NX_TRAZA_GL=1"},
+    })
+    j.guardar()
+    j = motor.Juego(carpeta)
+    nativo = os.path.join(carpeta, "juego")
+    if j.ejecutable_nativo != nativo or j.ejecutable != nativo:
+        mal("el ejecutable del juego no es el binario nativo <carpeta>/juego")
+    if j.listo:
+        mal("el juego figura listo sin binario nativo")
+
+    llamadas = []
+    build = SimpleNamespace(juego=j, _ejecutar=lambda paso, args, *_: llamadas.append((paso, args)))
+    motor.Construccion._compilar(build)
+    if not llamadas or llamadas[-1][1][llamadas[-1][1].index("-o") + 1] != nativo:
+        mal("la compilación NX2Linux no escribe el binario nativo")
+
+    with open(nativo, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(nativo, 0o755)
+    if j.listo:  # paso_hecho("recompilar") exige el C generado (motor.py), no solo el marcador
+        mal("el juego figura listo sin c/nxgame.h ni c/programa.c")
+    os.makedirs(os.path.join(carpeta, "c"), exist_ok=True)
+    for nombre in ("nxgame.h", "programa.c"):
+        open(os.path.join(carpeta, "c", nombre), "w").close()
+    if not j.listo or j.ejecutable != nativo:
+        mal("el binario nativo no quedó como ejecutable del juego")
+    with patch.object(motor.subprocess, "Popen") as popen:
+        motor.jugar(j, salida=object())
+    args, kwargs = popen.call_args
+    env = kwargs["env"]
+    if args[0] != [nativo] or kwargs["cwd"] != j.carpeta:
+        mal("el juego no se lanzó desde el binario nativo en su carpeta")
+    if env.get("TOTK_FRAMEGEN") != "off" or env.get("TOTK_PERF_OVERLAY") != "off":
+        mal("el entorno nativo no refleja los ajustes del juego")
+    if env.get("NX_TRAZA_GL") != "1":
+        mal("las variables extra del juego no llegaron al entorno")
+    # Un ejecutable anterior al runtime no se lanza aunque la ventana tenga "Jugar" activo de antes.
+    runtime_c = os.path.join(motor.ROOT, "runtime", "nxrt.c")
+    viejo = os.path.getmtime(runtime_c) - 60
+    os.utime(nativo, (viejo, viejo))
+    with patch.object(motor.subprocess, "Popen") as popen:
+        try:
+            motor.jugar(j, salida=object())
+            mal("se lanzó un ejecutable compilado antes del runtime actual")
+        except motor.EjecutableObsoleto:
+            pass
+        if popen.called:
+            mal("el ejecutable obsoleto llegó a lanzarse")
+    if not fallos:
+        print("OK: el juego se compila y se abre con el binario nativo de NX2Linux")
+
+
+probar_ejecutable_nativo()
 
 
 def construir_y_jugar(rutas, salida_esperada, nombre_esperado=None, version_esperada=None, extra=None):

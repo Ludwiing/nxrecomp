@@ -415,20 +415,8 @@ def baja_flo(d):
                                 NegB=_c(d, "op2.not"), **g)]
 
 
-PMODE = {"F4E": 1, "B4E": 2, "RC8": 3, "ECL": 4, "ECR": 5, "RC16": 6}
-
-
-def baja_prmt(d):
-    """PRMT Rd, A, sel, C [modo]: Maxwell PRMT con la misma semántica (A y C, selector B)."""
-    g, m = _guarda(d), _mods(d)
-    modo = [PMODE[x] for x in m if x in PMODE]
-    if any(x.startswith("INVALID") for x in m):
-        raise SinRegla("PRMT inválido")
-    previas = []
-    b = _a_registro(d, 2, g, previas, TEMPS[0])
-    c = _a_registro(d, 3, g, previas, TEMPS[1])
-    return previas + [codificar("PrmtR", Dest=_c(d, "op0.n"), SrcA=_c(d, "op1.n"), SrcB=b, SrcC=c,
-                                PMode=modo[0] if modo else 0, **g)]
+# PRMT: tools/sm86_baja_prmt.py. La regla de aquí bajaba a PrmtR de Maxwell, que el Ryujinx de totk_xlate no
+# implementa (InstEmit.cs: solo un log): el resultado quedaba sin escribir. Lo encontró la prueba en la GPU.
 
 
 def baja_s2r(d):
@@ -467,7 +455,7 @@ def baja_nop(d):
 REGLAS = {"MOV": baja_mov, "FADD": baja_fadd, "FMUL": baja_fmul, "FFMA": baja_ffma, "EXIT": baja_exit, "NOP": baja_nop,
           "ISETP": lambda d: baja_setp(d, True), "FSETP": lambda d: baja_setp(d, False), "SEL": baja_sel,
           "FSEL": baja_sel, "LOP3": baja_lop3, "IADD3": baja_iadd3, "MUFU": baja_mufu, "FMNMX": baja_fmnmx,
-          "IMNMX": baja_imnmx, "POPC": baja_popc, "FLO": baja_flo, "PRMT": baja_prmt, "S2R": baja_s2r,
+          "IMNMX": baja_imnmx, "POPC": baja_popc, "FLO": baja_flo, "S2R": baja_s2r,
           "IABS": baja_iabs}
 
 # Para comprobar sin repetir la lógica de las reglas: qué campo Maxwell debe tener qué operando SM86, y en qué
@@ -480,11 +468,11 @@ ROLES = {
     "LOP3": ({"Dest": 1, "SrcA": 2, "SrcC": 4}, 3), "IADD3": ({"Dest": 0, "SrcA": 3, "SrcC": 5}, 4),
     "MUFU": ({"Dest": 0}, 1), "FMNMX": ({"Dest": 0, "SrcA": 1, "SrcPred": 3}, 2),
     "IMNMX": ({"Dest": 0, "SrcA": 1, "SrcPred": 3}, 2), "POPC": ({"Dest": 0}, 1), "FLO": ({"Dest": 0}, 2),
-    "PRMT": ({"Dest": 0, "SrcA": 1}, 2), "S2R": ({"Dest": 0}, None), "IABS": ({"Dest": 0}, 1),
+    "S2R": ({"Dest": 0}, None), "IABS": ({"Dest": 0}, 1),
 }
 FAMILIA = {"FADD": "Fadd", "FMUL": "Fmul", "FFMA": "Ffma", "MOV": "Mov", "ISETP": "Isetp", "FSETP": "Fsetp",
            "SEL": "Sel", "FSEL": "Sel", "LOP3": "Lop3", "IADD3": "Iadd3", "MUFU": "Mufu", "FMNMX": "Fmnmx",
-           "IMNMX": "Imnmx", "POPC": "Popc", "FLO": "Flo", "PRMT": "Prmt", "S2R": "S2r", "IABS": "I2i"}
+           "IMNMX": "Imnmx", "POPC": "Popc", "FLO": "Flo", "S2R": "S2r", "IABS": "I2i"}
 
 
 def _cargar_modulos():

@@ -63,6 +63,23 @@ static uint32_t storage_handle(ServiceObject *self, NxRequest *r) {
         uint64_t off = nx_in64(r, 0), size = nx_in64(r, 8);
         if (!r->nb || size > r->b[0].size || off > s->size || size > s->size - off) return R_FS_OUT_OF_RANGE;
         nx_vigia_tocar(r->b[0].addr, size); // read() en una página protegida daría EFAULT
+        // Diagnóstico: NX_TRAZA_ROMFS=<desde>:<hasta>[:<máximo>] (offsets hex de la imagen; máximo decimal, 200 por
+        // omisión) escribe las lecturas que tocan ese rango, para saber si el juego lee un archivo concreto sin
+        // trazar todo el RomFS.
+        static int64_t traza_desde = -2, traza_hasta;
+        static int traza_lineas, traza_max = 200;
+        if (traza_desde == -2) {
+            const char *e = getenv("NX_TRAZA_ROMFS");
+            unsigned long long a, b;
+            int m, campos = e ? sscanf(e, "%llx:%llx:%d", &a, &b, &m) : 0;
+            traza_desde = campos >= 2 ? (int64_t)a : -1;
+            traza_hasta = traza_desde >= 0 ? (int64_t)b : 0;
+            if (campos == 3 && m > 0) traza_max = m;
+        }
+        if (traza_desde >= 0 && (int64_t)off < traza_hasta && (int64_t)(off + size) > traza_desde &&
+            __atomic_fetch_add(&traza_lineas, 1, __ATOMIC_RELAXED) < traza_max)
+            fprintf(stderr, "[romfs] tid %d lectura 0x%llx +0x%llx\n", (int)gettid(), (unsigned long long)off,
+                    (unsigned long long)size);
         int fd = fileno(s->f);
         if (fd >= 0) {
             // Sessions and domain clones share Storage. A seek followed by a
@@ -416,6 +433,22 @@ uint32_t nx_fsp(ServiceObject *self, NxRequest *r) {
                 fseeko(f, 0, SEEK_END);
                 s->size = (uint64_t)ftello(f);
                 nx_out_object(r, nx_object("IStorage (DLC)", storage_handle, s));
+                return OK;
+            }
+        }
+        // Datos del sistema (MiiModel 0x0100000000000802, etc.): no vienen con el juego, salen del firmware de la
+        // consola. Si el usuario dejó la imagen RomFS en $NX_DATOS_SISTEMA/<id de 16 cifras hex>.img, se entrega.
+        const char *sistema = getenv("NX_DATOS_SISTEMA");
+        if (sistema && id) {
+            char ruta[1100];
+            snprintf(ruta, sizeof ruta, "%s/%016llx.img", sistema, (unsigned long long)id);
+            FILE *f = open_romfs_image(ruta);
+            if (f) {
+                Storage *s = calloc(1, sizeof *s);
+                s->f = f;
+                fseeko(f, 0, SEEK_END);
+                s->size = (uint64_t)ftello(f);
+                nx_out_object(r, nx_object("IStorage (datos del sistema)", storage_handle, s));
                 return OK;
             }
         }

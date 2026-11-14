@@ -12,5 +12,9 @@ tamaño del RomFS: 65536 bytes
 Read(1000, 64): 0x0, primeros bytes 27 58 89, hash 0x8ee2be60
 después de cerrar el objeto 2, pedirle algo falla: sí
 sin dominio, IStorage llega como handle: sí, tamaño 65536
+GetService("pctl"): 0x0
+pctl CreateService: 0x0, IParentalControlService como handle: sí
+IParentalControlService Initialize: 0x0
+IParentalControlService comando 0x7777 (no existe): 0x0
 GetService("nada"): 0xe15
 Fin.

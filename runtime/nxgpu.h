@@ -2,6 +2,9 @@
 #pragma once
 #include <stdint.h>
 
+// Tegra host syncpoints exposed by the GSV shared-memory ABI (0x1f8 entries).
+enum { NX_SYNCPT_COUNT = 0x1F8 };
+
 uint64_t nx_gpu_alloc_va(uint64_t size, uint64_t align);
 void nx_gpu_map(uint64_t gpu, uint64_t size, uint64_t cpu);
 void nx_gpu_unmap(uint64_t gpu);

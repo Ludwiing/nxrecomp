@@ -201,6 +201,23 @@ int nx_main(void) {
     close_handle(st2);
     close_handle(fs2);
 
+    // pctl: CreateService (0, con pid) da IParentalControlService; Initialize (1, 4.0.0+) no tiene entradas ni
+    // salidas y responde éxito a una aplicación
+    u32 pctl;
+    pr("GetService(\"pctl\"): 0x%x\n", get_service(sm, "pctl", &pctl));
+    Req crear = {.type = 4, .cmd = 0, .in = &pid, .in_size = 8, .send_pid = 1};
+    request(pctl, &crear, &rs);
+    u32 control = rs.move_handle;
+    pr("pctl CreateService: 0x%x, IParentalControlService como handle: %s\n", rs.result, control ? "sí" : "no");
+    Req init = {.type = 4, .cmd = 1};
+    request(control, &init, &rs);
+    pr("IParentalControlService Initialize: 0x%x\n", rs.result);
+    Req raro = {.type = 4, .cmd = 0x7777};   // comando que no existe
+    request(control, &raro, &rs);
+    pr("IParentalControlService comando 0x7777 (no existe): 0x%x\n", rs.result);
+    close_handle(control);
+    close_handle(pctl);
+
     u32 none;
     pr("GetService(\"nada\"): 0x%x\n", get_service(sm, "nada", &none));
     pr("Fin.\n");

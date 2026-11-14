@@ -25,6 +25,11 @@ typedef struct VkCtx {
     VkQueue gfx_queue;                      // graphics + present
     VkQueue xfer_queue;                     // equals gfx_queue when xfer_shared
     int xfer_shared;                        // 1: no separate queue; serialise with gfx_queue
+    PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks;
+    PFN_vkCmdDrawMeshTasksIndirectEXT cmd_draw_mesh_tasks_indirect;
+    PFN_vkCmdDrawMeshTasksNV cmd_draw_mesh_tasks_nv;
+    PFN_vkCmdDrawMeshTasksIndirectNV cmd_draw_mesh_tasks_indirect_nv;
+    PFN_vkCmdSetViewportSwizzleNV cmd_set_viewport_swizzle;
     VmaAllocator vma;
     VkSemaphore timeline;                   // one timeline semaphore; values are issued by vk_sync.c
     VkDebugUtilsMessengerEXT messenger;
@@ -33,10 +38,12 @@ typedef struct VkCtx {
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
+        has_task_shader, has_mesh_shader,      // VK_EXT_mesh_shader feature bits (enabled only when supported)
+        has_task_shader_nv, has_mesh_shader_nv,// VK_NV_mesh_shader feature bits (firstTask-capable path)
         has_nv_checkpoints,                 // VK_NV_device_diagnostic_checkpoints (TOTK_PASS_CRUMBS=1, vk_crumbs.c)
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
-        has_hdr_metadata;                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
+        has_hdr_metadata, has_viewport_swizzle; // VK_EXT_hdr_metadata; VK_NV_viewport_swizzle + EDS3
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -509,6 +516,7 @@ void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem
 // vk_pipeline_set_dynamic only and left out of the pipeline key.
 typedef struct VkPipeState {
     const GfxShader *vs, *fs;              // gfx_shader_get results; fs NULL: no fragment stage (depth only)
+    const GfxShader *task, *mesh;          // NVN2 mesh pipeline: task optional; mesh required
     int32_t color_fmt[8];                  // NVNformat of colour target i (OP_SET_RT), 0 none
     int32_t depth_fmt;                     // NVNformat of the depth/stencil target, 0 none
     uint8_t samples;                       // sample count of the targets; 0 or 1 single-sampled
@@ -588,6 +596,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
 // write masks and references; vertex buffers with vkCmdBindVertexBuffers2 (strides NULL when
 // vk_pipeline_vertex_input_dynamic(), else from VkPipeState.vstream).
 void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s);
+void vk_pipeline_set_dynamic_mesh(VkCommandBuffer cb, const VkPipeState *s);
 int vk_pipeline_vertex_input_dynamic(void);    // 1: vertex input is VK_EXT_vertex_input_dynamic_state
 // Translator answers from the bound state: attr_type from the vertex attribute formats (vs), frag_out_type from the
 // colour target formats (fs). Other fields are left as they are; either pointer may be NULL.

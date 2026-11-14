@@ -11,8 +11,13 @@
 #define NX_ALIAS_SIZE 0x1000000000ull   // 64 GiB
 #define NX_STACK_BASE 0x4000000000ull
 #define NX_STACK_SIZE 0x80000000ull     // 2 GiB
-#define NX_TLS_BASE 0x3F000000ull       // 0x200 bytes por hilo; los primeros 0x100 son el buffer de IPC
+#define NX_TLS_BASE 0x3F000000ull       // TLR y bloques TPIDR_EL0, separados por hilo
 #define NX_TLS_SIZE 0x100000ull
+#define NX_THREAD_TLS_STRIDE 0x2000ull
+#define NX_THREAD_TLR_SIZE 0x200ull
+#define NX_THREAD_TP_OFFSET 0x800ull
+#define NX_THREAD_TLR_OFFSET 0x1000ull
+#define NX_TLS_SLOTS 32
 
 enum { KO_THREAD = 1, KO_EVENT, KO_SESSION, KO_SHMEM, KO_TMEM };
 enum { TS_CREATED = 1, TS_RUNNING, TS_EXITED };
@@ -22,7 +27,9 @@ typedef struct KThread {
     Ctx *ctx;
     pthread_t pthread;
     pthread_cond_t cv;
-    uint64_t id, entry, tls;
+    uint64_t id, entry, tls, tp;
+    uint64_t thread_type, thread_arg, stack_top;
+    uint64_t tls_slots[NX_TLS_SLOTS];
     uint32_t handle;
     int priority, core, state;
     int pausa, pausado; // SetThreadActivity: pedido de pausa y confirmación del hilo
@@ -58,6 +65,7 @@ typedef struct KTmem {     // memoria de transferencia: el juego le presta una z
 KThread *nx_kernel_main_thread(void);
 KThread *nx_current_thread(void);
 void nx_kernel_adopt(KThread *t);
+void nx_tls_hooks_ready(void);
 __attribute__((noreturn)) void nx_exit_thread(void);
 void nx_memory_init(void);
 void nx_memory_add_stack(uint64_t addr, uint64_t size);
@@ -66,9 +74,18 @@ void *nx_handle_get(uint32_t h, int type);
 void nx_kernel_lock(void);
 void nx_kernel_unlock(void);
 
+// Reemplazos del SDK nn::os para los valores TLS por hilo, como en Hookshot.
+void nx_tls_allocate(Ctx *c);
+void nx_tls_free(Ctx *c);
+void nx_tls_get(Ctx *c);
+void nx_tls_set(Ctx *c);
+void nx_tls_used(Ctx *c);
+
 // Para los servicios: eventos que señala el sistema y memoria compartida.
 uint32_t nx_event_new(KEvent **out);              // devuelve el handle de lectura
 void nx_event_signal(KEvent *ev);
+int nx_event_signal_handle(uint32_t handle);      // señala por el handle de escritura del SDK
+int nx_event_clear_handle(uint32_t handle);       // limpia el evento de un SystemEvent
 uint32_t nx_shmem_new(uint64_t size, KShmem **out); // devuelve un handle para copiar al juego
 
 // IPC (nxipc.c)

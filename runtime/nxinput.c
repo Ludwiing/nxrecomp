@@ -13,6 +13,7 @@
 
 #include <SDL3/SDL.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +39,75 @@ enum {
 
 static uint8_t *shmem;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t key_buttons, pad_buttons, script_buttons, sampling;
+static uint64_t script_buttons, sampling;
+// El SDK de Switch 2 (nn::hid::detail::GetNpadStates) lee cada entrada del LIFO como un seqlock: con el bit 0 del
+// número de la entrada encendido la da por escribiéndose y vuelve a empezar, y compara el número antes y después de
+// copiar. Con el número de muestreo (que sube de 1 en 1) la mitad de las entradas eran impares: una lectura de una
+// entrada esperaba al siguiente muestreo y una de varias no terminaba nunca. En Switch 2 la entrada lleva su propio
+// número par (2 × muestreo), impar mientras se escribe; el muestreo del estado sigue subiendo de 1 en 1 (el SDK
+// exige que dos estados seguidos difieran en 1). Switch 1 conserva el número de la entrada igual al del estado.
+static int seqlock_par;
+
+// El juego lee GetNpadState una vez por cuadro y solo ve la entrada más nueva del LIFO. Si KEY_DOWN y KEY_UP llegan
+// en el mismo lote de eventos SDL (pulsación sintética o muy rápida), el botón solo estaba publicado entre dos
+// escrituras y ningún cuadro lo veía. Un botón soltado antes de MIN_HOLD_NS queda apretado hasta cumplirlo; el
+// hilo de muestreo lo suelta. Cubre dos cuadros a 30 fps.
+#define MIN_HOLD_NS 70000000ull
+typedef struct {
+    uint64_t buttons, pending_release;
+    uint64_t down_ns[16];
+} Source;
+static Source keys, pads;
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// Traza opt-in (NX_TRAZA_ENTRADA=1): adjuntar memoria, foco y transiciones de botones con lo publicado; tope de líneas.
+static int traza = -1;
+static unsigned traza_lineas;
+static void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void trace(const char *fmt, ...) {
+    if (traza < 0) traza = getenv("NX_TRAZA_ENTRADA") && *getenv("NX_TRAZA_ENTRADA") == '1';
+    if (!traza || traza_lineas >= 400) return;
+    if (++traza_lineas == 400) { fputs("[entrada] traza: tope de 400 líneas alcanzado\n", stderr); return; }
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("[entrada] ", stderr);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void source_set(Source *s, uint64_t bits, int down) {
+    uint64_t t = now_ns();
+    for (int i = 0; i < 16; i++) {
+        uint64_t bit = 1ull << i;
+        if (!(bits & bit)) continue;
+        if (down) {
+            if (!(s->buttons & bit) || (s->pending_release & bit)) s->down_ns[i] = t;
+            s->buttons |= bit;
+            s->pending_release &= ~bit;
+        } else if (s->buttons & bit) {
+            if (t - s->down_ns[i] < MIN_HOLD_NS) s->pending_release |= bit;
+            else s->buttons &= ~bit;
+        }
+    }
+}
+
+// Lo llama el hilo de muestreo con el candado tomado: suelta los botones retenidos que ya cumplieron.
+static void source_expire(Source *s, uint64_t t) {
+    for (int i = 0; i < 16; i++) {
+        uint64_t bit = 1ull << i;
+        if ((s->pending_release & bit) && t - s->down_ns[i] >= MIN_HOLD_NS) {
+            s->pending_release &= ~bit;
+            s->buttons &= ~bit;
+            trace("botón %#llx soltado tras la retención mínima", (unsigned long long)bit);
+        }
+    }
+}
 static int key_lx, key_ly, key_rx, key_ry;   // ejes del teclado: -1, 0, 1
 static int pad_lx, pad_ly, pad_rx, pad_ry;   // ejes del mando: −32767 … 32767
 
@@ -60,9 +129,11 @@ static void lifo_push(uint8_t *lifo, uint64_t buttons, int lx, int ly, int rx, i
     int32_t sticks[4] = {lx, ly, rx, ry};
     memcpy(st + 0x10, sticks, 16);
     u32w(st + 0x20, 1); // conectado
-    __atomic_store_n((uint64_t *)e, sampling, __ATOMIC_RELEASE);
+    uint64_t seq = seqlock_par ? sampling * 2 : sampling;
+    __atomic_store_n((uint64_t *)e, seqlock_par ? seq - 1 : seq, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy(e + 8, st, sizeof st);
-    __atomic_store_n((uint64_t *)e, sampling, __ATOMIC_RELEASE);
+    __atomic_store_n((uint64_t *)e, seq, __ATOMIC_RELEASE);
     u64w(lifo + 0x08, LIFO_ENTRIES);
     __atomic_store_n((uint64_t *)(lifo + 0x10), tail, __ATOMIC_RELEASE);
     __atomic_store_n((uint64_t *)(lifo + 0x18), count < LIFO_ENTRIES ? count + 1 : LIFO_ENTRIES, __ATOMIC_RELEASE);
@@ -72,7 +143,10 @@ static int clamp_axis(int v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : 
 
 static void publish(void) {
     pthread_mutex_lock(&lock);
-    uint64_t b = key_buttons | pad_buttons | script_buttons;
+    uint64_t ahora = now_ns();
+    source_expire(&keys, ahora);
+    source_expire(&pads, ahora);
+    uint64_t b = keys.buttons | pads.buttons | script_buttons;
     int lx = clamp_axis(pad_lx + key_lx * 32767), ly = clamp_axis(pad_ly + key_ly * 32767);
     int rx = clamp_axis(pad_rx + key_rx * 32767), ry = clamp_axis(pad_ry + key_ry * 32767);
     // botones virtuales de los sticks, como los pone el sistema
@@ -103,7 +177,11 @@ static void *sampler(void *arg) {
 
 void nx_input_attach(uint8_t *hid_shmem) {
     if (shmem) return;
+    const char *plataforma = getenv("NX_PLATAFORMA"); // lo pone NX2Linux según el NPDM/ExeFS
+    seqlock_par = plataforma && !strcmp(plataforma, "switch2");
     shmem = hid_shmem;
+    trace("memoria compartida de hid adjunta en %p (seqlock Switch 2: %s); npad 0 en +0x9a00, portátil en +0x31a00",
+          (void *)hid_shmem, seqlock_par ? "sí" : "no");
     uint8_t *p1 = shmem + NPAD_BASE;
     u32w(p1 + ST_STYLE, 1);                        // mando Pro (FullKey)
     u32w(p1 + ST_DEVICE_TYPE, 1);                  // HidDeviceTypeBits_FullKey
@@ -169,21 +247,45 @@ static void key_axes(void) {
 void nx_input_event(const void *event) {
     const SDL_Event *ev = event;
     pthread_mutex_lock(&lock);
+    uint64_t before = keys.buttons | pads.buttons;
     switch (ev->type) {
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        trace("ventana: foco %s", ev->type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "ganado" : "perdido");
+        if (ev->type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            // SDL puede no enviar KEY_UP al perder el foco. No dejes botones ni ejes pegados en
+            // la memoria HID del juego; también cancela las liberaciones diferidas pendientes.
+            memset(&keys, 0, sizeof keys);
+            memset(&pads, 0, sizeof pads);
+            key_lx = key_ly = key_rx = key_ry = 0;
+            pad_lx = pad_ly = pad_rx = pad_ry = 0;
+        }
+        break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
-        if (ev->type == SDL_EVENT_KEY_DOWN) key_buttons |= key_button(ev->key.key);
-        else key_buttons &= ~key_button(ev->key.key);
+        if (!ev->key.repeat)
+            trace("tecla %s %s -> botón %#llx", SDL_GetKeyName(ev->key.key),
+                  ev->type == SDL_EVENT_KEY_DOWN ? "abajo" : "arriba", (unsigned long long)key_button(ev->key.key));
+        source_set(&keys, key_button(ev->key.key), ev->type == SDL_EVENT_KEY_DOWN);
         key_axes();
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
+        trace("mando SDL %u conectado", (unsigned)ev->gdevice.which);
         SDL_OpenGamepad(ev->gdevice.which);
         break;
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-        pad_buttons |= pad_button(ev->gbutton.button);
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        // Este HLE expone un mando virtual agregado, no un LIFO por cada dispositivo SDL.
+        // Al desconectarse uno, vuelve a reposo para evitar botones/ejes retenidos.
+        trace("mando SDL %u desconectado; limpiando estado HID", (unsigned)ev->gdevice.which);
+        memset(&pads, 0, sizeof pads);
+        pad_lx = pad_ly = pad_rx = pad_ry = 0;
         break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        pad_buttons &= ~pad_button(ev->gbutton.button);
+        trace("mando botón %d %s -> botón %#llx", ev->gbutton.button,
+              ev->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? "abajo" : "arriba",
+              (unsigned long long)pad_button(ev->gbutton.button));
+        source_set(&pads, pad_button(ev->gbutton.button), ev->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
         int v = ev->gaxis.value;
@@ -192,14 +294,26 @@ void nx_input_event(const void *event) {
         case SDL_GAMEPAD_AXIS_LEFTY: pad_ly = -v; break;
         case SDL_GAMEPAD_AXIS_RIGHTX: pad_rx = v; break;
         case SDL_GAMEPAD_AXIS_RIGHTY: pad_ry = -v; break;
-        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: pad_buttons = v > 8000 ? pad_buttons | B_ZL : pad_buttons & ~(uint64_t)B_ZL; break;
-        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: pad_buttons = v > 8000 ? pad_buttons | B_ZR : pad_buttons & ~(uint64_t)B_ZR; break;
+        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: source_set(&pads, B_ZL, v > 8000); break;
+        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: source_set(&pads, B_ZR, v > 8000); break;
         }
         break;
     }
     }
+    uint64_t after = keys.buttons | pads.buttons;
     pthread_mutex_unlock(&lock);
     if (shmem) publish();
+    if (after != before && shmem) {
+        const uint8_t *lifo = shmem + NPAD_BASE + ST_FULLKEY_LIFO;
+        uint64_t tail = __atomic_load_n((const uint64_t *)(lifo + 0x10), __ATOMIC_ACQUIRE);
+        const uint8_t *e = lifo + 0x20 + tail * LIFO_ENTRY;
+        trace("publicado: botones %#llx -> %#llx; FullKey cola %llu número %llu muestreo %llu botones %#llx",
+              (unsigned long long)before, (unsigned long long)after, (unsigned long long)tail,
+              (unsigned long long)u64r(e), (unsigned long long)u64r(e + 8), (unsigned long long)u64r(e + 16));
+    } else if (after != before) {
+        trace("botones %#llx -> %#llx sin memoria de hid adjunta: el juego aún no la pidió",
+              (unsigned long long)before, (unsigned long long)after);
+    }
 }
 
 // ---------- guion de pruebas (NX_PULSAR) ----------

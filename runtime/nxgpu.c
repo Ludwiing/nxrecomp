@@ -140,17 +140,16 @@ void *nx_gpu_ptr_n(uint64_t gpu, uint64_t *avail) {
 }
 
 // ---------- syncpoints ----------
-#define NSYNCPT 192
-static uint32_t syncpts[NSYNCPT];
+static uint32_t syncpts[NX_SYNCPT_COUNT];
 static pthread_mutex_t sp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sp_cond = PTHREAD_COND_INITIALIZER;
 // nvdrv owns event slots; notify after releasing sp_lock to avoid lock inversion.
 extern void nx_nvdrv_syncpt_changed(uint32_t id) __attribute__((weak));
 
-uint32_t nx_syncpt_read(uint32_t id) { return id < NSYNCPT ? __atomic_load_n(&syncpts[id], __ATOMIC_ACQUIRE) : 0; }
+uint32_t nx_syncpt_read(uint32_t id) { return id < NX_SYNCPT_COUNT ? __atomic_load_n(&syncpts[id], __ATOMIC_ACQUIRE) : 0; }
 
 void nx_syncpt_incr(uint32_t id) {
-    if (id >= NSYNCPT) return;
+    if (id >= NX_SYNCPT_COUNT) return;
     pthread_mutex_lock(&sp_lock);
     __atomic_add_fetch(&syncpts[id], 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&sp_cond);
@@ -159,7 +158,7 @@ void nx_syncpt_incr(uint32_t id) {
 }
 
 int nx_syncpt_wait(uint32_t id, uint32_t threshold, int32_t timeout_us) {
-    if (id >= NSYNCPT) return 0;
+    if (id >= NX_SYNCPT_COUNT) return 0;
     pthread_mutex_lock(&sp_lock);
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);

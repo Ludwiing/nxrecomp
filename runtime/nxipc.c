@@ -168,6 +168,23 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
         static int traza = -1; // NX_TRAZA_IPC: cada comando, con su objeto y su resultado
         if (traza < 0) traza = getenv("NX_TRAZA_IPC") != NULL;
         if (traza) fprintf(stderr, "[ipc] %s %u → 0x%x\n", target->name, r.cmd, result);
+        // Traza acotada para diagnosticar el ABI de las llamadas de vídeo/syncpoint
+        // sin volcar buffers grandes ni datos de otros servicios.
+        if (getenv("NX_TRAZA_IPC_DATOS") &&
+            ((!strcmp(target->name, "nx2:gsv") && r.cmd == 991) ||
+             (!strcmp(target->name, "nx2:chatgsv") && r.cmd == 103) ||
+             (!strcmp(target->name, "nx2:syncpt") && r.cmd == 22) ||
+             (!strcmp(target->name, "nx2:viddec") && (r.cmd == 0 || r.cmd == 101 || r.cmd == 115 || r.cmd == 200)))) {
+            uint32_t cap = ((!strcmp(target->name, "nx2:gsv") && r.cmd == 991) ||
+                            (!strcmp(target->name, "nx2:chatgsv") && r.cmd == 103)) ? 128 : 64;
+            uint32_t n = r.in_size < cap ? r.in_size : cap;
+            flockfile(stderr);
+            fprintf(stderr, "[ipc-data] %s cmd=%u in_size=%u handles=%d objects=%d A/B/X/C=%d/%d/%d/%d data=",
+                    target->name, r.cmd, r.in_size, r.nin_handles, r.nin_objects, r.na, r.nb, r.nx, r.nc);
+            for (uint32_t i = 0; i < n; i++) fprintf(stderr, "%02x", r.in[i]);
+            fputc('\n', stderr);
+            funlockfile(stderr);
+        }
         if (result == R_CMIF_UNKNOWN_CMD)
             fprintf(stderr, "[RED] %s: comando %u no implementado\n", target->name, r.cmd);
     }
@@ -175,7 +192,7 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
     // Objetos nuevos: en un dominio van como ids; si no, cada uno es una sesión nueva (handle movido).
     uint32_t out_ids[8], nout_ids = 0;
     for (int k = 0; k < r.nout_objects; k++) {
-        if (s->domain && !tipc) {
+        if (s->domain && !tipc && !r.out_object_as_session[k]) {
             for (int j = 0; j < 64; j++)
                 if (!s->objs[j]) {
                     s->objs[j] = r.out_objects[k];
@@ -186,6 +203,10 @@ uint32_t nx_send_sync_request(Ctx *c, uint32_t handle) {
             r.out_move[r.nout_move++] = session_handle(r.out_objects[k]);
         }
     }
+    if (r.nout_objects && getenv("NX_TRAZA_IPC"))
+        fprintf(stderr, "[ipc-out] %s domain=%d tipc=%d session=%u ids=%u moved=%d handle=%u\n",
+                target ? target->name : "?", s->domain, tipc, r.out_object_as_session[0], nout_ids,
+                r.nout_move, r.nout_move ? r.out_move[0] : 0);
 
     // Respuesta
     memset(tls, 0, 0x100);
@@ -234,6 +255,14 @@ void nx_out64(NxRequest *r, uint64_t v) {
     r->out_size += 8;
 }
 void nx_out_object(NxRequest *r, ServiceObject *o) { r->out_objects[r->nout_objects++] = o; }
+void nx_out_session(NxRequest *r, ServiceObject *o) {
+    uint32_t k = (uint32_t)r->nout_objects;
+    nx_out_object(r, o);
+    if (k < sizeof r->out_object_as_session) r->out_object_as_session[k] = 1;
+}
+void nx_out_copy_session(NxRequest *r, ServiceObject *o) {
+    nx_out_copy_handle(r, session_handle(o));
+}
 void nx_out_copy_handle(NxRequest *r, uint32_t h) { r->out_copy[r->nout_copy++] = h; }
 void nx_out_bytes(NxRequest *r, const void *p, uint32_t n) {
     memcpy(r->out + r->out_size, p, n);

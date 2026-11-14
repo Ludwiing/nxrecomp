@@ -218,6 +218,38 @@ static void join(u32 h) {
     svc_handle_op(0x16, h);
 }
 
+// Horizon no escribe la pila del hilo durante una SVC (NXnative threads.md, «SVCs leave the stack below sp
+// untouched»: los recolectores que escanean la pila lo necesitan). Se llenan 512 bytes debajo de sp, se hacen SVC sin
+// ninguna llamada de por medio (sin marcos nuevos) y se revisa el patrón.
+__attribute__((noinline)) static int bajo_sp_intacto(void) {
+    u64 sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    volatile u64 *p = (volatile u64 *)(sp - 512);
+    for (int i = 0; i < 64; i++) p[i] = 0xC0FFEE0000000000ull | (u64)i;
+    register u64 x0 __asm__("x0");
+    register u64 x1 __asm__("x1");
+    register u64 x2 __asm__("x2");
+    register u64 x3 __asm__("x3");
+    x0 = 0;
+    __asm__ volatile("svc #0x0b" : "+r"(x0) : : "memory");                       // SleepThread(0): ceder
+    __asm__ volatile("svc #0x1e" : "=r"(x0) : : "memory");                       // GetSystemTick
+    x1 = 24, x2 = 0xFFFF8001, x3 = 0;
+    __asm__ volatile("svc #0x29" : "=r"(x0), "+r"(x1) : "r"(x2), "r"(x3) : "memory");   // GetInfo
+    x0 = 1000;                                                                  // SleepThread(1 µs): bloquea
+    __asm__ volatile("svc #0x0b" : "+r"(x0) : : "memory");
+    for (int i = 0; i < 64; i++)
+        if (p[i] != (0xC0FFEE0000000000ull | (u64)i)) return 0;
+    return 1;
+}
+
+// GetInfo 24 (FreeThreadCount): un hilo que espera un evento ocupa el límite mientras vive
+static u32 libre_ev_r;
+static void espera_evento(void *arg) {
+    (void)arg;
+    s32 idx;
+    svc_wait_sync(&idx, &libre_ev_r, 1, -1);
+}
+
 // 1. contador protegido por mutex
 static u32 mtx;
 static u64 counter;
@@ -320,6 +352,21 @@ int nx_main(u64 config, u32 main_thread) {
     u64 info;
     svc_get_info(&info, 4, 0xFFFF8001, 0);
     pr("GetInfo(región del heap) coincide con SetHeapSize: %s\n", info == (u64)heap ? "sí" : "no");
+
+    pr("SVC sin tocar la pila debajo de sp: %s\n", bajo_sp_intacto() ? "sí" : "no");
+
+    u64 libres0, libres1, libres2, nada;
+    u32 libre_ev_w;
+    svc_create_event(&libre_ev_w, &libre_ev_r);
+    svc_get_info(&libres0, 24, 0xFFFF8001, 0);
+    u32 espera = spawn(espera_evento, 0, 0);
+    svc_get_info(&libres1, 24, 0xFFFF8001, 0);
+    svc_handle_op(0x11, libre_ev_w);
+    join(espera);
+    svc_get_info(&libres2, 24, 0xFFFF8001, 0);
+    pr("GetInfo(hilos libres): hay: %s, un hilo vivo resta 1: %s, al terminar vuelve: %s, subtipo 1: 0x%x\n",
+       libres0 > 0 ? "sí" : "no", libres1 == libres0 - 1 ? "sí" : "no", libres2 == libres0 ? "sí" : "no",
+       svc_get_info(&nada, 24, 0xFFFF8001, 1));
 
     u32 t[4];
     for (int i = 0; i < 4; i++) t[i] = spawn(count_with_mutex, 0, 0);

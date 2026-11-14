@@ -12,7 +12,7 @@ extern int sdk_counter;
 extern void funcion_que_no_existe(void);
 extern void opcional_ausente(void) __attribute__((weak));
 
-static int main_inits;
+static volatile int main_inits; // volatile: que clang no evalúe los constructores al compilar (GlobalOpt) y el runtime tenga que correrlos
 __attribute__((constructor)) static void init_a(void) { main_inits += 1; }
 __attribute__((constructor)) static void init_b(void) { main_inits = main_inits * 10 + 2; }
 

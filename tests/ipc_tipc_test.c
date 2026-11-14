@@ -8,6 +8,7 @@
 
 static void *handles[32];
 static unsigned next_handle = 1;
+static ServiceObject moved_session;
 void nx_kernel_lock(void) {}
 void nx_kernel_unlock(void) {}
 uint32_t nx_handle_new(int type, void *object, int writable) {
@@ -34,6 +35,15 @@ static uint32_t service(ServiceObject *self, NxRequest *r) {
         return 0;
     }
     if (r->cmd == 7) { nx_out32(r, 0x11223344); return 0; }
+    if (r->cmd == 8) { nx_out_session(r, &moved_session); return 0; }
+    return NX_R_UNKNOWN_CMD;
+}
+static uint32_t moved_session_service(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    if (r->cmd == 4 && r->in_size == sizeof(uint64_t)) {
+        nx_out64(r, nx_in64(r, 0));
+        return 0;
+    }
     return NX_R_UNKNOWN_CMD;
 }
 ServiceObject *nx_service_sm(void) {
@@ -41,6 +51,7 @@ ServiceObject *nx_service_sm(void) {
     return &object;
 }
 int main(void) {
+    moved_session = (ServiceObject){"test-moved-session", moved_session_service, NULL};
     uint32_t tls[64] = {0};
     Ctx ctx = {.tpidrro = (uintptr_t)tls};
     uint64_t handle;
@@ -59,6 +70,19 @@ int main(void) {
     tls[0] = 23;
     assert(nx_send_sync_request(&ctx, child) == 0);
     assert(tls[1] == 2 && tls[2] == 0 && tls[3] == 0x11223344);
+    // A CMIF-returned object becomes a moved session handle that accepts TIPC.
+    memset(tls, 0, sizeof tls);
+    tls[0] = 4; tls[1] = 10; memcpy(tls + 4, "SFCI", 4); tls[6] = 8;
+    assert(nx_send_sync_request(&ctx, handle) == 0);
+    uint32_t moved = tls[3];
+    assert(moved && (tls[1] & (1u << 31)));
+    uint64_t tick = 0x123456789ABCDEF0ull;
+    memset(tls, 0, sizeof tls);
+    tls[0] = 20; tls[1] = 2; memcpy(tls + 2, &tick, sizeof tick); // TIPC command 4
+    assert(nx_send_sync_request(&ctx, moved) == 0);
+    uint64_t echoed = 0;
+    memcpy(&echoed, &tls[3], sizeof echoed);
+    assert(tls[1] == 3 && tls[2] == 0 && echoed == tick);
     memset(tls, 0, sizeof tls);
     tls[0] = 116;
     assert(nx_send_sync_request(&ctx, child) == 0);
@@ -87,6 +111,21 @@ int main(void) {
     assert(nx_send_sync_request(&ctx, handle) == 0);
     assert(!memcmp(tls + 8, "SFCO", 4));
     assert(tls[10] == 0 && tls[12] == 0x11223344);
+    // Even when returned from a CMIF domain object, a raw TIPC session stays
+    // a moved session handle instead of becoming a domain object ID.
+    memset(tls, 0, sizeof tls);
+    tls[0] = 6; tls[1] = 12;
+    tls[4] = 1 | (16 << 16); tls[5] = 1;
+    memcpy(tls + 8, "SFCI", 4); tls[9] = 1; tls[10] = 8;
+    assert(nx_send_sync_request(&ctx, handle) == 0);
+    uint32_t domain_moved = tls[3];
+    assert(domain_moved && (tls[1] & (1u << 31)));
+    memset(tls, 0, sizeof tls);
+    tls[0] = 20; tls[1] = 2; memcpy(tls + 2, &tick, sizeof tick);
+    assert(nx_send_sync_request(&ctx, domain_moved) == 0);
+    echoed = 0;
+    memcpy(&echoed, &tls[3], sizeof echoed);
+    assert(tls[1] == 3 && tls[2] == 0 && echoed == tick);
     memset(tls, 0, sizeof tls);
     tls[0] = 7; tls[1] = 8; memcpy(tls + 4, "SFCI", 4); tls[6] = 2;
     assert(nx_send_sync_request(&ctx, handle) == 0);

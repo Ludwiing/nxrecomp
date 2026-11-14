@@ -20,7 +20,7 @@ import struct
 
 import jumptable
 from a64 import bits, decode
-from program import IMPORT_BASE, load_program
+from program import IMPORT_BASE, load_program, modulos_ro_de
 
 LINES_PER_FILE = 150000
 FUNCS_PER_BLOCK = 1000   # funciones por bloque de emisión (un archivo, o varios si pasa de LINES_PER_FILE líneas)
@@ -145,12 +145,12 @@ def fname(a):
     return f"f_{a:x}"
 
 
-def emit_function(mod, f, strong, out, stats):
+def emit_function(mod, f, strong, out, stats, name=None):
     body = walk(mod, f, strong, sorted(strong))
     for i in body.values():
         if i.kind == "br":
             stats["br_tabla" if i.targets else "br_indirecto"].add(i.pc)
-    out.append(f"void {fname(f)}(Ctx *c) {{")
+    out.append(f"void {name or fname(f)}(Ctx *c) {{")
     # Dirección de retorno con la que se entró: un RET con otra (código que escribe x30 a mano,
     # como el crt0 de libnx que pone exit en x30 y salta a main) continúa en esa dirección.
     out.append("    const uint64_t lr0 = nx_enter(c);")
@@ -242,13 +242,19 @@ def cuerpo_sustituida(nombre, que):
     if tipo == "aviso":
         return (f"void nxhle_aviso(Ctx *c, const char *simbolo);\n"
                 f"void {nombre}(Ctx *c) {{ nx_enter(c); nxhle_aviso(c, \"{v}\"); }}")
+    if tipo == "wrap":
+        _, funcion = v
+        return (f"void {funcion}(Ctx *c, NxFn original);\n"
+                f"void {nombre}_original(Ctx *c);\n"
+                f"void {nombre}(Ctx *c) {{ nx_enter(c); {funcion}(c, {nombre}_original); }}")
     return f"void {v}(Ctx *c);\nvoid {nombre}(Ctx *c) {{ nx_enter(c); {v}(c); }}"
 
 
 def leer_sustituciones(rutas, simbolos, en_texto):
     """{dirección: (tipo, valor)} de los archivos de sustituciones, en orden (un archivo posterior manda sobre uno
-    anterior). Cada línea: "símbolo funcion_c", "símbolo =VALOR" (devuelve VALOR), "símbolo !" (devuelve 0 y avisa la
-    primera vez). Un símbolo que termina en * es un prefijo: vale para todas las funciones del juego que empiezan así,
+    anterior). Cada línea: "símbolo funcion_c", "símbolo @funcion_c" (envoltorio que recibe el cuerpo original como
+    NxFn), "símbolo =VALOR" (devuelve VALOR), "símbolo !" (devuelve 0 y avisa la primera vez). Un símbolo que termina
+    en * es un prefijo: vale para todas las funciones del juego que empiezan así,
     salvo las que tienen su propia línea exacta. Devuelve también los símbolos exactos que el juego no tiene."""
     exactas, prefijos, faltan = {}, [], []
     for ruta in rutas:
@@ -263,6 +269,8 @@ def leer_sustituciones(rutas, simbolos, en_texto):
                 que = ("aviso", None)
             elif acc.startswith("="):
                 que = ("valor", int(acc[1:], 0) & 0xFFFFFFFFFFFFFFFF)
+            elif acc.startswith("@") and acc[1:].isidentifier():
+                que = ("wrap", (None, acc[1:]))
             elif acc.isidentifier():
                 que = ("c", acc)
             else:
@@ -304,6 +312,8 @@ def emitir_bloque(k):
     for f in bloques[k]:
         if f in sustituidas:
             # nx_enter consume un salto de cola pendiente: el juego suele llegar aquí con B/BR.
+            if sustituidas[f][0] == "wrap":
+                emit_function(prog, f, strong, buf, stats, name=f"{fname(f)}_original")
             buf.append(cuerpo_sustituida(fname(f), sustituidas[f]))
         else:
             desde = len(buf)
@@ -344,9 +354,11 @@ def main():
     ap.add_argument("--pistas", help="archivo con direcciones (una por línea) que también son funciones: las "
                     "que el runtime anotó en NX_PISTAS al saltar a código sin recompilar")
     ap.add_argument("--sustituir", action="append", default=[],
-                    help="archivo con líneas \"símbolo funcion_c\" (la función del juego con ese símbolo no se "
-                    "recompila: su cuerpo llama a void funcion_c(Ctx *) del runtime, HLE), \"símbolo =VALOR\" o "
+                    help="archivo con líneas \"símbolo funcion_c\" (HLE), \"símbolo @funcion_c\" (envuelve el "
+                    "cuerpo original recompilado), \"símbolo =VALOR\" o "
                     "\"símbolo !\"; un símbolo terminado en * es un prefijo. Se puede repetir (el último manda)")
+    ap.add_argument("--modulos-ro", help="carpeta con los NRO que el juego arma y carga con nn::ro::LoadModule "
+                    "(<sha256>.nro, los vuelca el runtime con NX_VOLCAR_NRO): se traducen detrás de los demás módulos")
     ap.add_argument("--progreso", action="store_true", help="líneas \"progreso i/n\" al escribir las funciones (para la app)")
     ap.add_argument("--hilos", type=int, default=0, help="procesos que escriben el C (por defecto, según núcleos y memoria)")
     ap.add_argument("--sin-optimizar-desde", type=int, default=SIN_OPTIMIZAR_DESDE,
@@ -355,7 +367,7 @@ def main():
     TRACE = args.traza
     SIN_OPTIMIZAR_DESDE = args.sin_optimizar_desde
 
-    prog = load_program(args.modulos, args.base)
+    prog = load_program(args.modulos, args.base, modulos_ro_de(args.modulos_ro))
     print("módulos:")
     print(prog.summary())
     if prog.npdm:
@@ -377,9 +389,10 @@ def main():
         for sim in faltan:
             print(f"sustituir: el símbolo {sim} no existe en el juego (se ignora)")
         pistas.update(sustituidas)
-        cuenta = {t: sum(1 for q in sustituidas.values() if q[0] == t) for t in ("c", "valor", "aviso")}
+        cuenta = {t: sum(1 for q in sustituidas.values() if q[0] == t) for t in ("c", "wrap", "valor", "aviso")}
         print(f"sustituir: {len(sustituidas)} funciones del juego reemplazadas por el runtime "
-              f"({cuenta['c']} en C, {cuenta['valor']} con un valor fijo, {cuenta['aviso']} con aviso)")
+              f"({cuenta['c']} HLE, {cuenta['wrap']} envueltas, {cuenta['valor']} con valor fijo, "
+              f"{cuenta['aviso']} con aviso)")
     strong, entries = discover(prog, prog.entry_points() | set(boot["inits"]) | pistas)
 
     os.makedirs(args.output, exist_ok=True)
@@ -447,6 +460,19 @@ def main():
                    f"0x{m.img.ro[0]:x}ull, 0x{m.img.rw[0]:x}ull }},")
     out.append("};")
     out.append(f"const int nx_nmodules = {len(prog.modules)};")
+    # Módulos de nn::ro ya traducidos (runtime/nxsvc_ldr.c los entrega en MapManualLoadModuleMemory) y, si hay
+    # alguno, los símbolos globales de los módulos del arranque ordenados por nombre: la búsqueda que rtld deja en
+    # nn::ro::detail::g_pLookupGlobalAutoFunctionPointer y con la que el SDK enlaza las importaciones del NRO.
+    ro = [(k, m) for k, m in enumerate(prog.modules) if m.dinamico]
+    out.append("const NxModuloRo nx_modulos_ro[] = {")
+    out += [f"    {{ {k}, {{ {', '.join(f'0x{b:02x}' for b in m.img.sha256)} }} }}," for k, m in ro] or ["    { -1, { 0 } },"]
+    out.append("};")
+    out.append(f"const int nx_nmodulos_ro = {len(ro)};")
+    globales = sorted(prog.globales.items(), key=lambda kv: kv[0].encode()) if ro else []
+    out.append("const NxSymbol nx_simbolos_globales[] = {")
+    out += [f"    {{ {c_string(n)}, 0x{a:x}ull }}," for n, a in globales] or ["    { 0, 0 },"]
+    out.append("};")
+    out.append(f"const int nx_nsimbolos_globales = {len(globales)};")
     syms = sorted((a, n) for n, a in prog.symbols.items() if prog.in_text(a))
     out.append("const NxSymbol nx_symbols[] = {")
     out += [f"    {{ {c_string(n)}, 0x{a:x}ull }}," for a, n in syms] or ["    { 0, 0 },"]
@@ -465,6 +491,16 @@ def main():
     np = prog.npdm or {}
     out.append(f"const uint64_t nx_system_resource = 0x{np.get('recurso del sistema', 0):x}ull;")
     out.append(f"const uint64_t nx_program_id = 0x{np.get('programa', 0):x}ull;")
+    # Entradas de la GOT de los hooks de hilo de nnmusl (0 = no hay): las usa nx_thread_create (HLE de Switch 2).
+    (hook_ini, hook_fin), avisos_hooks = prog.thread_hook_gots()
+    for aviso in avisos_hooks:
+        print(f"[RED] hooks de hilo: {aviso}")
+    out.append(f"const uint64_t nx_thread_hook_got[2] = {{ 0x{hook_ini:x}ull, 0x{hook_fin:x}ull }};")
+    # Las variables nn::ro::detail::g_p* que rtld rellena al enlazar (runtime/nxsvc_ldr.c): {índice, dirección}.
+    ro = prog.rtld_ro_vars()
+    out.append("const uint64_t nx_rtld_ro_vars[][2] = {" +
+               (", ".join(f"{{ {k}, 0x{a:x}ull }}" for k, a in ro) if ro else "{ 0, 0 }") + "};")
+    out.append(f"const int nx_nrtld_ro_vars = {len(ro)};")
     out.append(f"const int nx_main_priority = {np.get('prioridad', 44)}, nx_main_core = {np.get('núcleo', 0)};")
     out.append("")
     out.append("static __thread uint64_t destino_malo;")
@@ -483,7 +519,7 @@ def main():
     out.append("}")
     # Cada llamada indirecta es un punto de cesión del núcleo virtual (nxkern.c): una lectura si nadie espera.
     out.append("void nx_dispatch(Ctx *c, uint64_t a) { if (__builtin_expect(nx_core_pending, 0)) nx_core_check(); "
-               "nx_buscar(a)(c); }")
+               "if (nx_guest_host_call(c, a)) return; nx_buscar(a)(c); }")
     escribir("programa.c", "\n".join(out) + "\n")
     for viejo in os.listdir(args.output):   # lo de una emisión anterior que ya no corresponde
         if viejo.endswith((".c", ".h", ".bin")) and viejo not in escritos:

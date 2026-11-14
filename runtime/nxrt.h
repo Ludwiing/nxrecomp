@@ -85,9 +85,28 @@ extern const int nx_ninits;
 extern const uint64_t nx_main_addr, nx_entry_addr, nx_main_stack;
 extern const uint64_t nx_system_resource, nx_program_id; // del main.npdm (0 si no hay)
 extern const int nx_main_priority, nx_main_core;
+// Entradas de la GOT de los hooks de hilo de nnmusl (recomp/program.py thread_hook_gots). Débil: el C generado
+// antes de este cambio no la define, y entonces no se llama ningún hook.
+extern const uint64_t nx_thread_hook_got[2] __attribute__((weak));
+// Variables nn::ro::detail::g_p* que rtld rellena al enlazar: {índice en recomp/program.py RTLD_RO, dirección}.
+// Débiles por la misma razón que nx_thread_hook_got.
+extern const uint64_t nx_rtld_ro_vars[][2] __attribute__((weak));
+extern const int nx_nrtld_ro_vars __attribute__((weak));
+// Módulos de nn::ro traducidos de antemano (recomp/nxrecomp.py --modulos-ro): índice en nx_modules y SHA-256 del NRO
+// tal como el juego lo arma; y los símbolos globales de los módulos del arranque, ordenados por nombre (strcmp), para
+// la búsqueda que rtld publica en nn::ro. Débiles: el C generado antes de este cambio no los define.
+typedef struct NxModuloRo {
+    int modulo;
+    unsigned char sha256[32];
+} NxModuloRo;
+extern const NxModuloRo nx_modulos_ro[] __attribute__((weak));
+extern const int nx_nmodulos_ro __attribute__((weak));
+extern const NxSymbol nx_simbolos_globales[] __attribute__((weak));
+extern const int nx_nsimbolos_globales __attribute__((weak));
 extern const unsigned char nx_romfs_data[]; // el RomFS que venía dentro del NRO (homebrew)
 extern const uint64_t nx_romfs_size;
 void nx_dispatch(Ctx *c, uint64_t addr);
+int nx_guest_host_call(Ctx *c, uint64_t addr);
 extern volatile int nx_core_pending;  // nxkern.c: algún hilo debe ceder su núcleo virtual
 void nx_core_check(void);              // punto de cesión (SVC y llamadas indirectas)
 extern __thread int nx_en_host;       // nxkern.c: >0 mientras el hilo está dentro del runtime (no se interrumpe)
@@ -108,11 +127,23 @@ void nx_map_fixed(uint64_t addr, uint64_t size, const char *what);
 uint64_t nx_now_ns(void);
 uint64_t nx_ticks(void);
 void nx_svc(Ctx *c, uint32_t imm);
+void nx_thread_create(Ctx *c);
+void nx_thread_create_core(Ctx *c);
+void nx_thread_start(Ctx *c);
+void nx_thread_wait(Ctx *c);
+void nx_thread_try_wait(Ctx *c);
+void nx_thread_destroy(Ctx *c);
 uint64_t nx_mrs(Ctx *c, int reg);
 void nx_msr(Ctx *c, int reg, uint64_t v);
 void nx_dc_zva(Ctx *c, uint64_t addr);
 __attribute__((noreturn)) void nx_trap(Ctx *c, uint64_t pc, uint32_t word, const char *why);
 __attribute__((noreturn)) void nx_bad_jump(Ctx *c, uint64_t from, uint64_t to);
+// Diagnóstico sin segundo fallo (nxrt.c): lectura de memoria del invitado que devuelve 0 en vez de SIGSEGV, y la
+// cadena de marcos (fp, lr) de la pila del invitado.
+int nx_leer_seguro(uint64_t a, void *out, size_t n);
+// "módulo+0xoff (símbolo+0xoff)" de una dirección del invitado, con nx_modules y nx_symbols; "?" fuera de los módulos.
+const char *nx_describir_dir(uint64_t a, char *buf, size_t n);
+void nx_pila_invitado(const Ctx *c);
 __attribute__((noreturn)) void nx_import_call(Ctx *c, int index);
 uint64_t nx_symbol(const char *name);
 void nx_install_crash_handler(void);
@@ -153,6 +184,30 @@ NX_LD(8)
 NX_LD(16)
 NX_LD(32)
 NX_LD(64)
+
+// LDXR/LDAXR participate in an exclusive load/store pair. The value read here
+// is later compared by an atomic STXR compare-exchange, so an ordinary memcpy
+// load would race with another guest thread's atomic store in the C memory
+// model. Use sequentially consistent loads; this is stronger than the relaxed
+// LDXR form and also supplies LDAXR's acquire ordering.
+#define NX_EXCL_LD(bits)                                                                         \
+    static inline uint##bits##_t nx_excl_ld##bits(uint64_t a) {                                 \
+        return __atomic_load_n((uint##bits##_t *)(uintptr_t)a, __ATOMIC_SEQ_CST);               \
+    }
+NX_EXCL_LD(8)
+NX_EXCL_LD(16)
+NX_EXCL_LD(32)
+NX_EXCL_LD(64)
+
+// LDXP of two X registers and STXP operate on one 128-bit exclusive region.
+// A zero-to-zero CAS supplies an indivisible snapshot on hosts without a native
+// 128-bit load. The guest exclusive monitor is represented by the captured
+// value and address, so the unchanged host value preserves that model.
+static inline unsigned __int128 nx_excl_ld128(uint64_t a) {
+    unsigned __int128 *p = (unsigned __int128 *)(uintptr_t)a;
+    return __sync_val_compare_and_swap(p, 0, 0);
+}
+
 // STXR: guarda solo si la memoria todavía tiene el valor que leyó LDXR.
 #define NX_CAS(bits)                                                                            \
     static inline int nx_cas##bits(uint64_t a, uint64_t expected, uint64_t value) {            \

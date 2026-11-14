@@ -20,7 +20,7 @@ from nso import load_module  # noqa: E402
 CONOCIDOS = """
 acc:u0 acc:u1 acc:aa acc:su am apm apm:p appletAE appletOE aoc:u arp:r audin:u audout:u audrec:u audren:u
 audctl auddev bcat:u bcat:a bcat:m bcat:s bsd:u bsd:s bsd:a btm:u caps:a caps:c caps:su caps:u caps:ss csrng
-ectx:aw erpt:c err:u fatal:u friends:u friends:v fsp-srv grc:c hid hid:dbg hid:sys hidbus hwopus irs lbl ldn:u
+ectx:aw erpt:c err:u fatal:u friend:u friends:u friends:v fsp-srv grc:c hid hid:dbg hid:sys hidbus hwopus irs lbl ldn:u
 lm lp2p:app mii:e mii:u mm:u nfc:user nfp:user ngc:u ngct:u nifm:u nifm:a nifm:s nim:eca notif:a npns:u ns:am2
 ns:ec ns:rid ns:rt ns:su ns:vm ns:web ns:ro nsd:u olsc:u ovln:rcv pctl pctl:a pctl:r pctl:s pdm:ntfy pdm:qry pl:u
 pl:s prepo:a prepo:a2 prepo:s prepo:u psc:m psm set set:sys sfdnsres spl: ssl time:u time:a time:s vi:u vi:s vi:m

@@ -21,6 +21,7 @@
 #include "nvn_pool_index.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_phys_mem.h"
 #include "wb_merge_spv.h"
 #include "platform/platform.h"
 
@@ -191,17 +192,18 @@ static int alloc_physical(VkCtx *c, PoolRec *r) {
     if (rb.alignment > align) align = rb.alignment;
     if (ri.memoryRequirements.alignment > align) align = ri.memoryRequirements.alignment;
     VkMemoryRequirements req = {.size = (rb.size + align - 1) & ~(align - 1), .alignment = align, .memoryTypeBits = bits};
-    VmaAllocationCreateInfo aci = {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-    if ((res = vmaAllocateMemory(c->vma, &req, &aci, &r->alloc, NULL)) != VK_SUCCESS ||
+    int device_local = 0;
+    if ((res = vk_phys_mem_alloc(c->vma, &req, &r->alloc, &device_local)) != VK_SUCCESS ||
         (res = vmaBindBufferMemory(c->vma, r->alloc, r->buf)) != VK_SUCCESS) {
-        rt_log("vk: physical pool of %#llx bytes: device-local allocation failed (%d)", (unsigned long long)r->size, (int)res);
+        rt_log("vk: physical pool of %#llx bytes: allocation failed (%d)", (unsigned long long)r->size, (int)res);
         if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
         r->alloc = NULL;
         return 0;
     }
+    if (!device_local)
+        rt_log("vk: physical pool of %#llx bytes: VRAM full, placed in system memory (slower)", (unsigned long long)r->size);
     if (vk_fix_zero()) {   // Switch pool memory starts zeroed; once per pool, not per image placed in it
         VkCommandBuffer cb = vk_upload_begin();
         vkCmdFillBuffer(cb, r->buf, 0, VK_WHOLE_SIZE, 0);

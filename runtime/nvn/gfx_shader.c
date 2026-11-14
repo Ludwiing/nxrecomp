@@ -42,6 +42,8 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "nvn2_program.h"
+#include "sm86_propia.h"
 #include "platform/platform.h"
 
 #define CONTROL_SIZE 0x880
@@ -51,7 +53,7 @@
 #define KEY_VERSION 4                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids);
                                                            // translator changes are covered by its identity
-#define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
+#define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
                                                            // or the program hash changes (drops every stored input)
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
 #define USE_VERSION 1
@@ -122,6 +124,8 @@ static uint8_t xlate_id[32];                               // translator identit
 static int host_f64 = 1, host_zero_locals, host_set;                         // gfx_shader_set_host
 static uint32_t host_sbuf, host_sg[3] = {32, 32, 32}, host_gather;
 static PlatOnce paths_once = PLAT_ONCE_INIT;
+static int sm86_propia;                                    // NX_SM86_BAJADA=propia (sm86_propia.h)
+static char sm86_script[PATH_CAP];                         // tools/sm86_programa.py, "" if not found
 
 // ---- small helpers
 
@@ -276,6 +280,37 @@ static void xlate_identity(void) {
            xlate_id[3], xlate_id[4], xlate_id[5], xlate_id[6], xlate_id[7], how);
 }
 
+// NX_SM86_BAJADA=propia: NVN2 vertex, fragment and compute programs are lowered to Maxwell by nxrecomp's own
+// tools/sm86_programa.py before the translator sees them (sm86_propia.h). The lowering's sources are mixed into the
+// translator identity, so its SPIR-V never shares cache keys with the default path (nxnative's Ampere decoder).
+static void sm86_identity(void) {
+    sm86_propia = sm86_propia_activa();
+    if (!sm86_propia) return;
+    size_t n = 0;
+    uint8_t *huella = sm86_propia_script(sm86_script, sizeof sm86_script) ? sm86_propia_huella(sm86_script, &n) : NULL;
+    static const char tag[] = "NXSM86 propia";
+    uint8_t *buf = malloc(32 + sizeof tag + n);
+    if (!buf) {
+        sm86_script[0] = 0;                                // every NVN2 translation then fails with the reason
+        free(huella);
+        return;
+    }
+    memcpy(buf, xlate_id, 32), memcpy(buf + 32, tag, sizeof tag);
+    if (huella) memcpy(buf + 32 + sizeof tag, huella, n);
+    rt_sha256(buf, 32 + sizeof tag + n, xlate_id);
+    free(buf);
+    if (!huella) {
+        rt_log("gfx_shader: NX_SM86_BAJADA=propia but %s: NVN2 vertex/fragment/compute shaders will fail",
+               sm86_script[0] ? "a lowering source (tools/sm86*.py, mxisa.json, build/sm86_spec.json) is missing"
+                              : "tools/sm86_programa.py was not found (NX_SM86_PROGRAMA)");
+        sm86_script[0] = 0;
+    } else {
+        rt_log("gfx_shader: NX_SM86_BAJADA=propia: NVN2 vertex/fragment/compute lowered by %s; task/mesh unchanged",
+               sm86_script);
+    }
+    free(huella);
+}
+
 // The repository root is the nearest parent of totk.exe that holds build/xlate/totk_xlate.exe. The shader cache lives
 // next to totk.exe, so every build dir has its own (as the pipeline cache, vk_pipeline.c cache_path_init).
 static void use_preload_start(void);
@@ -305,6 +340,7 @@ static void init_paths(void *param) {
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s/shader-cache", exe_dir);
     xlate_identity();
+    sm86_identity();
     if (cache_dir[0]) pack_open();
     use_preload_start();
     return;
@@ -741,9 +777,10 @@ static void reflect_spirv(GfxShader *s) {
     uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
     // per id: location + 1 (0 = none), component flag, scalar/vector description of types, pointee of pointers
     int32_t *loc = calloc(bound, sizeof *loc);
-    uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1);
-    uint32_t *pointee = calloc(bound, sizeof *pointee);
-    if (!loc || !packed || !ttype || !tcomps || !pointee) goto out;
+    uint8_t *packed = calloc(bound, 1), *ttype = calloc(bound, 1), *tcomps = calloc(bound, 1), *image_type = calloc(bound, 1);
+    uint32_t *pointee = calloc(bound, sizeof *pointee), *elem = calloc(bound, sizeof *elem), *binding = malloc((size_t)bound * sizeof *binding);
+    if (!loc || !packed || !ttype || !tcomps || !image_type || !pointee || !elem || !binding) goto out;
+    for (uint32_t id = 0; id < bound; id++) binding[id] = UINT32_MAX;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) break;
@@ -754,6 +791,7 @@ static void reflect_spirv(GfxShader *s) {
         } else if (op == OP_DECORATE && len >= 4 && id < bound) {
             if (a[1] == DEC_LOCATION) loc[id] = (int32_t)a[2] + 1;
             else if (a[1] == DEC_COMPONENT) packed[id] = 1;
+            else if (a[1] == 33) binding[id] = a[2]; // DecorationBinding
         } else if (op == OP_TYPE_INT && len >= 4 && id < bound) {
             ttype[id] = a[2] ? GFX_TYPE_SINT : GFX_TYPE_UINT, tcomps[id] = 1;
         } else if (op == OP_TYPE_FLOAT && len >= 3 && id < bound) {
@@ -761,11 +799,22 @@ static void reflect_spirv(GfxShader *s) {
         } else if (op == OP_TYPE_VECTOR && len >= 4 && id < bound && a[1] < bound) {
             ttype[id] = ttype[a[1]], tcomps[id] = (uint8_t)a[2];
         } else if (op == OP_TYPE_ARRAY && len >= 4 && id < bound && a[1] < bound) {
-            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]];   // element type (arrayed interface blocks)
+            ttype[id] = ttype[a[1]], tcomps[id] = tcomps[a[1]], elem[id] = a[1]; // interface arrays and descriptor arrays
+        } else if (op == 25 && len >= 9 && id < bound && a[1] < bound && a[6] == 2) { // storage OpTypeImage
+            image_type[id] = (uint8_t)(ttype[a[1]] + 1);
+        } else if (op == 27 && len >= 3 && id < bound && a[1] < bound) { // OpTypeSampledImage
+            image_type[id] = image_type[a[1]];
         } else if (op == OP_TYPE_POINTER && len >= 4 && id < bound) {
             pointee[id] = a[2];
         } else if (op == OP_VARIABLE && len >= 4) {
             uint32_t type = a[0], var = a[1], sc = a[2];
+            if (sc == 0 && var < bound && type < bound && binding[var] != UINT32_MAX) {
+                uint32_t t = pointee[type];
+                for (int depth = 0; depth < 8 && t < bound && elem[t]; depth++) t = elem[t];
+                uint8_t numeric = t < bound ? image_type[t] : 0;
+                if (numeric) for (int r = 0; r < s->nres[GFX_RES_IMG]; r++)
+                    if (s->res[GFX_RES_IMG][r].binding == binding[var]) s->res[GFX_RES_IMG][r].sampled_type = numeric;
+            }
             if ((sc == SC_INPUT || sc == SC_OUTPUT) && var < bound && type < bound && loc[var] > 0 && loc[var] <= 32) {
                 int l = loc[var] - 1;
                 uint32_t t = pointee[type] < bound ? pointee[type] : 0;
@@ -777,7 +826,7 @@ static void reflect_spirv(GfxShader *s) {
         i += len;
     }
 out:
-    free(loc), free(packed), free(ttype), free(tcomps), free(pointee);
+    free(loc), free(packed), free(ttype), free(tcomps), free(image_type), free(pointee), free(elem), free(binding);
 }
 
 // Every gradient sample (OpImageSampleExplicitLod with Grad) whose two gradients are each built from two components gets
@@ -846,7 +895,8 @@ static void reflect(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS :
+               !strcmp(stage, "ts") ? GFX_STAGE_TASK : !strcmp(stage, "ms") ? GFX_STAGE_MESH : GFX_STAGE_VS;
     s->mvprev_banks = (uint32_t)json_int(js, js + strlen(js), "mvprev_banks", 0);
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
@@ -1060,6 +1110,8 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     for (int i = 0; i < 3; i++) *p++ = (uint8_t)a->local[i], *p++ = (uint8_t)(a->local[i] >> 8);
     put_u32(&p, a->shared_bytes);
     *p++ = (uint8_t)(a->depth_minus_w | (a->mvprev ? 0x80 : 0));
+    *p++ = a->mesh_has_task;
+    *p++ = a->mesh_nv;
     return (size_t)(p - o);
 }
 
@@ -1092,6 +1144,8 @@ static void mask_answers(const GfxShaderAnswers *a, const UseMask *m, GfxShaderA
     memcpy(o->local, a->local, sizeof o->local);
     o->shared_bytes = a->shared_bytes;
     o->mvprev = a->mvprev;   // another translation, not an answer the use mask covers
+    o->mesh_has_task = a->mesh_has_task; // program stage set, not a reflected resource
+    o->mesh_nv = a->mesh_nv; // selected Vulkan execution dialect, not a reflected resource
 }
 
 // The cache key of an input id under the current translator.
@@ -1128,11 +1182,22 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control, int ampere,
+                            const uint32_t *nvn2_cs, const Nvn2MeshInfo *nvn2_mesh) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
-    o += sprintf(o, "\",\"stage\":\"%s\",\"debug\":false,\"code\":\"", stage);
+    o += sprintf(o, "\",\"stage\":\"%s\",\"debug\":false", stage);
+    if (ampere) o += sprintf(o, ",\"arch\":\"sm86\"");
+    if (nvn2_cs)
+        o += sprintf(o, ",\"nvn2_cs\":[%u,%u,%u,%u,%u,%u,%u]", nvn2_cs[0], nvn2_cs[1], nvn2_cs[2],
+                     nvn2_cs[3], nvn2_cs[4], nvn2_cs[5], nvn2_cs[6]);
+    if (nvn2_mesh)
+        o += sprintf(o, ",\"mesh\":{\"stage\":%u,\"threads\":%u,\"payload\":%u,\"maxv\":%u,\"maxp\":%u,\"topo\":%u,\"task\":%s,\"nv\":%s}",
+                     nvn2_mesh->stage, nvn2_mesh->threads, nvn2_mesh->payload_bytes, nvn2_mesh->max_vertices,
+                     nvn2_mesh->max_primitives, nvn2_mesh->topology, nvn2_mesh->has_task ? "true" : "false",
+                     a && a->mesh_nv ? "true" : "false");
+    o += sprintf(o, ",\"code\":\"");
     json_esc(&o, code_path);
     o += sprintf(o, "\",\"c1\":\"");
     for (uint32_t i = 0; i < c1_len; i++) o += sprintf(o, "%02x", c1[i]);
@@ -1160,10 +1225,9 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         o += sprintf(o, "},\"shared\":%u", a->shared_bytes);
     }
     if (!strcmp(stage, "cs")) {
-        uint32_t l[3] = {1, 1, 1};
-        if (a && (a->local[0] | a->local[1] | a->local[2])) l[0] = a->local[0], l[1] = a->local[1], l[2] = a->local[2];
-        else memcpy(l, control + 0x748, 12);
-        o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
+        uint32_t l[3];
+        if (nvn2_cs_local(a ? a->local : NULL, control, ampere, l))   // nvn2_program.h: each u16 answer widened
+            o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
     }
     /* Control byte +0x718 of a fragment shader: early fragment tests (the NVN driver's early-Z-force, MacNativeGames
        ae8f4f4). Without it a shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test
@@ -1230,7 +1294,14 @@ static const GfxShader *fail(const char *why, const char *hex) {
 // A validated request: the program's code length, its c1 constants and the cache key. 0 (failure counted) when invalid.
 typedef struct {
     const char *stage_name;
-    uint32_t length, c1_len;
+    uint32_t length, c1_len, code_skip;
+    int ampere;
+    int has_nvn2_cs;
+    uint32_t nvn2_cs[7];
+    int has_nvn2_mesh;
+    Nvn2MeshInfo nvn2_mesh;
+    GfxShaderAnswers answers;
+    uint8_t control[CONTROL_SIZE];                   // NVN2's shorter control is zero-padded for hashing and stored inputs
     const uint8_t *c1;
     uint8_t code_hash[32];
     uint8_t key[32];                                       // cache key, or the provisional one with final 0
@@ -1240,20 +1311,96 @@ typedef struct {
 
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    if (!control) return fail("missing control section", NULL), 0;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" :
+                    stage == GFX_STAGE_CS || stage == GFX_STAGE_TASK || stage == GFX_STAGE_MESH ? "cs" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
+    memset(r->control, 0, sizeof r->control);
+    memset(&r->answers, 0, sizeof r->answers);
+    if (a) r->answers = *a;
+    r->ampere = 0;
+    r->has_nvn2_cs = 0;
+    r->has_nvn2_mesh = 0;
+    r->code_skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
     uint32_t c1_off;
-    memcpy(&c1_off, control + 0x700, 4), memcpy(&r->length, control + 0x704, 4);
-    uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
-    if (!code || r->length > code_size || c1_off > r->length || skip >= r->length) return fail("bad control section", NULL), 0;
-    r->c1_len = r->length - c1_off;
+    if (nvn2_control_tiene_magia(control)) {
+        if (!nvn2_control_es(control)) return fail("unsupported NVN2 control version", NULL), 0;
+        Nvn2Control n2;
+        if (stage == GFX_STAGE_CS) {
+            if (code_size > UINT32_MAX ||
+                !nvn2_control_leer(control, NVN2_CONTROL_COMPUTE_TAM, (uint32_t)code_size, 0, &n2))
+                return fail("invalid NVN2 compute control metadata", NULL), 0;
+            if (!nvn2_compute_resources_valid(&n2))
+                return fail("invalid NVN2 compute workgroup or shared-memory metadata", NULL), 0;
+            nvn2_compute_c0_layout(&n2, r->nvn2_cs);
+            r->length = n2.largo_instrucciones;
+            c1_off = n2.c1_inicio;
+            r->c1_len = nvn2_c1_tam(&n2);
+            if (c1_off > n2.area_codigo_tam || r->length > code_size ||
+                (!c1 && (n2.area_codigo_tam > code_size || r->c1_len > code_size - c1_off)))
+                return fail("NVN2 compute code or c1 range exceeds the supplied shader area", NULL), 0;
+            memcpy(r->control, control, NVN2_CONTROL_COMPUTE_TAM);
+            r->code_skip = 0;
+            r->has_nvn2_cs = 1;
+            r->ampere = 1;
+            for (int i = 0; i < 3; i++) r->answers.local[i] = (uint16_t)n2.compute_local[i];
+            r->answers.shared_bytes = nvn2_compute_shared_rounded(&n2);
+        } else if (stage == GFX_STAGE_TASK || stage == GFX_STAGE_MESH) {
+            uint8_t nvn_stage = stage == GFX_STAGE_TASK ? NVN2_CONTROL_STAGE_TASK : NVN2_CONTROL_STAGE_MESH;
+            uint32_t declared = nvn2_control_tam(control); // 0 at +0x30 = section from memory
+            if (code_size > UINT32_MAX || declared > sizeof r->control ||
+                !nvn2_mesh_info_leer(control, nvn_stage, &r->nvn2_mesh) ||
+                !nvn2_control_leer(control, NVN2_CONTROL_MIN_TAM, 0, 1, &n2) ||
+                n2.largo_instrucciones < NVN2_SPH_TAM || n2.area_codigo_tam < n2.largo_instrucciones ||
+                nvn2_sph_version(code, (uint32_t)code_size) != 4)
+                return fail("invalid NVN2 task/mesh control or SPH metadata", NULL), 0;
+            r->length = n2.largo_instrucciones;
+            c1_off = n2.c1_inicio;
+            r->c1_len = nvn2_c1_tam(&n2);
+            if (c1_off > n2.area_codigo_tam || r->length > code_size ||
+                (!c1 && (n2.area_codigo_tam > code_size || r->c1_len > code_size - c1_off)))
+                return fail("NVN2 task/mesh code or c1 range exceeds the supplied shader area", NULL), 0;
+            memcpy(r->control, control, declared);
+            r->code_skip = 0;                              // the SPH is already at code+0
+            r->ampere = 1;
+            r->has_nvn2_mesh = 1;
+            if (stage == GFX_STAGE_MESH) r->nvn2_mesh.has_task |= r->answers.mesh_has_task;
+        } else {
+            if (code_size > UINT32_MAX ||
+                !nvn2_control_leer(control, NVN2_CONTROL_MIN_TAM, 0, 1, &n2) ||
+                n2.largo_instrucciones < NVN2_SPH_TAM ||
+                n2.area_codigo_tam < n2.largo_instrucciones ||
+                nvn2_sph_version(code, (uint32_t)code_size) != 4 ||
+                (stage == GFX_STAGE_VS ? !nvn2_sph_es_vertex(code, (uint32_t)code_size)
+                                       : nvn2_sph_stage(code, (uint32_t)code_size) != NVN2_SPH_STAGE_FRAGMENT))
+                return fail("invalid NVN2 graphics control or SPH stage", NULL), 0;
+            r->length = n2.largo_instrucciones;
+            c1_off = n2.c1_inicio;
+            r->c1_len = nvn2_c1_tam(&n2);
+            if (c1_off > n2.area_codigo_tam || r->length > code_size ||
+                (!c1 && (n2.area_codigo_tam > code_size || r->c1_len > code_size - c1_off)))
+                return fail("NVN2 code or c1 range exceeds the supplied shader area", NULL), 0;
+            memcpy(r->control, control, NVN2_CONTROL_MIN_TAM);
+            r->code_skip = 0;                              // NVN2's 0x80-byte SPH is already at code+0
+            r->ampere = 1;
+        }
+    } else {
+        memcpy(r->control, control, CONTROL_SIZE);   // NVN1 retains its original full control bytes
+        memcpy(&c1_off, control + 0x700, 4), memcpy(&r->length, control + 0x704, 4);
+        if (!code || r->length > code_size || c1_off > r->length)
+            return fail("bad control section", NULL), 0;
+        r->c1_len = r->length - c1_off;
+    }
+    if (!code || r->length > code_size || r->code_skip >= r->length ||
+        (!c1 && (c1_off > code_size || r->c1_len > code_size - c1_off)))
+        return fail("bad control section", NULL), 0;
     r->c1 = c1 ? c1 : code + c1_off;
-    if (!build_code_hash(stage, control, code, r->length, r->c1, r->c1_len, r->code_hash))
+    if (!build_code_hash(stage, r->control, code, r->length, r->c1, r->c1_len, r->code_hash))
         return fail("out of memory", NULL), 0;
     paths();
     UseMask m;
     r->final = use_find(r->code_hash, &m);
-    build_key(r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
+    build_key(r->code_hash, &r->answers, r->final ? &m : NULL, r->key, r->iid);
     return 1;
 }
 
@@ -1265,22 +1412,21 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
 static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, const uint8_t *code,
                                       const GfxShaderAnswers *a, int *pending);
 
-static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
-                                const GfxShaderAnswers *a) {
+static const GfxShader *get_one(const Req *r, int stage, const uint8_t *code, const GfxShaderAnswers *a) {
     GfxShader *s = mem_find(r->key);
     if (s) return plat_inc64(&n_hits), s;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
     if (r->final && (s = disk_load(r->key, r->iid))) return plat_inc64(&n_hits), mem_insert(s);
-    return translate(r, stage, control, code, a);
+    return translate(r, stage, r->control, code, a);
 }
 
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                 const uint8_t *c1, const GfxShaderAnswers *a) {
     Req r;
     if (!req_init(&r, stage, control, code, code_size, c1, a)) return NULL;
-    const GfxShader *s = get_one(&r, stage, control, code, a);
-    if (s) ans_note(&r, stage, control, code, a, s);
+    const GfxShader *s = get_one(&r, stage, code, &r.answers);
+    if (s) ans_note(&r, stage, r.control, code, &r.answers, s);
     return s;
 }
 
@@ -1345,6 +1491,35 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
     in->code = o, o += h.length;
     in->c1 = o;
     in->buf = f, in->stage = (int)h.stage, in->length = h.length, in->c1_len = h.c1_len;
+    if (nvn2_control_tiene_magia(in->control)) {
+        Nvn2Control n2;
+        int valid = nvn2_control_es(in->control);
+        if (valid && in->stage == GFX_STAGE_CS) {
+            valid = nvn2_control_leer(in->control, NVN2_CONTROL_COMPUTE_TAM, 0, 0, &n2) &&
+                    n2.largo_instrucciones == in->length && nvn2_c1_tam(&n2) == in->c1_len &&
+                    nvn2_compute_resources_valid(&n2) &&
+                    in->a.local[0] == n2.compute_local[0] && in->a.local[1] == n2.compute_local[1] &&
+                    in->a.local[2] == n2.compute_local[2] &&
+                    in->a.shared_bytes == nvn2_compute_shared_rounded(&n2);
+        } else if (valid) {
+            valid = in->stage != GFX_STAGE_CS &&
+                    nvn2_control_leer(in->control, NVN2_CONTROL_MIN_TAM, 0, 1, &n2) &&
+                    n2.largo_instrucciones == in->length && nvn2_c1_tam(&n2) == in->c1_len &&
+                    nvn2_sph_version(in->code, in->length) == 4;
+            if (valid && (in->stage == GFX_STAGE_TASK || in->stage == GFX_STAGE_MESH)) {
+                Nvn2MeshInfo mesh;
+                uint8_t nvn_stage = in->stage == GFX_STAGE_TASK ? NVN2_CONTROL_STAGE_TASK : NVN2_CONTROL_STAGE_MESH;
+                valid = nvn2_mesh_info_leer(in->control, nvn_stage, &mesh);
+            } else if (valid) {
+                valid = in->stage == GFX_STAGE_VS || in->stage == GFX_STAGE_FS;
+            }
+        }
+        if (!valid) {
+            free(f);
+            memset(in, 0, sizeof *in);
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -1362,24 +1537,54 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     if (look && (s = mem_find(look))) return plat_inc64(&n_hits), s;
     if (look && (s = disk_load(look, look_iid))) return plat_inc64(&n_hits), mem_insert(s);
 
-    uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
+    uint64_t skip = r->code_skip;
     char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
     key_hex(key, hex);
     mkdir_p(cache_dir);
     snprintf(code_path, PATH_CAP + 80, "%s/%s.code", cache_dir, hex);
     snprintf(spv_path, PATH_CAP + 80, "%s/%s.spv", cache_dir, hex);
     snprintf(res_path, PATH_CAP + 80, "%s/%s.res.json", cache_dir, hex);
-    if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
-    size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
+    // What the translator gets: the program as the game gave it, or with NX_SM86_BAJADA=propia an NVN2 vertex,
+    // fragment or compute program lowered to Maxwell (and c1 with its BRX tables rewritten), sent as Maxwell. A
+    // program the lowering cannot handle fails here with its reason; it does not fall back to the other path.
+    const uint8_t *send = code + skip, *send_c1 = r->c1;
+    size_t send_len = (size_t)(r->length - skip);
+    uint32_t send_c1_len = r->c1_len;
+    int send_ampere = r->ampere;
+    Sm86Bajado low = {0};
+    if (sm86_propia && r->ampere && !r->has_nvn2_mesh) {
+        char why[1024], msg[1100];
+        if (!sm86_propia_bajar(sm86_script, cache_dir, hex, r->stage_name, send, send_len, r->c1, r->c1_len, &low, why,
+                               sizeof why)) {
+            snprintf(msg, sizeof msg, "SM86 lowering (NX_SM86_BAJADA=propia): %s", why);
+            return fail(msg, hex);
+        }
+        send = low.codigo, send_len = low.codigo_tam;
+        if (low.c1) send_c1 = low.c1, send_c1_len = (uint32_t)low.c1_tam;
+        send_ampere = 0;
+    }
+    if (!write_file(code_path, send, send_len)) return sm86_propia_liberar(&low), fail("cannot write the code file", hex);
+    size_t cap = 2 * PATH_CAP * 6 + 2 * send_c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
-    if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
+    if (!req) return sm86_propia_liberar(&low), plat_file_delete(code_path), fail("out of memory", hex);
+    // nvn2_cs (NVN2's c[0] layout of a compute program) only means something to the Ampere decoder: not sent with
+    // lowered code (the lowered program keeps NVN2's c[0] offsets; see docs/SWITCH2_PROGRESS.md).
+    build_request(req, hex, r->stage_name, code_path, send_c1, send_c1_len, a, control, send_ampere,
+                  r->has_nvn2_cs && send_ampere ? r->nvn2_cs : NULL, r->has_nvn2_mesh ? &r->nvn2_mesh : NULL);
+    sm86_propia_liberar(&low);
     int ok = svc_request(req, reply, sizeof reply);
     // TOTK_XLATE_KEEP=1: a last-frame variant's job stays as <key>.job (one request line) with its code, to run the
     // translator on by hand (totk_xlate --serve < <key>.job)
     static int keep = -1;
     if (keep < 0) keep = rt_knob("XLATE_KEEP", "0");
-    int kept = keep && a && a->mvprev;
+    static int keep_failed = -1;
+    if (keep_failed < 0) keep_failed = rt_knob("XLATE_KEEP_FAILED", "0");
+    int failed = !ok || strncmp(reply, "ok ", 3);
+    // TOTK_XLATE_KEEP_FAILED=1 preserves the exact input of a failed translation:
+    // <key>.code plus <key>.job (which also contains c1 and stage/answers). This
+    // allows replaying a failure with `totk_xlate --serve` without retaining every
+    // shader or changing the normal cache behavior.
+    int kept = (keep && a && a->mvprev) || (keep_failed && failed);
     if (kept) {
         char job_path[PATH_CAP + 80];
         snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
@@ -1438,8 +1643,8 @@ static const GfxShader *translate(const Req *r, int stage, const uint8_t *contro
 typedef struct XJob {
     struct XJob *next;
     int stage;
-    Req r;                                                 // r.c1 points into code
-    uint8_t *control, *code;
+    Req r;                                                 // r.c1 points into c1; control is normalized/padded
+    uint8_t *control, *code, *c1;
     GfxShaderAnswers a;
 } XJob;
 
@@ -1482,7 +1687,7 @@ static void xlate_worker(void *arg) {
         plat_mutex_unlock(&X.lock);
         plat_cond_broadcast(&X.done);
         if (s) plat_inc64(&n_async);
-        free(j->control), free(j->code), free(j);
+        free(j->control), free(j->code), free(j->c1), free(j);
     }
     return;
 }
@@ -1491,8 +1696,8 @@ const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const u
     *pending = 0;
     Req r;
     if (!req_init(&r, stage, control, code, code_size, NULL, a)) return NULL;
-    const GfxShader *s = get_async_one(r, stage, control, code, a, pending);
-    if (s) ans_note(&r, stage, control, code, a, s);
+    const GfxShader *s = get_async_one(r, stage, r.control, code, &r.answers, pending);
+    if (s) ans_note(&r, stage, r.control, code, &r.answers, s);
     return s;
 }
 
@@ -1511,7 +1716,7 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
 
     XJob *j = calloc(1, sizeof *j);
     XWait *e = calloc(1, sizeof *e);
-    uint8_t *ctl = malloc(CONTROL_SIZE), *cd = malloc(r.length);
+    uint8_t *ctl = malloc(CONTROL_SIZE), *cd = malloc(r.length), *c1 = malloc(r.c1_len ? r.c1_len : 1);
     plat_mutex_lock(&X.lock);
     if (!X.started) {
         int n = 0;
@@ -1524,11 +1729,12 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     }
     XWait **slot = wait_slot(r.key);
     int raced = *slot != NULL;                             // another thread queued it between the checks
-    int queued = !raced && X.started == 1 && j && e && ctl && cd;
+    int queued = !raced && X.started == 1 && j && e && ctl && cd && c1;
     if (queued) {
-        memcpy(ctl, control, CONTROL_SIZE), memcpy(cd, code, r.length);
-        *j = (XJob){.stage = stage, .r = r, .control = ctl, .code = cd, .a = *a};
-        j->r.c1 = cd + (r.length - r.c1_len);
+        memcpy(ctl, r.control, CONTROL_SIZE), memcpy(cd, code, r.length);
+        if (r.c1_len) memcpy(c1, r.c1, r.c1_len);
+        *j = (XJob){.stage = stage, .r = r, .control = ctl, .code = cd, .c1 = c1, .a = r.answers};
+        j->r.c1 = c1;
         memcpy(e->key, r.key, 32);
         *slot = e;
         if (X.tail) X.tail->next = j;
@@ -1538,9 +1744,9 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     }
     plat_mutex_unlock(&X.lock);
     if (queued) return *pending = 1, NULL;
-    free(j), free(e), free(ctl), free(cd);
+    free(j), free(e), free(ctl), free(cd), free(c1);
     if (raced) return *pending = 1, NULL;
-    return translate(&r, stage, control, code, a);         // no worker or out of memory
+    return translate(&r, stage, r.control, code, a);      // no worker or out of memory
 }
 
 const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
@@ -1726,6 +1932,20 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
 
 int gfx_shader_stage(const GfxShader *s) { return s->stage; }
 
+int gfx_shader_mesh_nv(const GfxShader *s) {
+    // Execution model is authoritative: answers can request NV when supported, but a translator failure, stale
+    // shader cache, or wrong module must never cause the runtime to bind an NV module as MeshEXT (or vice versa).
+    if (!s || s->stage != GFX_STAGE_MESH || !s->spirv || s->words < 6) return 0;
+    for (uint64_t p = 5; p < s->words;) {
+        uint32_t first = s->spirv[p];
+        uint32_t words = first >> 16, op = first & 0xffff;
+        if (!words || words > s->words - p) return 0;
+        if (op == 15) return words >= 3 && s->spirv[p + 1] == 5268; // OpEntryPoint MeshNV
+        p += words;
+    }
+    return 0;
+}
+
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res) {
     if (kind < 0 || kind >= GFX_RES_KINDS) return 0;
     if (res) *res = s->res[kind];
@@ -1765,8 +1985,8 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 //                       code[length], c1. One per code hash; written before the answers that name it. Game content:
 //                       it stays in the ignored pipeline cache directory.
 // A file with another header is rewritten; a torn tail (killed process) is cut off at open.
-#define ANS_VERSION 1
-#define ANS_PACKED 147                                     // pack_answers' size
+#define ANS_VERSION 3                                       // adds mesh execution dialect to packed translator answers
+#define ANS_PACKED 149                                     // pack_answers' size
 #define ANS_REC (4 + 32 + 32 + ANS_PACKED + 1)
 #define PRG_VERSION 1
 #define PRG_HEAD (12 + 32 + CONTROL_SIZE)
@@ -1833,6 +2053,8 @@ static void unpack_answers(const uint8_t *p, GfxShaderAnswers *a) {
     for (int i = 0; i < 3; i++) a->local[i] = (uint16_t)(p[0] | p[1] << 8), p += 2;
     memcpy(&a->shared_bytes, p, 4), p += 4;
     a->depth_minus_w = *p & 0x7f, a->mvprev = *p >> 7;
+    a->mesh_has_task = *p++;
+    a->mesh_nv = *p;
 }
 
 // Reads a record file's body (after its header) into *body; 0 when absent, and a file with another header is removed.
@@ -2079,13 +2301,13 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     if (n < 0) return 1;
     uint8_t *recs = calloc((size_t)n + 1, PRP_REC);
     static const uint8_t zero[32];
-    size_t u = 0, by[3] = {0}, stages[6] = {0};
+    size_t u = 0, by[3] = {0}, stages[8] = {0};
     Set64 seen = {0};
     for (long long i = 0; recs && i < n; i++) {           // seed records come in priority order: the first id wins
         if (!memcmp(iid[i], zero, 32) || !set_add(&seen, hash8(iid[i]))) continue;
         uint8_t *r = recs + u * PRP_REC;
         const uint8_t *a = ab + (size_t)i * ANS_REC;
-        r[0] = a[0] < 6 ? a[0] : 0, r[1] = a[ANS_REC - 1] > 2 ? 2 : a[ANS_REC - 1];
+        r[0] = a[0] < COUNT(stages) ? a[0] : 0, r[1] = a[ANS_REC - 1] > 2 ? 2 : a[ANS_REC - 1];
         memcpy(r + 4, iid[i], 32);
         by[r[1]]++, stages[r[0]]++, u++;
     }
@@ -2098,9 +2320,10 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
         ok = plat_file_write_atomic(out, file, sizeof h + u * PRP_REC);
     }
     char msg[640];
-    snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu; title %zu, "
+    snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu, task %zu, mesh %zu; title %zu, "
              "warm-up %zu, other %zu) from %lld seed records, %llu translations failed, in %.0f ms; %s %s", u,
-             stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], by[0], by[1], by[2], n,
+             stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], stages[GFX_STAGE_TASK],
+             stages[GFX_STAGE_MESH], by[0], by[1], by[2], n,
              (unsigned long long)((uint64_t)n_failures - fail0), (double)plat_now_ms() - t0,
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);

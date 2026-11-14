@@ -3,7 +3,7 @@ CLANG ?= clang
 B := build
 PROGS := hola neon vm multi
 # programas que hablan con el kernel o los servicios: su salida se compara con guest/esperado/
-PROGS_ESPERADO := hilos servicios retorno_br
+PROGS_ESPERADO := hilos servicios retorno_br romper
 # Homebrew hechos con libnx (devkitPro): se compilan con su toolchain si está instalado.
 DEVKITPRO ?= /opt/devkitpro
 LIBNX_PROGS := $(if $(wildcard $(DEVKITPRO)/libnx),basico sistema kernel cuentas)
@@ -62,12 +62,15 @@ GUEST_CFLAGS := --target=aarch64-none-elf $(OPT) -ffreestanding -fno-builtin -no
 CFLAGS_hola := -mgeneral-regs-only
 CFLAGS_hilos := -mgeneral-regs-only
 CFLAGS_servicios := -mgeneral-regs-only
+CFLAGS_romper_abort := -mgeneral-regs-only
+CFLAGS_romper_ilegible := -mgeneral-regs-only
+CFLAGS_romper := -mgeneral-regs-only
 CFLAGS_neon := -O3
 SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS := $(shell pkg-config --libs sdl3)
 HOST_CFLAGS := -O2 -march=x86-64-v3 -Iruntime $(SDL_CFLAGS) -Wall -Wno-unused-label -Wno-unused-function \
 	-Wno-unused-value -Wno-unused-variable -Wno-parentheses-equality
-RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxaudren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxsvc_opus.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c
+RUNTIME := runtime/nxrt.c runtime/nxmain.c runtime/nxkern.c runtime/nxipc.c runtime/nxservices.c runtime/nxsvc_am.c runtime/nxsvc_ldr.c runtime/nxsvc_hid.c runtime/nxsvc_time.c runtime/nxsvc_fs.c runtime/nxsvc_vi.c runtime/nxdisplay.c runtime/nxinput.c runtime/nxaudio.c runtime/nxsvc_audio.c runtime/nxsvc_audren.c runtime/nxaudren.c runtime/nxsvc_acc.c runtime/nxsvc_otros.c runtime/nxsvc_opus.c runtime/nxgpu.c runtime/nxgl.c runtime/nxshader.c runtime/nxastc.c runtime/nxnvn.c runtime/nxhle.c runtime/nxcodec.c runtime/nxguest.c runtime/nxhle_event.c runtime/nxcodec_hle.c runtime/nxfont.c
 RUNTIME_H := $(wildcard runtime/*.h)
 RECOMP := $(wildcard recomp/*.py)
 
@@ -92,7 +95,7 @@ $(B)/%_rec/programa.c: $(B)/%.nro $(RECOMP)
 	python3 recomp/nxrecomp.py $< -o $(B)/$*_rec
 
 $(B)/%: $(B)/%_rec/programa.c $(RUNTIME) $(RUNTIME_H)
-	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread $(SDL_LIBS) -lEGL -lOpenGL -lopus -o $@
+	$(CLANG) $(HOST_CFLAGS) -I$(B)/$*_rec $(B)/$*_rec/*.c $(RUNTIME) -lm -lpthread $(SDL_LIBS) -lEGL -lOpenGL -lopus -lvpx -o $@
 
 # El mismo programa compilado directo para x86_64: su salida es la referencia.
 $(B)/%_ref: guest/%.c guest/mini.h | $(B)
@@ -160,10 +163,61 @@ $(B)/ipc_tipc_test: tests/ipc_tipc_test.c runtime/nxipc.c $(RUNTIME_H) | $(B)
 $(B)/applet_startup_test: tests/applet_startup_test.c runtime/nxsvc_am.c $(RUNTIME_H) | $(B)
 	$(CLANG) -O2 -march=x86-64-v3 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
 
+$(B)/ldr_ro_test: tests/ldr_ro_test.c runtime/nxsvc_ldr.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -march=x86-64-v3 -Iruntime tests/ldr_ro_test.c runtime/nxsvc_ldr.c -o $@
+
 $(B)/native_window_test: tests/native_window_test.c runtime/nxsvc_vi.c $(RUNTIME_H) | $(B)
 	$(CLANG) -O2 -march=x86-64-v3 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
 
-.PHONY: test-startup
+$(B)/vi2_session_test: tests/vi2_session_test.c runtime/nxsvc_vi.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -march=x86-64-v3 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
+
+$(B)/pl_fuentes_test: tests/pl_fuentes_test.c runtime/nx_pl.h | $(B)
+	$(CLANG) -O2 -Wall -Wextra -Iruntime $< -o $@
+
+$(B)/nxfont_work_test: tests/nxfont_work_test.c runtime/nxfont.c runtime/nxrt.h $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -Wall -Wextra -Iruntime tests/nxfont_work_test.c runtime/nxfont.c -lpthread -o $@
+
+$(B)/nvn_device_info_test: tests/nvn_device_info_test.c runtime/nvn/nvn_device_info.h | $(B)
+	$(CLANG) -O2 -Iruntime/nvn $< -o $@
+
+.PHONY: test-startup test-identidad test-codec
+$(B)/nxcodec_vp9_test: tests/nxcodec_vp9_test.c runtime/nxcodec.c runtime/nxcodec.h | $(B)
+	$(CLANG) -O2 -Wall -Wextra -Iruntime tests/nxcodec_vp9_test.c runtime/nxcodec.c -lvpx -o $@
+
+$(B)/nxcodec_hle_test: tests/nxcodec_hle_test.c runtime/nxcodec_hle.c runtime/nxcodec.c runtime/nxguest.c runtime/nxhle_event.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Wall -Wextra -Iruntime tests/nxcodec_hle_test.c runtime/nxcodec_hle.c runtime/nxcodec.c -lvpx -lpthread -o $@
+
+test-codec: $(B)/nxcodec_vp9_test $(B)/nxcodec_hle_test
+	$(B)/nxcodec_vp9_test
+	$(B)/nxcodec_hle_test
+
+$(B)/nxkern_event_handle_test: tests/nxkern_event_handle_test.c runtime/nxkern.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< runtime/nxkern.c -lpthread -o $@
+
+# Nintendo Switch Sports Resort al arrancar: chat GSV por TIPC (id, evento, TryWait, trazas de espera acotadas),
+# chat:u, ThreadType del CreateThread HLE y datos del sistema por $NX_DATOS_SISTEMA
+$(B)/chat_gsv_tipc_test: tests/chat_gsv_tipc_test.c runtime/nxsvc_am.c runtime/nxkern.c runtime/nxipc.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< runtime/nxkern.c runtime/nxipc.c -lpthread -o $@
+$(B)/chat_servicio_test: tests/chat_servicio_test.c runtime/nxsvc_otros.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lpthread -o $@
+$(B)/mii_servicio_test: tests/mii_servicio_test.c runtime/nxsvc_otros.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lpthread -o $@
+$(B)/thread_create_stack_test: tests/thread_create_stack_test.c runtime/nxkern.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< runtime/nxkern.c -lpthread -o $@
+$(B)/datos_sistema_test: tests/datos_sistema_test.c runtime/nxsvc_fs.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lpthread -o $@
+
+$(B)/nxguest_test: tests/nxguest_test.c runtime/nxguest.c runtime/nxrt.h | $(B)
+	$(CLANG) -O1 -Iruntime tests/nxguest_test.c runtime/nxguest.c -o $@
+
+$(B)/nxhle_event_test: tests/nxhle_event_test.c runtime/nxhle_event.c runtime/nxguest.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O1 -Iruntime tests/nxhle_event_test.c runtime/nxhle_event.c runtime/nxguest.c -o $@
+
+# Identidad de los juegos de NX2Linux (Title ID por estructura, .nup incompleto/ambiguo, nombre visible), sin juegos reales
+test-identidad:
+	python3 tests/identidad_juego_test.py
+
 .PHONY: test-gpu-state
 $(B)/renderer_config_test: tests/renderer_config_test.c runtime/nxmain.c $(RUNTIME_H) | $(B)
 	$(CLANG) -O1 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -o $@
@@ -182,19 +236,45 @@ test-gpu-state: $(B)/clip_depth_test $(B)/gpu_submission_snapshot_test $(B)/rend
 $(B)/hid_startup_test: tests/hid_startup_test.c runtime/nxsvc_hid.c $(RUNTIME_H) | $(B)
 	$(CLANG) -O2 -Iruntime $< -o $@
 
+$(B)/hid_npad_condition_test: tests/hid_npad_condition_test.c runtime/nxsvc_hid.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -Wall -Iruntime $< -o $@
+
+$(B)/hid_npad_seqlock_test: tests/hid_npad_seqlock_test.c runtime/nxinput.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -Iruntime $(SDL_CFLAGS) $< $(SDL_LIBS) -lpthread -o $@
+
+$(B)/hid_key_cycle_test: tests/hid_key_cycle_test.c runtime/nxinput.c $(RUNTIME_H) | $(B)
+	$(CLANG) -O2 -Wall -Iruntime $(SDL_CFLAGS) $< $(SDL_LIBS) -lpthread -o $@
+
 $(B)/storage_concurrency_test: tests/storage_concurrency_test.c runtime/nxsvc_fs.c $(RUNTIME_H) | $(B)
 	$(CLANG) -O2 -Iruntime -ffunction-sections -fdata-sections -Wl,--gc-sections $< -lpthread -o $@
 
 $(B)/nv_sync_event_test: tests/nv_sync_event_test.c runtime/nxsvc_vi.c runtime/nxgpu.c $(RUNTIME_H) | $(B)
 	$(CLANG) -O1 -Iruntime $(SDL_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections $< runtime/nxgpu.c -lpthread -lEGL -lOpenGL -lm -o $@
 
-test-startup: $(B)/ipc_tipc_test $(B)/applet_startup_test $(B)/native_window_test $(B)/hid_startup_test $(B)/storage_concurrency_test $(B)/nv_sync_event_test
+test-startup: $(B)/ipc_tipc_test $(B)/applet_startup_test $(B)/ldr_ro_test $(B)/pl_fuentes_test $(B)/nxfont_work_test $(B)/native_window_test $(B)/vi2_session_test $(B)/nvn_device_info_test $(B)/hid_startup_test $(B)/hid_npad_condition_test $(B)/hid_npad_seqlock_test $(B)/hid_key_cycle_test $(B)/storage_concurrency_test $(B)/nv_sync_event_test $(B)/nxkern_event_handle_test $(B)/chat_gsv_tipc_test $(B)/chat_servicio_test $(B)/mii_servicio_test $(B)/thread_create_stack_test $(B)/datos_sistema_test
 	$(B)/ipc_tipc_test
 	$(B)/applet_startup_test
+	$(B)/ldr_ro_test
+	$(B)/pl_fuentes_test
+	$(B)/nxfont_work_test
 	$(B)/native_window_test
+	$(B)/vi2_session_test
+	$(B)/nvn_device_info_test
 	$(B)/hid_startup_test
+	$(B)/hid_npad_condition_test
+	$(B)/hid_npad_seqlock_test
+	$(B)/hid_key_cycle_test
 	$(B)/storage_concurrency_test
 	$(B)/nv_sync_event_test
+	$(B)/nxkern_event_handle_test
+	$(B)/nxguest_test
+	$(B)/nxhle_event_test
+	$(B)/chat_gsv_tipc_test
+	$(B)/chat_servicio_test
+	$(B)/mii_servicio_test
+	$(B)/thread_create_stack_test
+	$(B)/datos_sistema_test
+	python3 tests/construccion_cancelar_test.py
 	python3 tests/romfs_native_test.py
 	python3 tests/dispatch_table_test.py
 	python3 tests/branch_local_test.py
@@ -211,9 +291,25 @@ runtime/nvn/fg_%_spv.h: runtime/shaders/fg_%.comp tools/spv_header.py
 $(B)/nvn2_program_test: tests/nvn2_program_test.c runtime/nvn/nvn2_program.h | $(B)
 	$(CLANG) -O1 -Iruntime/nvn tests/nvn2_program_test.c -o $@
 
+# Memoria de comandos y de control de los command buffers NVN: callbacks al agotarse y contadores (nvn_api_cmd.c)
+.PHONY: test-nvn-cmd
+$(B)/nvn_cmd_memory_test: tests/nvn_cmd_memory_test.c runtime/nvn/nvn_api_cmd.c runtime/nvn/nvn_api.h runtime/nvn/nvn_obj.h | $(B)
+	$(CLANG) -O1 -Wall -Wextra -Iruntime -Iruntime/nvn -Iruntime/nvn/third_party/vma tests/nvn_cmd_memory_test.c runtime/nvn/nvn_api_cmd.c -o $@
+
+test-nvn-cmd: $(B)/nvn_cmd_memory_test
+	$(B)/nvn_cmd_memory_test 2>$(B)/nvn_cmd_memory.txt || { cat $(B)/nvn_cmd_memory.txt; exit 1; }
+
 # Decodificador SM86 (Switch 2) en C contra el de Python; sm86_tablas.h se regenera a mano con tools/sm86_c.py
 $(B)/sm86_dec_test: tests/sm86_dec_test.c runtime/nvn/sm86_dec.c runtime/nvn/sm86_dec.h runtime/nvn/sm86_tablas.h | $(B)
 	$(CLANG) -O2 -march=x86-64-v3 -Wall -Wextra -Iruntime/nvn tests/sm86_dec_test.c runtime/nvn/sm86_dec.c -o $@
+
+# Dirección del invitado -> módulo y símbolo (svcBreak, pila del invitado)
+$(B)/describir_test: tests/describir_test.c runtime/nx_describir.h runtime/nxrt.h | $(B)
+	$(CLANG) -O1 -Wall -Iruntime tests/describir_test.c -o $@
+
+# La bajada SM86 -> Maxwell propia del runtime (NX_SM86_BAJADA=propia) contra armar() de Python
+$(B)/sm86_propia_test: tests/sm86_propia_test.c runtime/nvn/sm86_propia.c runtime/nvn/sm86_propia.h | $(B)
+	$(CLANG) -O1 -Wall -Wextra -Iruntime/nvn tests/sm86_propia_test.c runtime/nvn/sm86_propia.c -o $@
 
 # Corre en la GPU el SPIR-V de cómputo de un programa SM86 bajado a Maxwell (tests/sm86_programa_test.py)
 $(B)/sm86_programa_vk: tests/sm86_programa_vk.c | $(B)
@@ -226,10 +322,17 @@ $(B)/gob_test: tests/gob_test.c runtime/nvn/tex_deswizzle.c runtime/nvn/tex.h | 
 $(B)/deswizzle_gpu_test: tests/deswizzle_gpu_test.c runtime/nvn/deswizzle_spv.h runtime/nvn/tex_deswizzle.c runtime/nvn/tex.h | $(B)
 	$(CLANG) -O1 -Iruntime -Iruntime/nvn -Iruntime/nvn/third_party/vma tests/deswizzle_gpu_test.c runtime/nvn/tex_deswizzle.c -lvulkan -o $@
 
+$(B)/vk_vma.o: runtime/nvn/vk_vma.cpp runtime/nvn/third_party/vma/vk_mem_alloc.h | $(B)
+	clang++ -c -O1 -Iruntime/nvn/third_party/vma runtime/nvn/vk_vma.cpp -o $@
+
+$(B)/vk_pool_fisico_test: tests/vk_pool_fisico_test.c runtime/nvn/vk_phys_mem.h $(B)/vk_vma.o | $(B)
+	$(CLANG) -O1 -Iruntime/nvn -Iruntime/nvn/third_party/vma tests/vk_pool_fisico_test.c $(B)/vk_vma.o -lvulkan -lstdc++ -o $@
+
 runtime/nvn/deswizzle_spv.h: runtime/shaders/deswizzle.comp tools/spv_header.py
 	python3 tools/spv_header.py $<
 
-test: all test-startup $(B)/framegen_test $(B)/nvn2_program_test $(B)/gob_test $(B)/deswizzle_gpu_test $(B)/sm86_dec_test $(B)/sm86_programa_vk
+test: all test-startup test-identidad test-codec test-nvn-cmd $(B)/framegen_test $(B)/vk_pool_fisico_test $(B)/nvn2_program_test $(B)/gob_test $(B)/deswizzle_gpu_test $(B)/sm86_dec_test $(B)/sm86_programa_vk $(B)/sm86_propia_test $(B)/romper_abort $(B)/romper_ilegible $(B)/describir_test
+	python3 tests/compilar_runtime_test.py
 	@ok=1; for p in $(PROGS) $(PROGS_ESPERADO); do \
 		NX_ROMFS=$(B)/romfs_prueba.img $(B)/$$p > $(B)/$$p.salida.txt; \
 		if [ -f guest/esperado/$$p.txt ]; then cp guest/esperado/$$p.txt $(B)/$$p.referencia.txt; \
@@ -248,9 +351,18 @@ test: all test-startup $(B)/framegen_test $(B)/nvn2_program_test $(B)/gob_test $
 			echo "OK: $$p (libnx, pantalla) dibuja el cuadro esperado"; else echo "MAL: $$p dibujó otro cuadro"; ok=0; fi; \
 	done; \
 	python3 tests/nso_test.py || ok=0; \
+	python3 tests/program_boot_test.py || ok=0; \
+	python3 tests/thread_hooks_test.py || ok=0; \
+	python3 tests/svc_break_test.py $(B)/romper_abort $(B)/romper_ilegible || ok=0; \
+	python3 tests/salidas_test.py || ok=0; \
+	$(B)/describir_test || ok=0; \
+	python3 tests/servicios_estrictos_test.py $(B)/servicios || ok=0; \
+	python3 tests/rtld_ro_test.py || ok=0; \
+	python3 tests/modulos_ro_test.py || ok=0; \
 	python3 tests/plataforma_test.py || ok=0; \
 	$(B)/gob_test >$(B)/gob.txt 2>&1 && echo "OK: acomodo block-linear de Switch 1 y de Switch 2 (GOB con bits 5 y 6 cambiados)" || { echo "MAL: gob_test (ver $(B)/gob.txt)"; ok=0; }; \
 	python3 tests/sustituir_test.py >$(B)/sustituir.txt 2>&1 && echo "OK: sustituciones HLE (valor fijo, aviso, prefijo, varios archivos)" || { echo "MAL: sustituir_test (ver $(B)/sustituir.txt)"; ok=0; }; \
+	python3 tests/wrap_sustitucion_test.py || ok=0; \
 	$(B)/nvn2_program_test >/dev/null && echo "OK: secciones de control de NVN2 (Switch 2)" || { echo "MAL: nvn2_program_test"; ok=0; }; \
 	python3 tests/sm86_dec_test.py $(B)/sm86_dec_test >$(B)/sm86_dec.txt 2>&1; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el decodificador SM86 en C da lo mismo que el de Python ($$(head -1 $(B)/sm86_dec.txt | cut -d: -f1))"; \
@@ -258,6 +370,23 @@ test: all test-startup $(B)/framegen_test $(B)/nvn2_program_test $(B)/gob_test $
 	python3 tests/sm86_programa_test.py >$(B)/sm86_programa.txt 2>&1; r=$$?; \
 	if [ $$r = 0 ]; then grep -h "^OK\|^(sin" $(B)/sm86_programa.txt; \
 	elif [ $$r = 77 ]; then echo "(sin totk_xlate o sin CUDA no se prueba la bajada de programas SM86)"; else echo "MAL: bajada de programas SM86 (ver $(B)/sm86_programa.txt)"; ok=0; fi; \
+	if [ ! -f build/sm86_spec.json ]; then echo "(sin build/sm86_spec.json no se prueba la bajada de VOTE, FSET y PLOP3)"; \
+	elif python3 tools/sm86_baja_predicados.py probar 1500 >$(B)/sm86_predicados.txt 2>&1; then echo "OK: bajada de VOTE, FSET y PLOP3 ejecutada contra SM86 ($$(head -1 $(B)/sm86_predicados.txt))"; \
+	else echo "MAL: bajada de VOTE, FSET y PLOP3 (ver $(B)/sm86_predicados.txt)"; ok=0; fi; \
+	if [ ! -f build/sm86_spec.json ]; then echo "(sin build/sm86_spec.json no se prueba la bajada de PRMT)"; \
+	elif python3 tools/sm86_baja_prmt.py probar 1500 >$(B)/sm86_prmt.txt 2>&1; then echo "OK: bajada de PRMT con BFE/BFI ejecutada contra SM86 ($$(head -1 $(B)/sm86_prmt.txt))"; \
+	else echo "MAL: bajada de PRMT (ver $(B)/sm86_prmt.txt)"; ok=0; fi; \
+	if [ ! -f build/sm86_spec.json ]; then echo "(sin build/sm86_spec.json no se prueba la bajada de medio float)"; \
+	elif python3 tools/sm86_baja_medios.py probar 800 >$(B)/sm86_medios.txt 2>&1; then echo "OK: bajada de HADD2/HMUL2/HFMA2/HSETP2/HSET2 ejecutada contra SM86 ($$(head -1 $(B)/sm86_medios.txt))"; \
+	else echo "MAL: bajada de medio float (ver $(B)/sm86_medios.txt)"; ok=0; fi; \
+	if [ ! -f build/sm86_spec.json ] || ! python3 -c "import sys; sys.path.insert(0, 'tools'); import sm86_oraculo; sys.exit(0 if sm86_oraculo.disponible() else 1)"; then echo "(sin nvdisasm no se compara la lectura de medio float con el oráculo)"; \
+	elif python3 tools/sm86_baja_medios.py oraculo 100 >$(B)/sm86_medios_oraculo.txt 2>&1; then echo "OK: lectura de operandos de medio float igual a nvdisasm ($$(head -1 $(B)/sm86_medios_oraculo.txt))"; \
+	else echo "MAL: lectura de medio float distinta de nvdisasm (ver $(B)/sm86_medios_oraculo.txt)"; ok=0; fi; \
+	if python3 -B tools/sm86_baja_suld.py probar >$(B)/sm86_suld.txt 2>&1; then echo "OK: bajada SM86 SULD.P 2D ($$(head -1 $(B)/sm86_suld.txt))"; \
+	else echo "MAL: bajada SM86 SULD.P 2D (ver $(B)/sm86_suld.txt)"; ok=0; fi; \
+	python3 tests/sm86_propia_test.py $(B)/sm86_propia_test >$(B)/sm86_propia.txt 2>&1; r=$$?; \
+	if [ $$r = 0 ]; then grep -h "^OK" $(B)/sm86_propia.txt; \
+	elif [ $$r = 77 ]; then echo "(sin build/sm86_spec.json no se prueba la bajada SM86 propia del runtime)"; else echo "MAL: bajada SM86 propia del runtime (ver $(B)/sm86_propia.txt)"; ok=0; fi; \
 	python3 tests/app_entradas_test.py 2>/dev/null || ok=0; \
 	$(B)/astc_test 20000 >/dev/null 2>$(B)/astc.err; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el decodificador ASTC da lo mismo que Mesa en 560 mil bloques (14 tamaños, lineal y sRGB)"; \
@@ -268,6 +397,9 @@ test: all test-startup $(B)/framegen_test $(B)/nvn2_program_test $(B)/gob_test $
 	$(B)/deswizzle_gpu_test >$(B)/deswizzle_gpu.txt 2>&1; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el deswizzle en la GPU da lo mismo que el del procesador byte a byte (Switch 1 y Switch 2, 400 geometrías)"; \
 	elif [ $$r = 77 ]; then echo "(sin Vulkan no se prueba el deswizzle en la GPU)"; else echo "MAL: deswizzle en la GPU (ver $(B)/deswizzle_gpu.txt)"; ok=0; fi; \
+	$(B)/vk_pool_fisico_test >$(B)/vk_pool_fisico.txt 2>&1; r=$$?; \
+	if [ $$r = 0 ]; then echo "OK: un pool físico más grande que la VRAM libre cae en memoria de sistema en vez de rechazarse"; \
+	elif [ $$r = 77 ]; then echo "(sin Vulkan o sin memoria de sistema aparte no se prueba el pool físico)"; else echo "MAL: pool físico (ver $(B)/vk_pool_fisico.txt)"; ok=0; fi; \
 	if [ -n "$(LIBNX_GPU)" ]; then \
 		NX_SIN_VENTANA=1 NX_CAPTURA=$(B)/deko_astc.ppm NX_CAPTURA_CUADRO=3 timeout 60 $(B)/libnx_deko_astc >/dev/null 2>&1; \
 		$(B)/astc_test --captura guest/libnx/deko_astc/romfs $(B)/deko_astc.ppm 2>>$(B)/astc.err; r=$$?; \

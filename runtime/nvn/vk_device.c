@@ -217,6 +217,9 @@ typedef struct {
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr;
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh;
+    VkPhysicalDeviceMeshShaderFeaturesNV mesh_nv;
 } FeatureChain;
 
 static int create_device(void) {
@@ -242,6 +245,10 @@ static int create_device(void) {
     OPTIONAL_EXT(has_eds, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, eds, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT);
     OPTIONAL_EXT(has_eds2, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, eds2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT);
     OPTIONAL_EXT(has_eds3, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, eds3, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT);
+    if (g_vk.has_eds3 && has_ext(ep, ne, VK_NV_VIEWPORT_SWIZZLE_EXTENSION_NAME)) {
+        g_vk.has_viewport_swizzle = 1;
+        ext[n_ext++] = VK_NV_VIEWPORT_SWIZZLE_EXTENSION_NAME;
+    }
     OPTIONAL_EXT(has_vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, vids, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT);
     OPTIONAL_EXT(has_conditional_rendering, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, cond, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT);
     OPTIONAL_EXT(has_transform_feedback, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME, xfb, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT);
@@ -260,6 +267,11 @@ static int create_device(void) {
         ext[n_ext++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
+    }
+    int has_fsr = has_ext(ep, ne, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    if (has_fsr) {
+        ext[n_ext++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
+        CHAIN(fsr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR);
     }
     vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the seven below
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
@@ -286,13 +298,62 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
+    // Mesh shaders are optional groundwork for NVN2 task/mesh programs. Query only when the device advertises the
+    // extension; after the query, keep it enabled only if at least one of its two execution-stage features is usable.
+    void **mesh_link = NULL, **mesh_nv_link = NULL;
+    if (has_ext(ep, ne, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+        mesh_link = tail;
+        CHAIN(mesh, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+    }
+    if (has_ext(ep, ne, VK_NV_MESH_SHADER_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_NV_MESH_SHADER_EXTENSION_NAME;
+        mesh_nv_link = tail;
+        CHAIN(mesh_nv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_NV);
+    }
     free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
+    g_vk.has_viewport_swizzle = g_vk.has_viewport_swizzle && c->eds3.extendedDynamicState3ViewportSwizzle;
+    if (!g_vk.has_viewport_swizzle) c->eds3.extendedDynamicState3ViewportSwizzle = VK_FALSE;
+    rt_log("vk: viewport swizzle: %s", g_vk.has_viewport_swizzle ? "VK_NV_viewport_swizzle + dynamic state" : "unavailable");
     vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
+    if (mesh_link) {
+        g_vk.has_task_shader = c->mesh.taskShader;
+        g_vk.has_mesh_shader = c->mesh.meshShader;
+        // Vulkan makes the mesh-shader primitive rate feature depend on the base fragment-shading-rate feature.
+        // Query and enable both nodes together; do not pass an unsupported child feature to vkCreateDevice.
+        if (!has_fsr || !c->fsr.primitiveFragmentShadingRate)
+            c->mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+        if (!g_vk.has_task_shader && !g_vk.has_mesh_shader) {
+            rt_log("vk: VK_EXT_mesh_shader is present, but taskShader and meshShader are unsupported");
+        } else {
+            rt_log("vk: VK_EXT_mesh_shader taskShader=%d meshShader=%d", g_vk.has_task_shader, g_vk.has_mesh_shader);
+        }
+    }
+    if (mesh_nv_link) {
+        g_vk.has_task_shader_nv = c->mesh_nv.taskShader;
+        g_vk.has_mesh_shader_nv = c->mesh_nv.meshShader;
+        if (!g_vk.has_task_shader_nv && !g_vk.has_mesh_shader_nv) {
+            rt_log("vk: VK_NV_mesh_shader is present, but taskShader and meshShader are unsupported");
+        } else {
+            rt_log("vk: VK_NV_mesh_shader taskShader=%d meshShader=%d", g_vk.has_task_shader_nv, g_vk.has_mesh_shader_nv);
+        }
+    }
+    // Do not unlink a later feature node when only the earlier mesh dialect is unavailable.
+    if (mesh_link && !g_vk.has_mesh_shader && !g_vk.has_task_shader) {
+        if (mesh_nv_link && (g_vk.has_mesh_shader_nv || g_vk.has_task_shader_nv)) *mesh_link = &c->mesh_nv;
+        else *mesh_link = NULL;
+        n_ext--;
+    }
+    if (mesh_nv_link && !g_vk.has_mesh_shader_nv && !g_vk.has_task_shader_nv) {
+        if (mesh_link && (g_vk.has_mesh_shader || g_vk.has_task_shader)) *mesh_nv_link = NULL;
+        else if (!mesh_link) *mesh_nv_link = NULL;
+        n_ext--;
+    }
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
@@ -342,6 +403,35 @@ static int create_device(void) {
     VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
+    if (g_vk.has_viewport_swizzle) {
+        g_vk.cmd_set_viewport_swizzle =
+            (PFN_vkCmdSetViewportSwizzleNV)vkGetDeviceProcAddr(g_vk.device, "vkCmdSetViewportSwizzleNV");
+        if (!g_vk.cmd_set_viewport_swizzle) {
+            rt_log("vk: viewport swizzle feature enabled but vkCmdSetViewportSwizzleNV is missing");
+            return 0;
+        }
+    }
+    if (g_vk.has_mesh_shader) {
+        g_vk.cmd_draw_mesh_tasks =
+            (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(g_vk.device, "vkCmdDrawMeshTasksEXT");
+        g_vk.cmd_draw_mesh_tasks_indirect =
+            (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(g_vk.device, "vkCmdDrawMeshTasksIndirectEXT");
+        if (!g_vk.cmd_draw_mesh_tasks || !g_vk.cmd_draw_mesh_tasks_indirect) {
+            rt_log("vk: VK_EXT_mesh_shader is enabled but its draw entry points are unavailable; disabling NVN2 mesh draws");
+            g_vk.has_mesh_shader = 0;
+        }
+    }
+    if (g_vk.has_mesh_shader_nv) {
+        g_vk.cmd_draw_mesh_tasks_nv =
+            (PFN_vkCmdDrawMeshTasksNV)vkGetDeviceProcAddr(g_vk.device, "vkCmdDrawMeshTasksNV");
+        g_vk.cmd_draw_mesh_tasks_indirect_nv =
+            (PFN_vkCmdDrawMeshTasksIndirectNV)vkGetDeviceProcAddr(g_vk.device, "vkCmdDrawMeshTasksIndirectNV");
+        if (!g_vk.cmd_draw_mesh_tasks_nv || !g_vk.cmd_draw_mesh_tasks_indirect_nv) {
+            rt_log("vk: VK_NV_mesh_shader is enabled but its draw entry points are unavailable; disabling its NVN2 path");
+            g_vk.has_mesh_shader_nv = 0;
+            g_vk.has_task_shader_nv = 0;
+        }
+    }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }

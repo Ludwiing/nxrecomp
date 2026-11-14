@@ -129,6 +129,20 @@ def computo():
     return p
 
 
+def computo_ldc_is():
+    """Como computo(), pero LDC usa .IS con el banco dinámico en los bits altos de Ra.
+    R4 solo contiene offsets menores de 64 KiB en este caso, por lo que el banco sigue siendo c3;
+    esto verifica que el traductor acepte y preserve el modo de dirección que aparece en Mario Tennis Fever.
+    """
+    p = computo()
+    for i, (insn, texto) in enumerate(p):
+        if texto == "LDC R7, c[0x3][R4]":
+            lo, hi = insn
+            p[i] = ((lo, (hi & ~(3 << 14)) | (2 << 14)), None)
+            return p
+    raise AssertionError("computo() ya no contiene el LDC dinámico esperado")
+
+
 LOP3_I = (0x000000fc02037812, 0x000fe400078ec0ff)       # LOP3.LUT R3, R2, 0xfc, RZ, 0xc0, !PT
 IMNMX_I = (0x0000000303037817, 0x000fca0003800000)      # IMNMX.U32 R3, R3, 0x3, PT
 BRX = (0xfffffd8004007949, 0x000fea000383ffff)          # BRX R4 -0x280
@@ -234,7 +248,11 @@ def main():
     tmp = tempfile.mkdtemp(prefix="sm86_programa_")
     c3 = [0x1000 + 7 * i for i in range(64)]
     casos = (("cómputo", computo(), b"", "cs", b"", esperado_computo),
+             ("ldc_is", computo_ldc_is(), b"", "cs", b"", esperado_computo),
              ("saltos", saltos(), b"", "cs", C1_SALTOS, esperado_saltos),
+             ("prmt", prmt(), b"", "cs", b"", lambda c3: [0x80FF0244] * 64),
+             ("hadd2", hadd2(), b"", "cs", b"", lambda c3: [0xC0003E00] * 64),
+             ("hfma2", hfma2(), b"", "cs", b"", lambda c3: [0x49004500] * 64),
              ("fragmento", fragmento(), sph_fragmento(), "ps", b"", None))
     for nombre, prog, sph, etapa, c1, esperado in casos:
         if comprobar_textos(prog, sm86_oraculo, nombre):
@@ -247,7 +265,7 @@ def main():
             print(f"MAL: {nombre}: {e}")
             ok = False
             continue
-        extra = {"shared": 256} if etapa == "cs" else {"fout": {"0": "float"}}
+        extra = {"shared": 256, "nvn2_cs": [1, 1, 0, 0x400, 0, 0, 0]} if etapa == "cs" else {"fout": {"0": "float"}}
         respuesta, spv, res = sp.traducir(p, etapa, tmp, clave=nombre.replace("ó", "o"), local=(64, 1, 1), extra=extra)
         if VERBOSO:
             print(f"  {nombre}: {len(prog)} instrucciones SM86 -> {len(p['codigo'])} bytes Maxwell; totk_xlate: {respuesta}")
@@ -294,6 +312,41 @@ def errores_claros(sp):
     return bien
 
 
+def con_salida(cuerpo):
+    """64 hilos: el cuerpo deja su resultado en R5, que se guarda en out[tid] (como computo)."""
+    p = [(ins(S2R, op0_n=0), "S2R R0, SR_TID.X"),
+         (ins(IADD3_R, op0_n=4, op3_n=0, op4_n=0, op5_n=RZ), "IADD3 R4, R0, R0, RZ"),
+         (ins(IADD3_R, op0_n=4, op3_n=4, op4_n=4, op5_n=RZ), "IADD3 R4, R4, R4, RZ")]
+    p += cuerpo
+    p += [(ins(MOV_C, op0_n=3, op1_banco=0, op1_off=0x114), "MOV R3, c[0x0][0x114]"),
+          (ins(IADD3_C, op0_n=2, op3_n=4, op4_banco=0, op4_off=0x110, op5_n=RZ), "IADD3 R2, R4, c[0x0][0x110], RZ"),
+          ((0x0000000502007986, 0x000fe8000c101904), "STG.E [R2.64], R5"), (EXIT, "EXIT"), (rel(BRA, -0x10), None)]
+    return p
+
+
+# PRMT: tools/sm86_baja_prmt.py (Ryujinx no tiene PRMT de Maxwell: la regla anterior daba 0 en la GPU).
+# R1 = 0x11223344, R7 = 0x80ff0102; selector 0x7e40: byte 0 = A.b0 (0x44), byte 1 = C.b0 (0x02), byte 2 = signo de
+# C.b2 (0xff -> 0xff), byte 3 = C.b3 (0x80): 0x80ff0244. El byte 3 no es 0 a propósito: un error que deje ahí lo que
+# tenía el temporal (que empieza en 0) no se vería con 0x00.
+def prmt():
+    return con_salida([(ins(MOV_I, op0_n=1, op1_v=0x11223344), "MOV R1, 0x11223344"),
+                       (ins(MOV_I, op0_n=7, op1_v=0x80FF0102), "MOV R7, 0x80ff0102"),
+                       ((0x00007E4001057816, 0x000fe20000000007), "PRMT R5, R1, 0x7e40, R7")])
+
+
+# Medio float: tools/sm86_baja_medios.py. R1 = (H0 1.0, H1 2.0), R6 = (H0 0.5, H1 -4.0).
+def hadd2():   # (1 + 0.5, 2 - 4) = (1.5, -2.0)
+    return con_salida([(ins(MOV_I, op0_n=1, op1_v=0x40003C00), "MOV R1, 0x40003c00"),
+                       (ins(MOV_I, op0_n=6, op1_v=0xC4003800), "MOV R6, 0xc4003800"),
+                       ((0x0000000601057230, 0x000fe20000000000), "HADD2 R5, R1, R6")])
+
+
+def hfma2():   # R1 * R6.H1_H1 + R1, con - en A: (-1 * -4 + 1, -2 * -4 + 2) = (5, 10)
+    return con_salida([(ins(MOV_I, op0_n=1, op1_v=0x40003C00), "MOV R1, 0x40003c00"),
+                       (ins(MOV_I, op0_n=6, op1_v=0xC4003800), "MOV R6, 0xc4003800"),
+                       ((0x3000000601057231, 0x000fe20000000101), "HFMA2 R5, -R1, R6.H1_H1, R1")])
+
+
 def correr_computo(nombre, spv, res, c3, c1, esperado, tmp):
     """Corre el SPIR-V en la GPU con build/sm86_programa_vk: c0 = ceros (la dirección base del buffer 0 es 0),
     c3 = la tabla, el buffer de memoria global = salida."""
@@ -334,12 +387,16 @@ def correr_computo(nombre, spv, res, c3, c1, esperado, tmp):
         return False
     tiene = list(struct.unpack("<64I", open(salida, "rb").read()[:256]))
     quiere = esperado(c3)
+    que = {"cómputo": "saltos, lazo, LDC, compartida, BAR, STG", "ldc_is": "LDC.IS de banco dinámico",
+           "saltos": "BRX con tabla en c1, CALL/RET", "prmt": "PRMT con signo, sin el PRMT de Maxwell",
+           "hadd2": "medio float", "hfma2": "medio float, - y .H1_H1"}[nombre]
     if tiene != quiere:
         malos = [t for t in range(64) if tiene[t] != quiere[t]]
         print(f"MAL: {nombre}: el cómputo bajado dio otra cosa en {len(malos)} hilos; ej. hilo {malos[0]}: "
-              f"{tiene[malos[0]]:#x} en vez de {quiere[malos[0]]:#x}")
+              f"{tiene[malos[0]]:#x} en vez de {quiere[malos[0]]:#x}; "
+              f"primeros 8: {', '.join(f'{x:#x}' for x in tiene[:8])} "
+              f"en vez de {', '.join(f'{x:#x}' for x in quiere[:8])}")
         return False
-    que = {"cómputo": "saltos, lazo, LDC, compartida, BAR, STG", "saltos": "BRX con tabla en c1, CALL/RET"}[nombre]
     print(f"OK: {nombre} SM86 ({que}) -> Maxwell -> SPIR-V corre en la GPU y da lo esperado en los 64 hilos")
     return True
 

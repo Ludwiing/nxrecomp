@@ -15,6 +15,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn2_program.h"
 #include "nvn_tex.h"
 #include "platform/platform.h"
 
@@ -423,14 +424,32 @@ NVN_API(nvnProgramFinalize) {
     o->magic = 0;
 }
 static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
-    if (n < 0 || n > 6 || (n && !sd)) {
+    if (n < 0 || n > NVN_MAX_PROGRAM_STAGES || (n && !sd)) {
         rt_log("nvn: ProgramSetShaders with %d stages at %p", n, (const void *)sd);
+        return 0;
+    }
+    uint32_t nvn2_stages = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t stage;
+        if (nvn2_control_stage_leer(sd[i].control, &stage) && stage < NVN_MAX_PROGRAM_STAGES)
+            nvn2_stages |= 1u << stage;
+    }
+    if (n > 6 && !(nvn2_stages & ((1u << NVN2_CONTROL_STAGE_TASK) | (1u << NVN2_CONTROL_STAGE_MESH)))) {
+        rt_log("nvn: ProgramSetShaders with %d stages has no NVN2 task/mesh stage", n);
         return 0;
     }
     prog_release(o);
     o->nstage = (uint32_t)n;
     if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
     o->serial = nvn_new_serial();
+    // NVN2 adds task/mesh stage IDs (6/7) to the control section, while the legacy NVNshaderData
+    // array only gives a count. Report each observed stage-set once so new game ports can establish
+    // the real program combinations before the draw path is extended.
+    if (nvn2_stages) {
+        static uint8_t seen_stage_sets[256];
+        if (!__atomic_test_and_set(&seen_stage_sets[nvn2_stages], __ATOMIC_RELAXED))
+            rt_log("nvn: NVN2 ProgramSetShaders stages=%02x (bit 6 task, bit 7 mesh)", nvn2_stages);
+    }
     NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }
@@ -448,12 +467,12 @@ NVN_API(nvnProgramSetShadersExt) {
     prog_t *o = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
     const shader_data_ext *sd = arg_p(c, 2);
-    if (n < 0 || n > 6 || (n && !sd)) {
+    if (n < 0 || n > NVN_MAX_PROGRAM_STAGES || (n && !sd)) {
         rt_log("nvn: ProgramSetShadersExt with %d stages at %p", n, (const void *)sd);
         ret_x(c, 0);
         return;
     }
-    NVNshaderData plain[6];
+    NVNshaderData plain[NVN_MAX_PROGRAM_STAGES];
     for (int i = 0; i < n; i++) {
         if (sd[i].reserved)
             rt_fatal("nvn: ProgramSetShadersExt: unknown non-zero field %#llx in stage %d", (unsigned long long)sd[i].reserved, i);

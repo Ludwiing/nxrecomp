@@ -7,12 +7,30 @@ Layout and name hashing follow libnx romfs_header/romfs_dir/romfs_file.
 import argparse
 import fcntl
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
 import tempfile
 
 NONE = 0xffffffff
+# Bumped whenever the produced image changes for the same source, so stale
+# .native images are rebuilt. The runtime reads only the first two numbers.
+FORMAT = 2
+# One line of an FTP LIST reply (Unix style), as wget writes it to .listing.
+FTP_LIST_LINE = re.compile(rb'[-dlbcps][-rwxsStT]{9}[+@.]?\s+\d+\s+\S+\s+\S+\s+\d+\s+\S+\s+\d+\s+[\d:]+\s.+')
+
+
+def ftp_listing(name, data):
+    """wget --mirror over FTP leaves a .listing (the server's LIST reply) in every
+    directory. Dumps copied that way carry hundreds of them; they are not part of
+    the game's RomFS, and games that enumerate a directory and load every entry
+    (Switch Sports Resort strips the extension and gets an empty resource name)
+    crash on them."""
+    if name != b'.listing':
+        return False
+    lines = [line.rstrip(b'\r') for line in data.split(b'\n') if line.strip()]
+    return bool(lines) and all(FTP_LIST_LINE.fullmatch(line) for line in lines)
 
 
 def align(n, size=4):
@@ -32,7 +50,7 @@ def convert(source):
     stamp = Path(str(output) + '.source')
     with source.open('rb') as original:
         stat = os.fstat(original.fileno())
-        identity = f'{stat.st_size}\t{stat.st_mtime_ns}\n'
+        identity = f'{stat.st_size}\t{stat.st_mtime_ns}\t{FORMAT}\n'
         head = original.read(32)
         if head[:8] != b'DMROMFS1':
             return source
@@ -55,7 +73,11 @@ def convert(source):
                 raise ValueError('Invalid archive name')
             if kind and (a < 32 or a > index or b > index - a):
                 raise ValueError('Archive file lies outside data region')
-            entries.append(dict(a=a, b=b, name=name, kind=kind, parent=None, sibling=NONE))
+            skip = False
+            if kind and name == b'.listing' and b <= 64 * 1024 * 1024:
+                original.seek(a)
+                skip = ftp_listing(name, original.read(b))
+            entries.append(dict(a=a, b=b, name=name, kind=kind, parent=None, sibling=NONE, skip=skip))
         if entries[0]['kind'] or entries[0]['name']:
             raise ValueError('Invalid archive root')
         entries[0]['parent'] = 0
@@ -70,13 +92,14 @@ def convert(source):
                     raise ValueError('Directory graph has duplicate children')
                 child['parent'] = k
             for kind in (0, 1):
-                children = [c for c in entries[a:a + b] if c['kind'] == kind]
+                children = [c for c in entries[a:a + b] if c['kind'] == kind and not c['skip']]
                 for left, right in zip(children, children[1:]):
                     left['next_entry'] = right
         if any(e['parent'] is None for e in entries):
             raise ValueError('Unreachable archive entry')
         directories = [e for e in entries if not e['kind']]
-        files = [e for e in entries if e['kind']]
+        files = [e for e in entries if e['kind'] and not e['skip']]
+        dropped = sum(e['skip'] for e in entries)
         for group, base_size in ((directories, 24), (files, 32)):
             offset = 0
             for e in group:
@@ -113,7 +136,7 @@ def convert(source):
                 else:
                     children = entries[e['a']:e['a'] + e['b']]
                     first_dir = next((c['offset'] for c in children if not c['kind']), NONE)
-                    first_file = next((c['offset'] for c in children if c['kind']), NONE)
+                    first_file = next((c['offset'] for c in children if c['kind'] and not c['skip']), NONE)
                     packed = struct.pack('<6I', parent, sibling, first_dir, first_file, previous, len(e['name']))
                 table_out[e['offset']:e['offset'] + len(packed)] = packed
                 start = e['offset'] + len(packed)
@@ -149,7 +172,8 @@ def convert(source):
                 raise ValueError('Source changed during conversion')
             os.replace(temporary, output)
             stamp.write_text(identity)
-            print(f'{output}: {len(directories)} directories, {len(files)} files; {mode}', flush=True)
+            print(f'{output}: {len(directories)} directories, {len(files)} files'
+                  f' ({dropped} FTP .listing left out); {mode}', flush=True)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)

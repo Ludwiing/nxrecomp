@@ -49,9 +49,9 @@ const RtConfig *rt_config(void);
 // Lo que totk-pc-recomp hace al presentar un cuadro y que es propio de TotK (ritmo de 60 fps, videos, cambio de
 // resolución, mediciones): en el runtime genérico no hace nada.
 enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
-static inline uint64_t perf_begin(void) { return 0; }
-static inline void perf_end(int kind, uint64_t t0) { (void)kind, (void)t0; }
-static inline void perf_replay_thread(void) {}
+uint64_t perf_begin(void);
+void perf_end(int kind, uint64_t t0);
+void perf_replay_thread(void);
 static inline void movie_tick(Cpu *c) { (void)c; }
 static inline void res_present(Cpu *c) { (void)c; }
 static inline int frame_step_realtime(void) { return 0; }
@@ -80,13 +80,13 @@ typedef struct {
     uint64_t idle_gaps, max_gap_ns;
 } PerfGpu;
 extern void (*perf_gpu_stats)(PerfGpu *out);
-static inline void perf_count(int kind) { (void)kind; }
-static inline void perf_present(uint64_t frame) { (void)frame; }
-static inline void perf_replay(uint64_t t0) { (void)t0; }
-static inline void perf_gpu_wait(uint64_t t0) { (void)t0; }
-static inline int perf_gpu_timing(void) { return 0; }
-static inline void perf_gpu_busy(uint64_t ns) { (void)ns; }
-static inline void prof_write(void) {}
+void perf_count(int kind);
+void perf_present(uint64_t frame);
+void perf_replay(uint64_t t0);
+void perf_gpu_wait(uint64_t t0);
+int perf_gpu_timing(void);
+void perf_gpu_busy(uint64_t ns);
+void prof_write(void);
 // Memoria del juego: qué páginas escribió la CPU (nxkern.c nx_mem_written, con userfaultfd). UINT64_MAX fuera del heap
 // y de la región alias: el backend copia ese rango entero. Congelar regiones (mem_freeze) todavía no está.
 uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);

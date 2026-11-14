@@ -3,6 +3,7 @@
 import os
 import subprocess
 import threading
+import time
 
 import gi
 
@@ -46,7 +47,11 @@ def texto_estado(juego, construyendo):
     if construyendo:
         return "Construyendo…"
     if juego.listo:
+        if juego.datos.get("plataforma") == "switch2" and not motor.motor_especial(juego):
+            return "Compilado · Switch 2 experimental"
         return "Listo para jugar"
+    if juego.runtime_desactualizado:
+        return "Runtime desactualizado"
     hechos = sum(juego.paso_hecho(k) for k, _, _ in motor.PASOS)
     return f"Sin terminar ({hechos} de {len(motor.PASOS)} pasos)" if hechos else "Sin construir"
 
@@ -60,6 +65,8 @@ class Ventana(Adw.ApplicationWindow):
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.construcciones = {}   # id de juego -> Construccion en curso
         self.partidas = {}         # id de juego -> proceso del juego
+        self.cerrando = set()      # ids que el usuario mandó cerrar: su código de salida no es un error
+        self.sin_ventana = {}      # id de juego -> momento del arranque, mientras no se le vea ventana
         self.detalle = None        # PaginaJuego visible
 
         self.nav = Adw.NavigationView()
@@ -67,8 +74,28 @@ class Ventana(Adw.ApplicationWindow):
         self.set_content(self.toasts)
         self.nav.add(self._pagina_biblioteca())
         self.nav.connect("popped", lambda *_: setattr(self, "detalle", None))
+        self.connect("close-request", self._al_cerrar)
+        self.aviso_cierre = None   # diálogo "espera a que termine" abierto, para no apilar varios
         self.refrescar()
         GLib.idle_add(self._primera_vez)
+
+    def _al_cerrar(self, *_):
+        """close-request: devolver True cancela el cierre. Con una construcción en marcha la ventana no se
+        cierra; se le pide al usuario que espere (la construcción no se detiene ni se toca)."""
+        activas = [c for c in self.construcciones.values() if c.activa()]
+        if not activas:
+            return False
+        if self.aviso_cierre is None:
+            nombres = ", ".join(c.juego.nombre for c in activas)
+            d = Adw.AlertDialog(heading="Hay una construcción en curso",
+                                body=f"{nombres} se está construyendo. Espera a que termine antes de cerrar "
+                                     "NX2Linux; cuando acabe vas a ver el aviso y ya podrás cerrar la ventana.")
+            d.add_response("ok", "Esperar")
+            d.set_close_response("ok")
+            d.connect("closed", lambda *_a: setattr(self, "aviso_cierre", None))
+            self.aviso_cierre = d
+            d.present(self)
+        return True
 
     # ---------- biblioteca ----------
 
@@ -214,7 +241,8 @@ class Ventana(Adw.ApplicationWindow):
         threading.Thread(target=trabajo, daemon=True).start()
 
     def _confirmar(self, origen):
-        partes = [f"Juego: {os.path.basename(origen['base'].rstrip(os.sep))}"]
+        partes = [f"Juego: {origen.get('nombre') or os.path.basename(origen['base'].rstrip(os.sep))} "
+                  f"(Title ID {origen['title']})", f"Archivo: {os.path.basename(origen['base'].rstrip(os.sep))}"]
         partes.append(f"Actualización: {os.path.basename(origen['update'])}" if origen["update"]
                       else "Sin actualización")
         if origen["dlc"]:
@@ -231,10 +259,39 @@ class Ventana(Adw.ApplicationWindow):
 
         def resp(_d, r):
             if r == "construir":
-                j = motor.nuevo_juego(origen, origen.get("llaves"))
+                if origen["title"] in self.construcciones:
+                    self.toast("Este juego ya se está construyendo; espera a que termine")
+                    return
+                try:
+                    j = motor.nuevo_juego(origen, origen.get("llaves"))
+                except Exception as e:
+                    self._error("No se pudo agregar", str(e))
+                    return
                 self.refrescar()
                 self.abrir_juego(j)
-                self.construir(j)
+                self.construir(j, motivo="agregar juego → Construir")
+        d.connect("response", resp)
+        d.present(self)
+
+    def _sin_ventana(self, juego, pid):
+        d = Adw.AlertDialog(heading=f"{juego.nombre} no muestra ventana",
+                            body=f"El juego arrancó hace más de {self.ESPERA_VENTANA} segundos y todavía no abrió "
+                                 "su ventana. Puede seguir cargando (la primera vez compila shaders) o haberse "
+                                 "trabado. Lo que va diciendo está en ultima_partida.txt.")
+        extra = cola_widget(juego)
+        if extra:
+            d.set_extra_child(extra)
+        d.add_response("esperar", "Esperar")
+        d.add_response("ver", "Ver la salida")
+        d.add_response("cerrar", "Cerrarlo")
+        d.set_response_appearance("cerrar", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_close_response("esperar")
+
+        def resp(_d, r):
+            if r == "cerrar":
+                self._cerrar(juego, [pid])
+            elif r == "ver":
+                abrir(os.path.join(juego.carpeta, "ultima_partida.txt"))
         d.connect("response", resp)
         d.present(self)
 
@@ -249,13 +306,13 @@ class Ventana(Adw.ApplicationWindow):
         self.detalle = PaginaJuego(self, juego)
         self.nav.push(self.detalle)
 
-    def construir(self, juego, desde=None, solo_dlc=None):
+    def construir(self, juego, desde=None, solo_dlc=None, motivo=None):
         if juego.id in self.construcciones:
             return
 
         def avisar(paso, frac, linea):
             GLib.idle_add(self._aviso, juego.id, paso, frac, linea)
-        c = motor.Construccion(juego, avisar, desde, solo_dlc)
+        c = motor.Construccion(juego, avisar, desde, solo_dlc, motivo=motivo)
         self.construcciones[juego.id] = c
         c.empezar()
         self.refrescar()
@@ -276,45 +333,154 @@ class Ventana(Adw.ApplicationWindow):
 
     def jugar(self, juego):
         p = self.partidas.get(juego.id)
+        pids = set(motor.procesos_del_juego(juego))
         if p and p.poll() is None:
-            self.toast("Ya está abierto")
+            pids.add(p.pid)
+        if pids:
+            self._ya_abierto(juego, sorted(pids))
             return
         try:
             self.partidas[juego.id] = motor.jugar(juego)
+        except motor.EjecutableObsoleto as e:
+            self.refrescar()
+            if self.detalle and self.detalle.juego.id == juego.id:
+                self.detalle.actualizar()
+            d = Adw.AlertDialog(heading=f"{juego.nombre} necesita actualizar el runtime", body=str(e).capitalize() + ".")
+            d.add_response("despues", "Después")
+            d.add_response("actualizar", "Actualizar runtime")
+            d.set_response_appearance("actualizar", Adw.ResponseAppearance.SUGGESTED)
+            d.connect("response", lambda _d, r: r == "actualizar" and self.construir(juego, motivo="Jugar → aviso de runtime → Actualizar runtime"))
+            d.present(self)
+            return
         except Exception as e:
             self._error("No se pudo abrir", str(e))
             return
         self.toast(f"Abriendo {juego.nombre}…")
+        self.sin_ventana[juego.id] = time.monotonic()
         GLib.timeout_add_seconds(2, self._vigilar, juego)
+
+    # Tiempo que una partida puede seguir cargando sin mostrar ventana antes de avisar.
+    ESPERA_VENTANA = 90
+
+    def _ya_abierto(self, juego, pids):
+        """El juego ya corre (lanzado por esta ventana o por una anterior de NX2Linux). Con ventana, se enfoca;
+        sin ventana, se ofrece cerrarlo: lo normal es que se haya trabado al cargar."""
+        ventana = motor.tiene_ventana(pids)
+        if ventana and motor.enfocar(pids):
+            self.toast(f"{juego.nombre} ya está abierto")
+            return
+        copias = f"{len(pids)} copias" if len(pids) > 1 else "una copia"
+        if ventana is None:
+            cuerpo = (f"Hay {copias} de {juego.nombre} en marcha (PID {', '.join(map(str, pids))}). Si no la ves, "
+                      "se quedó trabada: ciérrala y vuelve a abrirlo.")
+        else:
+            cuerpo = (f"Hay {copias} de {juego.nombre} en marcha (PID {', '.join(map(str, pids))}), pero ninguna "
+                      "tiene ventana: seguramente se trabó mientras cargaba.")
+        d = Adw.AlertDialog(heading=f"{juego.nombre} ya está abierto", body=cuerpo)
+        extra = cola_widget(juego)
+        if extra:
+            d.set_extra_child(extra)
+        d.add_response("dejar", "Dejarlo")
+        d.add_response("cerrar", "Cerrarlo")
+        d.add_response("reabrir", "Cerrar y abrir de nuevo")
+        d.set_response_appearance("cerrar", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_response_appearance("reabrir", Adw.ResponseAppearance.SUGGESTED)
+        d.set_close_response("dejar")
+        d.connect("response", lambda _d, r: r in ("cerrar", "reabrir") and self._cerrar(juego, pids, r == "reabrir"))
+        d.present(self)
+
+    def _cerrar(self, juego, pids, reabrir=False):
+        """Cierra las partidas en un hilo (puede esperar unos segundos) y, si se pidió, vuelve a abrir el juego."""
+        self.toast(f"Cerrando {juego.nombre}…")
+        self.cerrando.add(juego.id)
+
+        def hilo():
+            quedan = motor.cerrar_partidas(pids)
+
+            def listo():
+                self.cerrando.discard(juego.id)
+                p = self.partidas.get(juego.id)
+                if p and p.poll() is not None:
+                    self.partidas.pop(juego.id, None)
+                if quedan:
+                    self._error("No se pudo cerrar", f"Siguen en marcha: PID {', '.join(map(str, quedan))}.")
+                elif reabrir:
+                    self.jugar(juego)
+                else:
+                    self.toast(f"{juego.nombre} cerrado")
+                return False
+            GLib.idle_add(listo)
+        threading.Thread(target=hilo, daemon=True).start()
 
     def _vigilar(self, juego):
         p = self.partidas.get(juego.id)
         if not p:
+            self.sin_ventana.pop(juego.id, None)
             return False
         rc = p.poll()
         if rc is None:
+            desde = self.sin_ventana.get(juego.id)
+            if desde is not None:
+                ventana = motor.tiene_ventana([p.pid])
+                if ventana is not False:   # ya la tiene, o no se puede saber: no hay nada que vigilar
+                    self.sin_ventana.pop(juego.id, None)
+                elif time.monotonic() - desde > self.ESPERA_VENTANA:
+                    self.sin_ventana.pop(juego.id, None)   # se avisa una sola vez por partida
+                    self._sin_ventana(juego, p.pid)
             return True
+        self.sin_ventana.pop(juego.id, None)
         del self.partidas[juego.id]
-        if motor.pistas_nuevas(juego) > 0: # saltó a código que no estaba recompilado: recompilar y seguir
+        try:   # el código y su significado, al final de la salida guardada
+            with open(os.path.join(juego.carpeta, "ultima_partida.txt"), "a") as f:
+                f.write(f"\n[nx2linux] el juego terminó con código {rc}: {motor.significado_salida(rc)}\n")
+        except OSError:
+            pass
+        # Saltó a código que no estaba recompilado, o armó y quiso cargar un módulo (nn::ro) que todavía no se
+        # tradujo: NX2Linux lo anotó o lo guardó; recompilar lo incluye.
+        if motor.pistas_nuevas(juego) > 0 or motor.modulos_ro_nuevos(juego) > 0:
             d = Adw.AlertDialog(heading=f"{juego.nombre} necesita recompilarse",
                                 body="El juego llegó a código que la recompilación no había visto. NX2Linux "
-                                     "anotó dónde; al recompilar lo incluye y el juego pasa de ese punto.")
+                                     "lo guardó; al recompilar lo incluye y el juego pasa de ese punto.")
             d.add_response("despues", "Después")
             d.add_response("recompilar", "Recompilar ahora")
             d.set_response_appearance("recompilar", Adw.ResponseAppearance.SUGGESTED)
-            d.connect("response", lambda _d, r: r == "recompilar" and self.construir(juego, desde="recompilar"))
+            d.connect("response", lambda _d, r: r == "recompilar" and self.construir(juego, desde="recompilar",
+                                                                         motivo="aviso de código nuevo al cerrar el juego → Recompilar ahora"))
             d.present(self)
             return False
-        if rc not in (0, -15):
+        if rc not in (0, -15) and juego.id not in self.cerrando:
             d = Adw.AlertDialog(heading=f"{juego.nombre} se cerró con un error",
-                                body=f"Código {rc}. Lo último que dijo está en ultima_partida.txt, en la carpeta "
-                                     "del juego.")
+                                body=f"Código {rc}: {motor.significado_salida(rc)}. Lo último que dijo está en "
+                                     "ultima_partida.txt, en la carpeta del juego.")
+            extra = cola_widget(juego)
+            if extra:
+                d.set_extra_child(extra)
             d.add_response("ok", "Cerrar")
             d.add_response("ver", "Ver la salida")
             d.connect("response", lambda _d, r: r == "ver" and abrir(os.path.join(juego.carpeta,
                                                                                   "ultima_partida.txt")))
             d.present(self)
         return False
+
+
+def cola_widget(juego, lineas=12):
+    """Recuadro con lo último que dijo el juego (ultima_partida.txt), para mostrar dentro de un aviso; None si
+    no hay salida."""
+    texto = motor.cola_salida(juego, lineas)
+    if not texto:
+        return None
+    vista = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                         top_margin=6, bottom_margin=6, left_margin=8, right_margin=8)
+    vista.get_buffer().set_text(texto)
+    caja = Gtk.ScrolledWindow(child=vista, min_content_height=160, max_content_height=260,
+                              propagate_natural_height=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+    caja.add_css_class("card")
+    marco = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    marco.append(Gtk.Label(label="Lo último que dijo el juego", xalign=0, css_classes=["dim-label"]))
+    marco.append(caja)
+    GLib.idle_add(lambda: vista.scroll_to_mark(vista.get_buffer().get_insert(), 0, False, 0, 1) and False)
+    vista.get_buffer().place_cursor(vista.get_buffer().get_end_iter())
+    return marco
 
 
 def abreviar(ruta):
@@ -337,8 +503,8 @@ class PaginaJuego(Adw.NavigationPage):
         acciones = Gio.SimpleActionGroup()
         for nombre, etiqueta, fn in [
             ("carpeta", "Abrir la carpeta del juego", lambda: abrir(juego.carpeta)),
-            ("rehacer", "Construir de nuevo desde cero", lambda: ventana.construir(juego, desde="extraer")),
-            ("recompilar", "Recompilar (sin volver a extraer)", lambda: ventana.construir(juego, desde="recompilar")),
+            ("rehacer", "Construir de nuevo desde cero", lambda: ventana.construir(juego, desde="extraer", motivo="menú del juego → Construir de nuevo desde cero")),
+            ("recompilar", "Recompilar (sin volver a extraer)", lambda: ventana.construir(juego, desde="recompilar", motivo="menú del juego → Recompilar")),
             ("contenido", "Agregar actualización o DLC…", self._agregar_contenido),
             ("quitar", "Quitar de la biblioteca", self._quitar),
         ]:
@@ -429,7 +595,10 @@ class PaginaJuego(Adw.NavigationPage):
         self.sub.set_label(" · ".join(partes) + " — " + texto_estado(j, construyendo))
         self.b_jugar.set_sensitive(j.listo and not construyendo)
         self.b_contenido.set_sensitive(not construyendo)
-        self.b_construir.set_label("Detener" if construyendo else ("Reconstruir" if j.listo else "Construir"))
+        runtime_obsoleto = j.runtime_desactualizado
+        etiqueta = ("Detener" if construyendo else "Actualizar runtime" if runtime_obsoleto else
+                    "Reconstruir" if j.listo else "Construir")
+        self.b_construir.set_label(etiqueta)
         self.b_construir.remove_css_class("destructive-action")
         if construyendo:
             self.b_construir.add_css_class("destructive-action")
@@ -440,7 +609,10 @@ class PaginaJuego(Adw.NavigationPage):
                 fila.set_subtitle("En curso…")
             else:
                 fila.icono.set_from_icon_name("emblem-ok-symbolic" if hecho else "")
-                fila.set_subtitle(j.datos["pasos"].get(k, ""))
+                detalle = j.datos["pasos"].get(k, "")
+                if k == "compilar" and detalle and j.runtime_desactualizado:
+                    detalle = "El runtime cambió desde esta compilación; actualiza el ejecutable."
+                fila.set_subtitle(detalle)
         if not construyendo:
             hechos = sum(j.paso_hecho(k) * p for k, _, p in motor.PASOS) / sum(p for _, _, p in motor.PASOS)
             self.barra.set_fraction(hechos)
@@ -475,10 +647,10 @@ class PaginaJuego(Adw.NavigationPage):
         if c:
             c.cancelar()
         elif self.juego.listo:
-            self.v.construir(self.juego, desde="recompilar")
+            self.v.construir(self.juego, desde="recompilar", motivo="botón Reconstruir de la página del juego")
         else:
             self.exp.set_expanded(True)
-            self.v.construir(self.juego)
+            self.v.construir(self.juego, motivo=f"botón {self.b_construir.get_label()} de la página del juego")
 
     def _agregar_contenido(self):
         if self.juego.id in self.v.construcciones:
@@ -529,13 +701,16 @@ class PaginaJuego(Adw.NavigationPage):
                 return
             self.exp.set_expanded(True)
             if hacer == "extraer":
-                self.v.construir(self.juego, desde="extraer")
+                self.v.construir(self.juego, desde="extraer", motivo="contenido del juego → reconstruir desde cero")
             else:
-                self.v.construir(self.juego, solo_dlc=hacer)
+                self.v.construir(self.juego, solo_dlc=hacer, motivo="contenido del juego → agregar DLC")
         d.connect("response", resp)
         d.present(self.v)
 
     def _quitar(self):
+        if self.juego.id in self.v.construcciones:
+            self.v.toast("Detén la construcción y espera a que termine antes de quitar el juego")
+            return
         d = Adw.AlertDialog(heading=f"¿Quitar {self.juego.nombre}?",
                             body="Se borra lo que NX2Linux construyó, incluidas las partidas guardadas de este "
                                  "juego. Tus archivos originales no se tocan.")
@@ -545,10 +720,14 @@ class PaginaJuego(Adw.NavigationPage):
 
         def resp(_d, r):
             if r == "quitar":
-                c = self.v.construcciones.pop(self.juego.id, None)
-                if c:
-                    c.cancelar()
-                motor.quitar(self.juego)
+                if self.juego.id in self.v.construcciones:
+                    self.v.toast("Espera a que termine la construcción antes de quitar el juego")
+                    return
+                try:
+                    motor.quitar(self.juego)
+                except OSError as e:
+                    self.v._error("No se pudo quitar", str(e))
+                    return
                 self.v.nav.pop()
                 self.v.refrescar()
         d.connect("response", resp)
@@ -594,6 +773,18 @@ class AjustesJuego(Adw.PreferencesDialog):
                           active=aj.get("generacion_cuadros", False))
         s.connect("notify::active", lambda r, _p: self._poner("generacion_cuadros", r.get_active()))
         g.add(s)
+        pag.add(g)
+        g = Adw.PreferencesGroup(title="Diagnóstico de rendimiento",
+                                 description="Escribe un resumen aproximadamente cada 60 cuadros en ultima_partida.txt.")
+        niveles = [("off", "Desactivada"), ("fps", "FPS y frametime"), ("full", "Detallada (CPU y GPU)")]
+        valores = [v for v, _ in niveles]
+        telemetria = Adw.ComboRow(title="Mediciones", subtitle="La medición detallada activa timestamps GPU y puede añadir carga.",
+                                  model=Gtk.StringList.new([n for _, n in niveles]),
+                                  selected=valores.index(aj.get("telemetria", "off"))
+                                  if aj.get("telemetria", "off") in valores else 0)
+        telemetria.connect("notify::selected",
+                           lambda r, _p: self._poner("telemetria", valores[r.get_selected()]))
+        g.add(telemetria)
         pag.add(g)
         g = Adw.PreferencesGroup(title="Avanzado",
                                  description="Variables de entorno extra, una CLAVE=VALOR por línea "

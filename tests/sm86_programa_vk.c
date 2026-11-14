@@ -11,7 +11,7 @@
 #include <vulkan/vulkan.h>
 
 #define OK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s: %d\n", #x, r_); exit(1); } } while (0)
-#define MAXB 16
+#define MAXB 32
 
 static VkDevice dev;
 static VkPhysicalDevice phys;

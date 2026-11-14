@@ -10,11 +10,13 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/random.h>
 #include <time.h>
 
 #include "nxkern.h"
+#include "nx_pl.h"
 #include "nxsvc.h"
 
 #define OK 0u
@@ -33,11 +35,14 @@ typedef struct {
 } StubDef;
 
 #define R_SIN_RED 0x1686Eu // nifm 180: sin conexión a internet
+#define R_COMANDO_DESCONOCIDO ((221u << 9) | 10u) // sf::cmif::ResultUnknownCommandId = 0x1ba0a
 
 static const StubDef stubs[] = {
     // red, amigos, informes, control parental
     {"friends:u", {{0, OBJETO, "IFriendService"}, {1, OBJETO, "INotificationService"}, {2, OBJETO, "IDaemonSuspendSessionService"}}},
     {"friends:v", {{0, OBJETO, "IFriendService"}, {1, OBJETO, "INotificationService"}}},
+    // Switch 2: el mismo servicio con otro nombre (nn::friends::detail::ipc crea las mismas tres interfaces).
+    {"friend:u", {{0, OBJETO, "IFriendService"}, {1, OBJETO, "INotificationService"}, {2, OBJETO, "IDaemonSuspendSessionService"}}},
     {"IFriendService", {{10100, ERROR, 0, R_SIN_RED}, {10101, ERROR, 0, R_SIN_RED}}},
     {"INotificationService", {{0, EVENTO}}},
     {"IDaemonSuspendSessionService", {{0}}},
@@ -83,6 +88,11 @@ static const StubDef stubs[] = {
     {"sfdnsres", {{0}}},
     {"nifm:a", {{4, OBJETO, "IGeneralService"}, {5, OBJETO, "IGeneralService"}}},
     {"nifm:s", {{4, OBJETO, "IGeneralService"}, {5, OBJETO, "IGeneralService"}}},
+    // Switch 2: GameChat (nn::chat::Initialize abre chat:u al arrancar Nintendo Switch Sports Resort y aborta si
+    // sm no lo encuentra). nn::chat::detail::CreateUserServiceByHipc pide al comando 0 la interfaz con la que
+    // trabaja (sin ella el proxy queda con vtable nula). Sin red ni chat: sus comandos responden bien con ceros.
+    {"chat:u", {{0, OBJETO, "IChatUserService"}}},
+    {"IChatUserService", {{0}}},
     {"nifm:u", {{4, OBJETO, "IGeneralService"}, {5, OBJETO, "IGeneralService"}}},
     {"IGeneralService", {{4, OBJETO, "IRequest"}, {12, ERROR, 0, R_SIN_RED}, {18, ERROR, 0, 0x2586Eu}}},
     {"IRequest", {{0}}},
@@ -118,6 +128,16 @@ static uint32_t stub(ServiceObject *self, NxRequest *r) {
         case ERROR: return c->valor;
         case MEMORIA: { KShmem *s; nx_out_copy_handle(r, nx_shmem_new(c->valor, &s)); return OK; }
         }
+    }
+    // NX_SERVICIOS_ESTRICTOS=1 (diagnóstico): un comando que la tabla no conoce responde lo que responde Horizon,
+    // sf::cmif::ResultUnknownCommandId (módulo 10, 221: Atmosphère sf_results.hpp / sf_cmif_service_dispatch.cpp),
+    // en vez de éxito con ceros. Sirve para ver si un juego dependía de esa respuesta genérica.
+    static int estricto = -1;
+    if (estricto < 0) estricto = getenv("NX_SERVICIOS_ESTRICTOS") != NULL;
+    if (estricto) {
+        fprintf(stderr, "[stub] %s %u: comando desconocido, 0x%x (UnknownCommandId) por NX_SERVICIOS_ESTRICTOS\n",
+                d->nombre, r->cmd, R_COMANDO_DESCONOCIDO);
+        return R_COMANDO_DESCONOCIDO;
     }
     // Cualquier otro: bien, con ceros. Se avisa una vez por servicio y comando.
     static struct { const StubDef *d; uint32_t cmd; } vistos[512];
@@ -198,6 +218,29 @@ static uint32_t pl(ServiceObject *self, NxRequest *r) {
         }
         nx_out32(r, 1);
         nx_out32(r, 6);
+        return OK;
+    }
+    // Switch 2 (nx_pl.h): la memoria compartida de las fuentes y cada fuente integrada.
+    case 2000:
+        if (!fuentes) return NX_R_UNKNOWN_CMD;
+        nx_out32(r, (uint32_t)fuentes->size);
+        nx_out_copy_handle(r, fuentes_h);
+        return OK;
+    case 2010: {
+        uint8_t res[16];
+        int cargada = fuentes && nx_pl_fuente_integrada(fuente_off, fuente_tam, fuentes->host, fuentes->size, r->in,
+                                                        r->in_size, res);
+        if (!cargada)
+            fprintf(stderr, "[nxrt] pl:u: fuente integrada %u no disponible (se responde «no cargada»)\n",
+                    r->in_size ? r->in[0] : 0);
+        if (getenv("NX_TRAZA_PL")) {
+            fprintf(stderr, "[pl] 2010 entrada");
+            for (uint32_t i = 0; i < r->in_size && i < 16; i++) fprintf(stderr, " %02x", r->in[i]);
+            fprintf(stderr, " → salida");
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", res[i]);
+            fprintf(stderr, "\n");
+        }
+        nx_out_bytes(r, res, sizeof res);
         return OK;
     }
     }
@@ -300,6 +343,10 @@ static int especial_aoc(NxRequest *r, uint32_t *rc) {
     }
     case 4: case 5: nx_out64(r, base); *rc = OK; return 1; // GetAddOnContentBaseId
     case 8: case 10: { KEvent *ev; nx_out_copy_handle(r, nx_event_new(&ev)); *rc = OK; return 1; }
+    case 50: // CheckAddOnContentMountStatus; this runtime does not mount AOC images yet.
+        nx_out32(r, 0); // false: the requested add-on content is not mounted
+        *rc = OK;
+        return 1;
     case 100: case 101:
         nx_out_object(r, nx_object("IPurchaseEventManager", stub, (void *)buscar("IPurchaseEventManager")));
         *rc = OK;
@@ -308,12 +355,127 @@ static int especial_aoc(NxRequest *r, uint32_t *rc) {
     return 0;
 }
 
+/* nn::mii::CharInfo, the 0x58-byte result used by IDatabaseService.
+ * Layout follows the public SwIPC interface definition. Field values model
+ * the six built-in Miis described by nxnative's MIT-licensed HLE reference;
+ * no game- or build-specific addresses/data are used. */
+typedef struct __attribute__((packed)) {
+    uint8_t create_id[16];
+    uint16_t nickname[11];
+    uint8_t font_region, favorite_color, gender, height, build, type, region_move;
+    uint8_t faceline_type, faceline_color, faceline_wrinkle, faceline_make;
+    uint8_t hair_type, hair_color, hair_flip;
+    uint8_t eye_type, eye_color, eye_scale, eye_aspect, eye_rotate, eye_x, eye_y;
+    uint8_t eyebrow_type, eyebrow_color, eyebrow_scale, eyebrow_aspect, eyebrow_rotate, eyebrow_x, eyebrow_y;
+    uint8_t nose_type, nose_scale, nose_y;
+    uint8_t mouth_type, mouth_color, mouth_scale, mouth_aspect, mouth_y;
+    uint8_t beard_color, beard_type, mustache_type, mustache_scale, mustache_y;
+    uint8_t glass_type, glass_color, glass_scale, glass_y;
+    uint8_t mole_type, mole_scale, mole_x, mole_y, reserved;
+} MiiCharInfo;
+_Static_assert(sizeof(MiiCharInfo) == 0x58, "Mii CharInfo ABI size");
+
+enum { MII_SOURCE_USER = 1, MII_SOURCE_DEFAULT = 2, MII_DEFAULT_COUNT = 6 };
+
+static uint64_t mii_nonce(void) {
+    static _Atomic uint64_t seq = 1;
+    uint64_t value = 0;
+    if (getrandom(&value, sizeof value, 0) == (ssize_t)sizeof value) return value;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ atomic_fetch_add(&seq, 1);
+}
+
+static void mii_build(MiiCharInfo *m, unsigned gender, int index) {
+    memset(m, 0, sizeof *m);
+    uint64_t id0 = index >= 0 ? 0x4d49494e44454641ull + (uint64_t)index : mii_nonce();
+    uint64_t id1 = index >= 0 ? 0x554c54444d484f53ull : mii_nonce();
+    memcpy(m->create_id, &id0, sizeof id0);
+    memcpy(m->create_id + sizeof id0, &id1, sizeof id1);
+    m->create_id[6] = (uint8_t)((m->create_id[6] & 0x0f) | 0x40);
+    m->create_id[8] = (uint8_t)((m->create_id[8] & 0x3f) | 0x80);
+    if (index >= 0) m->favorite_color = (uint8_t)(index * 2);
+    static const char name[] = "no name";
+    for (size_t i = 0; i < sizeof name - 1; i++) m->nickname[i] = (uint16_t)name[i];
+    m->gender = (uint8_t)(gender != 0);
+    m->height = 64; m->build = 64;
+    m->hair_type = 33; m->hair_color = 1;
+    m->eye_type = 2; m->eye_color = 8; m->eye_scale = 4; m->eye_aspect = 3; m->eye_rotate = 4; m->eye_x = 2; m->eye_y = 12;
+    m->eyebrow_type = 6; m->eyebrow_color = 1; m->eyebrow_scale = 4; m->eyebrow_aspect = 3; m->eyebrow_rotate = 6; m->eyebrow_x = 2; m->eyebrow_y = 10;
+    m->nose_type = 1; m->nose_scale = 4; m->nose_y = 9;
+    m->mouth_type = 23; m->mouth_color = 19; m->mouth_scale = 4; m->mouth_aspect = 3; m->mouth_y = 13;
+    m->beard_color = 8; m->mustache_scale = 4; m->mustache_y = 10;
+    m->glass_color = 8; m->glass_scale = 4; m->glass_y = 10;
+    m->mole_scale = 4; m->mole_x = 2; m->mole_y = 20;
+}
+
+static uint32_t mii_service(NxRequest *r) {
+    switch (r->cmd) {
+    case 0: // IsUpdated(source): the host's database does not change.
+    case 1: // IsFullDatabase(): it is empty.
+        nx_out8(r, 0);
+        return OK;
+    case 2: { // GetCount(source)
+        if (r->in_size < 4) return R_COMANDO_DESCONOCIDO;
+        uint32_t source = nx_in32(r, 0);
+        nx_out32(r, (source & MII_SOURCE_DEFAULT) ? MII_DEFAULT_COUNT : 0);
+        return OK;
+    }
+    case 3: case 4: { // Get(source) / Get1(source), output buffer B
+        if (r->in_size < 4) return R_COMANDO_DESCONOCIDO;
+        uint32_t source = nx_in32(r, 0);
+        NxBuffer *b = nx_out_buffer(r, 0);
+        uint32_t stride = r->cmd == 3 ? sizeof(MiiCharInfo) + 4 : sizeof(MiiCharInfo);
+        uint32_t count = (source & MII_SOURCE_DEFAULT) && b && b->addr ? (uint32_t)(b->size / stride) : 0;
+        if (count > MII_DEFAULT_COUNT) count = MII_DEFAULT_COUNT;
+        if (count) {
+            nx_vigia_tocar(b->addr, (uint64_t)count * stride);
+            uint8_t *dst = (uint8_t *)(uintptr_t)b->addr;
+            for (uint32_t i = 0; i < count; i++) {
+                MiiCharInfo m;
+                mii_build(&m, i >= 3, (int)i);
+                memcpy(dst + (size_t)i * stride, &m, sizeof m);
+                if (r->cmd == 3) {
+                    uint32_t origin = MII_SOURCE_DEFAULT;
+                    memcpy(dst + (size_t)i * stride + sizeof m, &origin, sizeof origin);
+                }
+            }
+        }
+        nx_out32(r, count);
+        return OK;
+    }
+    case 6: { // BuildRandom(age, gender, race) -> CharInfo
+        if (r->in_size < 12) return R_COMANDO_DESCONOCIDO;
+        uint32_t gender = nx_in32(r, 4);
+        if (gender > 2) return 0x87Eu; // Mii InvalidArgument
+        if (gender == 2) gender = (uint32_t)(mii_nonce() & 1);
+        MiiCharInfo m;
+        mii_build(&m, gender, -1);
+        nx_out_bytes(r, &m, sizeof m);
+        return OK;
+    }
+    case 7: { // BuildDefault(index) -> CharInfo
+        if (r->in_size < 4) return R_COMANDO_DESCONOCIDO;
+        uint32_t index = nx_in32(r, 0);
+        MiiCharInfo m;
+        mii_build(&m, index >= 3, index < MII_DEFAULT_COUNT ? (int)index : 0);
+        nx_out_bytes(r, &m, sizeof m);
+        return OK;
+    }
+    case 22: // SetInterfaceVersion
+        return OK;
+    default:
+        return R_COMANDO_DESCONOCIDO;
+    }
+}
+
 // ---------- nifm: IRequest pasa por "en espera" antes de decir que no hay red ----------
 // (Pikmin 4 competía con su propio arranque si la respuesta llegaba en la primera consulta.)
 static uint32_t especial(const StubDef *d, NxRequest *r, int *hecho) {
     uint32_t rc = OK;
     *hecho = 1;
     if (!strcmp(d->nombre, "aoc:u") && especial_aoc(r, &rc)) return rc;
+    if (!strcmp(d->nombre, "IDatabaseService")) return mii_service(r);
     if (!strcmp(d->nombre, "IRequest")) {
         static int consultas;
         switch (r->cmd) {
@@ -331,6 +493,9 @@ static uint32_t especial(const StubDef *d, NxRequest *r, int *hecho) {
     }
     if (!strcmp(d->nombre, "IGeneralService") && r->cmd == 21) { nx_out8(r, 0); return OK; } // IsAnyInternetRequestAccepted
     if (!strcmp(d->nombre, "IParentalControlService") && r->cmd == 1031) { nx_out8(r, 0); return OK; } // IsRestrictionEnabled
+    // Initialize (4.0.0+): sin entradas ni salidas; éxito para una aplicación (Skyline, MPL-2.0, y Ryujinx, GPL-3.0:
+    // solo el comportamiento). Explícito para no avisar como si fuera un hueco.
+    if (!strcmp(d->nombre, "IParentalControlService") && r->cmd == 1) return OK;
     if (!strcmp(d->nombre, "fatal:u")) {
         fprintf(stderr, "[nxrt] el juego lanzó un error fatal: 0x%x (%04u-%04u)\n", nx_in32(r, 0), 2000 + (nx_in32(r, 0) & 0x1FF),
                 nx_in32(r, 0) >> 9 & 0x1FFF);
@@ -346,6 +511,7 @@ static const StubDef fatal_def = {"fatal:u", {{0}}};
 // Lo que sm: no encuentra en su tabla propia se busca aquí.
 ServiceObject *nx_servicio_otro(const char *nombre) {
     if (!strcmp(nombre, "pl:u") || !strcmp(nombre, "pl:s")) return nx_object(nombre, pl, NULL);
+    if (!strcmp(nombre, "ldr:ro")) return nx_object(nombre, nx_ldr_ro, NULL);
     if (!strcmp(nombre, "csrng")) return nx_object(nombre, csrng, NULL);
     if (!strcmp(nombre, "bsd:u") || !strcmp(nombre, "bsd:s") || !strcmp(nombre, "bsd:a")) return nx_object(nombre, bsd, NULL);
     if (!strcmp(nombre, "ngc:u") || !strcmp(nombre, "ngct:u")) return nx_object(nombre, ngc, NULL);

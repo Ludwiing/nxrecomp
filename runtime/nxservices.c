@@ -22,6 +22,48 @@ int nx_en_base(void) {
     return !(m && (!strcmp(m, "portatil") || !strcmp(m, "portátil") || !strcmp(m, "0")));
 }
 
+// Switch 2 exposes the audio managers behind a single aud:u session.
+static uint32_t aud_user_session(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    switch (r->cmd) {
+    case 0: nx_out_object(r, nx_object("audin:u", nx_audout, NULL)); return 0;
+    case 1: nx_out_object(r, nx_object("audout:u", nx_audout, NULL)); return 0;
+    case 2: nx_out_object(r, nx_object("audren:u", nx_audren, NULL)); return 0;
+    default: return NX_R_UNKNOWN_CMD;
+    }
+}
+
+// Switch 2 virtual audio-device manager. No host microphone is exposed yet;
+// report no virtual input route so games can continue without capture.
+static uint32_t auddmg_user(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    switch (r->cmd) {
+    case 0: { // ListVirtualDeviceNames(bool, functionality), output DeviceName[256]
+        uint32_t functionality = r->in_size >= 8 ? *(uint32_t *)(r->in + 4) : 0;
+        if (functionality != 1 && functionality != 2) return 0xC8899u;
+        uint32_t count = 0;
+        NxBuffer *b = nx_out_buffer(r, 0);
+        if (functionality == 1 && b && b->addr && b->size >= 0x100) {
+            memset((void *)(uintptr_t)b->addr, 0, 0x100);
+            memcpy((void *)(uintptr_t)b->addr, "MainAudioOut", 12);
+            count = 1;
+        }
+        nx_out32(r, count);
+        return 0;
+    }
+    default:
+        if (getenv("NX_TRAZA_AUDREN")) fprintf(stderr, "[nxrt] auddmg: comando %u sin implementar\n", r->cmd);
+        return NX_R_UNKNOWN_CMD;
+    }
+}
+
+static uint32_t auddmg_manager(ServiceObject *self, NxRequest *r) {
+    (void)self;
+    if (r->cmd != 0) return NX_R_UNKNOWN_CMD;
+    nx_out_object(r, nx_object("auddmg:IUserSession", auddmg_user, NULL));
+    return 0;
+}
+
 uint64_t nx_lang_code(const char *s) {
     uint64_t v = 0;
     memcpy(&v, s, strlen(s) < 8 ? strlen(s) : 8);
@@ -144,6 +186,8 @@ static const struct {
     {"vi:m", "vi:m", nx_vi},
     {"nvdrv", "nvdrv", nx_nvdrv},
     {"audout:u", "audout:u", nx_audout},
+    {"aud:u", "aud:u", aud_user_session},
+    {"auddmg:u", "auddmg:u", auddmg_manager},
     {"audren:u", "audren:u", nx_audren},
     {"nvdrv:a", "nvdrv:a", nx_nvdrv},
     {"nvdrv:s", "nvdrv:s", nx_nvdrv},
