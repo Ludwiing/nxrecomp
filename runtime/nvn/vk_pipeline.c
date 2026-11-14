@@ -52,6 +52,7 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
+#include "vk_noopt.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -891,6 +892,15 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
     st->pNext = rq;
 }
 
+// Largest SPIR-V among the given stages (NULL ones skipped), for vk_noopt_flags.
+static uint64_t stage_words(const GfxShader *a, const GfxShader *b, const GfxShader *c) {
+    const GfxShader *st[3] = {a, b, c};
+    uint64_t m = 0, w;
+    for (int i = 0; i < 3; i++)
+        if (st[i] && (gfx_shader_spirv(st[i], &w), w > m)) m = w;
+    return m;
+}
+
 static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
@@ -1453,6 +1463,7 @@ static VkPipeline create_mesh_graphics(const VkPipeState *s, const GKey *k, cons
         .pDynamicState = &dy, .layout = l->layout};
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    pi.flags |= vk_noopt_flags(stage_words(s->task, s->mesh, s->fs));
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);
@@ -1585,6 +1596,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                        .pDynamicState = &dy, .layout = l->layout};
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    pi.flags |= vk_noopt_flags(stage_words(s->vs, s->fs, NULL));
     uint64_t p0 = perf_begin();
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
@@ -1737,6 +1749,8 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
+    // Only the shader libraries compile code; the interface libraries follow TOTK_VK_NOOPT alone.
+    pi.flags |= vk_noopt_flags(kind == LIB_PR ? stage_words(s->vs, NULL, NULL) : kind == LIB_FS ? stage_words(s->fs, NULL, NULL) : 0);
     if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
@@ -1926,7 +1940,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
         VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4,
                                              .pLibraries = lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
-                                           .layout = l->layout};
+                                           .flags = vk_noopt_flags(stage_words(s->vs, s->fs, NULL)), .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -2686,7 +2700,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
-                                      .layout = l->layout};
+                                      .flags = vk_noopt_flags(words), .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;

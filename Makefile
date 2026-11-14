@@ -217,6 +217,7 @@ $(B)/nxhle_event_test: tests/nxhle_event_test.c runtime/nxhle_event.c runtime/nx
 # Identidad de los juegos de NX2Linux (Title ID por estructura, .nup incompleto/ambiguo, nombre visible), sin juegos reales
 test-identidad:
 	python3 tests/identidad_juego_test.py
+	python3 tests/sustituciones_switch2_test.py
 
 .PHONY: test-gpu-state
 $(B)/renderer_config_test: tests/renderer_config_test.c runtime/nxmain.c $(RUNTIME_H) | $(B)
@@ -325,13 +326,16 @@ $(B)/deswizzle_gpu_test: tests/deswizzle_gpu_test.c runtime/nvn/deswizzle_spv.h 
 $(B)/vk_vma.o: runtime/nvn/vk_vma.cpp runtime/nvn/third_party/vma/vk_mem_alloc.h | $(B)
 	clang++ -c -O1 -Iruntime/nvn/third_party/vma runtime/nvn/vk_vma.cpp -o $@
 
+$(B)/vk_noopt_test: tests/vk_noopt_test.c runtime/nvn/vk_noopt.h runtime/nvn/cfg.c runtime/nvn/cfg.h | $(B)
+	$(CLANG) -O1 -Wall -Wextra -Iruntime -Iruntime/nvn tests/vk_noopt_test.c runtime/nvn/cfg.c -o $@
+
 $(B)/vk_pool_fisico_test: tests/vk_pool_fisico_test.c runtime/nvn/vk_phys_mem.h $(B)/vk_vma.o | $(B)
 	$(CLANG) -O1 -Iruntime/nvn -Iruntime/nvn/third_party/vma tests/vk_pool_fisico_test.c $(B)/vk_vma.o -lvulkan -lstdc++ -o $@
 
 runtime/nvn/deswizzle_spv.h: runtime/shaders/deswizzle.comp tools/spv_header.py
 	python3 tools/spv_header.py $<
 
-test: all test-startup test-identidad test-codec test-nvn-cmd $(B)/framegen_test $(B)/vk_pool_fisico_test $(B)/nvn2_program_test $(B)/gob_test $(B)/deswizzle_gpu_test $(B)/sm86_dec_test $(B)/sm86_programa_vk $(B)/sm86_propia_test $(B)/romper_abort $(B)/romper_ilegible $(B)/describir_test
+test: all test-startup test-identidad test-codec test-nvn-cmd $(B)/framegen_test $(B)/vk_pool_fisico_test $(B)/vk_noopt_test $(B)/nvn2_program_test $(B)/gob_test $(B)/deswizzle_gpu_test $(B)/sm86_dec_test $(B)/sm86_programa_vk $(B)/sm86_propia_test $(B)/romper_abort $(B)/romper_ilegible $(B)/describir_test
 	python3 tests/compilar_runtime_test.py
 	@ok=1; for p in $(PROGS) $(PROGS_ESPERADO); do \
 		NX_ROMFS=$(B)/romfs_prueba.img $(B)/$$p > $(B)/$$p.salida.txt; \
@@ -397,6 +401,8 @@ test: all test-startup test-identidad test-codec test-nvn-cmd $(B)/framegen_test
 	$(B)/deswizzle_gpu_test >$(B)/deswizzle_gpu.txt 2>&1; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: el deswizzle en la GPU da lo mismo que el del procesador byte a byte (Switch 1 y Switch 2, 400 geometrías)"; \
 	elif [ $$r = 77 ]; then echo "(sin Vulkan no se prueba el deswizzle en la GPU)"; else echo "MAL: deswizzle en la GPU (ver $(B)/deswizzle_gpu.txt)"; ok=0; fi; \
+	if $(B)/vk_noopt_test >$(B)/vk_noopt.txt 2>&1; then echo "OK: compilación segura de shaders: apagada por defecto, por umbral de palabras SPIR-V o para todo"; \
+	else echo "MAL: compilación segura de shaders (ver $(B)/vk_noopt.txt)"; ok=0; fi; \
 	$(B)/vk_pool_fisico_test >$(B)/vk_pool_fisico.txt 2>&1; r=$$?; \
 	if [ $$r = 0 ]; then echo "OK: un pool físico más grande que la VRAM libre cae en memoria de sistema en vez de rechazarse"; \
 	elif [ $$r = 77 ]; then echo "(sin Vulkan o sin memoria de sistema aparte no se prueba el pool físico)"; else echo "MAL: pool físico (ver $(B)/vk_pool_fisico.txt)"; ok=0; fi; \

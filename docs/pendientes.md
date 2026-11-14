@@ -173,6 +173,11 @@ reales las hace el usuario con sus dumps y trae el registro; aquí se prueba con
   Se llena sustituciones-switch2.txt con los nombres que dé sdk_simbolos.py sobre un dump.
 - [ ] Fase 3: NVN2 sobre runtime/nvn (versión 231.x de la API, tabla de límites del dispositivo, program builders,
   imágenes nativas, pools virtuales de 64 bits, mesh/task).
+- [x] Compilación segura de shaders (2026-11-14): `TOTK_VK_NOOPT=1` (todas) o `TOTK_VK_NOOPT_WORDS=N` (solo pipelines
+  con un shader de más de N palabras SPIR-V) crean las pipelines con `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT`, para
+  los shaders SM86 gigantes que cuelgan el compilador de NVIDIA (`runtime/nvn/vk_noopt.h`; idea de NS2_VK_NOOPT de MTF
+  ShadowRacket/Lichii). Apagado por defecto. `robustBufferAccess2` ya estaba activo (vk_device.c habilita robustness2).
+  Prueba: `tests/vk_noopt_test.c`. Sin probar todavía con un juego que cuelgue el driver.
 - [~] Fase 4: traductor propio de SASS Ampere (SM86, instrucciones de 16 bytes); lector de programas ya hecho
   (runtime/nvn/nvn2_program.h). Método, sin código GPL: nvdisasm del kit CUDA (`sudo pacman -S cuda`, solo en la PC de
   desarrollo) como oráculo. `tools/sm86_oraculo.py` desensambla y enumera los códigos (334 válidos, 134 instrucciones,

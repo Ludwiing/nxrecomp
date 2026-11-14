@@ -59,3 +59,7 @@ _ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTypeERKNS1_15SyncP
 _ZN2nn6syncpt3sdk20CancelSyncPointEventEPNS1_18SyncPointEventTypeE nxcodec_syncpt_cancel
 _ZN2nn6syncpt3sdk21TryWaitSyncPointEventEPKNS1_18SyncPointEventTypeE nxcodec_syncpt_try_wait
 _ZN2nn6syncpt3sdk21DestroySyncPointEventEPNS1_18SyncPointEventTypeE nxcodec_syncpt_destroy
+# "Ounce" es el nombre interno del hardware de Switch 2. El SDK pregunta si corre en él: sí (estos juegos solo
+# reciben este archivo cuando son de Switch 2), y no hay un accesorio de vibración propio de Ounce montado.
+_ZN2nn2pl16IsRunningOnOunceEv =1
+_ZN2nn3hid29IsOunceVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE =0
