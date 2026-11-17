@@ -3295,6 +3295,42 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
+    if (d->prim == NVN_DRAW_PRIMITIVE_QUADS) {
+        uint32_t q = (uint32_t)d->count / 4;
+        if (!q) return;
+        // shortcut: GPU-only index buffers need a GPU-side expansion when a game uses indexed quads from them.
+        if (sp.alloc) return warn_once(W_INDEX, "indexed quads in device-local memory: draw skipped");
+        uint32_t *ix = malloc(sizeof *ix * 6 * q);
+        if (!ix) rt_fatal("vk: out of memory");
+        const uint8_t *src = (const uint8_t *)(uintptr_t)d->ibuf;
+        for (uint32_t i = 0; i < q; i++) {
+            uint32_t v[4];
+            for (int j = 0; j < 4; j++) {
+                const uint8_t *p = src + (4 * i + j) * isize[d->itype];
+                if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) v[j] = *p;
+                else if (d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT) {
+                    uint16_t value;
+                    memcpy(&value, p, sizeof value);
+                    v[j] = value;
+                } else memcpy(&v[j], p, 4);
+            }
+            uint32_t k[6] = {v[0], v[1], v[2], v[0], v[2], v[3]};
+            memcpy(ix + 6 * i, k, sizeof k);
+        }
+        vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
+        vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, sizeof *ix * 6 * q);
+        bind_index(ex, ix, sizeof *ix * 6 * q, VK_INDEX_TYPE_UINT32);
+        free(ix);
+        vkCmdDrawIndexed(ex->cb, 6 * q, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
+                         (uint32_t)d->base_instance);
+        ex->recorded++;
+        if (d->itype != NVN_INDEX_TYPE_UNSIGNED_BYTE) {
+            VK_MEM_USE(sp);
+            mvobj_draw(ex, d, sp.buffer, sp.offset);
+            VK_MEM_BOUND(sp);
+        }
+        return;
+    }
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
         vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
